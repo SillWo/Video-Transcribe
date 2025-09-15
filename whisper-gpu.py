@@ -221,17 +221,26 @@ def main():
 		if args.quiet == False:
 			print(f"Processing file {media_file} and using audio filter")
 
-		if args.audio_filter or args.codec or args.bitrate:
-			if args.quiet == False:
-				print(f"File {audiofile}")
-				print(f"Filter {args.audio_filter}")
-				print(f"Codec {args.codec}")
-				print(f"Bitrate {args.bitrate}")
+		if args.quiet == False:
+			if args.output_name:
+				print(f"Set file {args.output_name}")
 
+			if args.audio_filter:
+				print(f"Set filter {args.audio_filter}")
+
+			if args.codec:
+				print(f"Set codec {args.codec}")
+
+			if args.bitrate:
+				print(f"Set bitrate {args.bitrate}")
 
 		audio_processor = AudioProcess(args)
 
-		if not audio_processor.audio_only(media_file) or findarg(args, 'start') or findarg(args, 'end') or findarg(args, 'codec') or findarg(args, 'bitrate'):
+		if not audio_processor.audio_only(media_file) \
+				or findarg(args, 'start')
+				or findarg(args, 'end')
+				or findarg(args, 'codec')
+				or findarg(args, 'bitrate'):
 			print("Extracting audio")
 			audio_processor.extract_audio(input_filepath=media_file, output_filepath=audio_file, overwrite=True)
 
