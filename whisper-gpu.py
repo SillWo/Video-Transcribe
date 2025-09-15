@@ -237,9 +237,10 @@ def main():
 		audio_processor = AudioProcess(args)
 
 		if not audio_processor.audio_only(media_file) \
-				or findarg(args, 'start')
-				or findarg(args, 'end')
-				or findarg(args, 'codec')
+				or findarg(args, 'audio_filter') \
+				or findarg(args, 'start') \
+				or findarg(args, 'end') \
+				or findarg(args, 'codec') \
 				or findarg(args, 'bitrate'):
 			print("Extracting audio")
 			audio_processor.extract_audio(input_filepath=media_file, output_filepath=audio_file, overwrite=True)
