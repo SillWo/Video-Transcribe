@@ -93,13 +93,17 @@ def initialize(args):
 
 	# initialize the model with given args
 	if args.device != "cuda":
-		#overrides the os.environ["OMP_NUM_THREADS"]
-		threads = str(args.nproc)
-		model = whisper(args.model_size, cpu_threads=threads, num_workers=4, device=args.device, compute_type=args.precision)
+		threads = os.cpu_count()
+		model = whisper(
+        	args.model_size,
+        	cpu_threads=threads,
+        	num_workers=4,
+       		device=args.device,
+        	compute_type=args.precision)
 	else:
 		model = whisper(args.model_size, device=args.device, compute_type=args.precision)
 
-	return model;
+	return model
 
 def close(args):
 
@@ -169,10 +173,10 @@ def main():
 						(for ffmpeg), no spaces, just comma-separated")
 	parser.add_argument("-o", "--output_name", help="Output filename in case of issues with title")
 	parser.add_argument("-od", "--output_dir", help="Ouput directory", default=os.getcwd())
-	parser.add_argument("-l", "--language", help="Language to be translated from", default='en', type=str)
+	parser.add_argument("-l", "--language", help="Language to be translated from", default='ru', type=str)
 	parser.add_argument("-b", "--beam_size", help="Beam size parameter or best_of equivalent from Open-AI whisper", type=int, default=5)
 	parser.add_argument("-p", "--precision", help="Precision to use to create the model", type=str, default="auto")
-	parser.add_argument("-d", "--device", help="Device to use such a CPU or GPU", choices=["cpu", "cuda"], default="cuda")
+	parser.add_argument("-d", "--device", help="Device to use such a CPU or GPU", choices=["cpu", "cuda"], default="cpu")
 	parser.add_argument("-s", "--model_size", help="Size of the model, default is small.", choices=sizes_supported(), nargs='?', default="small")
 	parser.add_argument("--start", help="Start time in 00:00:00 format", type=AudioProcess.valid_time)
 	parser.add_argument("--end", help="End time in 00:00:00 format", type=AudioProcess.valid_time)
