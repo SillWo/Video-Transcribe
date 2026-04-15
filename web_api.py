@@ -11,12 +11,17 @@ from pathlib import Path
 from typing import Any
 
 import psutil
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from faster_whisper.utils import available_models
 from pydantic import BaseModel
 
+from services.model_management import (
+    ModelCacheInspectionError,
+    get_model_panel_payload,
+    list_models_with_status,
+)
+from services.model_registry import list_enabled_backend_values, list_model_catalog
 from source_check import check_source
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -96,6 +101,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+model_management_router = APIRouter(prefix="/api/models", tags=["model-management"])
 
 
 def get_job(job_id: str) -> JobState:
@@ -290,12 +297,33 @@ def health_check():
 def get_options():
     max_cpu_threads = logical_cpu_count()
     return {
-        "models": available_models(),
+        "models": list_enabled_backend_values(),
         "devices": ["cpu", "cuda"],
         "outputFormats": ["txt", "srt", "json"],
         "languages": ["auto", "ru", "en", "de", "fr", "es", "it", "pt", "uk", "ja", "ko", "zh"],
         "maxCpuThreads": max_cpu_threads,
     }
+
+
+@model_management_router.get("/catalog")
+def get_models_catalog():
+    return list_model_catalog()
+
+
+@model_management_router.get("/status")
+def get_models_status():
+    try:
+        return list_models_with_status()
+    except ModelCacheInspectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@model_management_router.get("/panel")
+def get_models_panel():
+    try:
+        return get_model_panel_payload()
+    except ModelCacheInspectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.post("/api/check-source")
@@ -383,3 +411,6 @@ def download_result(job_id: str):
         raise HTTPException(status_code=404, detail="Result file is missing")
 
     return FileResponse(path=output_path, filename=output_path.name, media_type="application/octet-stream")
+
+
+app.include_router(model_management_router)

@@ -21,6 +21,8 @@ import {
   getOutputFormatDisplayLabel,
 } from './i18n/displayLabels'
 import { useI18n } from './i18n/useI18n'
+import { API_BASE, fetchJson } from './lib/api'
+import { ModelManagementPanel } from './components/ModelManagementPanel'
 
 type SourceType = 'url' | 'file'
 type OutputFormat = 'txt' | 'srt' | 'json'
@@ -101,50 +103,15 @@ type UiError =
       key: string
     }
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '') ?? ''
 const FALLBACK_CPU_THREADS =
   typeof navigator !== 'undefined' ? Math.max(navigator.hardwareConcurrency || 1, 1) : 1
 const DEFAULT_LANGUAGE_OPTIONS = ['ru', 'auto', 'en', 'de', 'fr', 'es', 'it', 'pt', 'uk', 'ja', 'ko', 'zh']
 const DEFAULT_OPTIONS: OptionsResponse = {
-  models: ['small', 'medium', 'large-v3'],
+  models: [],
   devices: ['cpu', 'cuda'],
   outputFormats: ['txt', 'srt', 'json'],
   languages: DEFAULT_LANGUAGE_OPTIONS,
   maxCpuThreads: FALLBACK_CPU_THREADS,
-}
-
-async function getErrorMessage(response: Response): Promise<string> {
-  const text = await response.text()
-  if (!text) {
-    return `Request failed with status ${response.status}`
-  }
-
-  try {
-    const payload = JSON.parse(text) as { detail?: unknown; message?: unknown }
-    if (typeof payload.detail === 'string') {
-      return payload.detail
-    }
-    if (typeof payload.message === 'string') {
-      return payload.message
-    }
-    if (Array.isArray(payload.detail) && payload.detail.length > 0) {
-      return payload.detail
-        .map((item) => (typeof item === 'string' ? item : JSON.stringify(item)))
-        .join(', ')
-    }
-  } catch {
-    // Keep the plain response text when the backend does not return JSON.
-  }
-
-  return text
-}
-
-async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, init)
-  if (!response.ok) {
-    throw new Error(await getErrorMessage(response))
-  }
-  return response.json() as Promise<T>
 }
 
 function mergeOrderedValues(preferred: string[], incoming?: string[]) {
@@ -885,6 +852,8 @@ export default function App() {
             />
           </div>
         </div>
+
+        <ModelManagementPanel />
       </div>
     </main>
   )
