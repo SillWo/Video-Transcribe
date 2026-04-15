@@ -159,6 +159,7 @@ def apply_complete(job_id: str, results: list[dict[str, Any]]) -> None:
 
     combined_text = "\n\n".join(result.get("text", "").strip() for result in results if result.get("text")).strip()
     rendered_chunks = []
+    saved_audio = next((result.get("saved_audio") for result in reversed(results) if result.get("saved_audio")), None)
     for result in results:
         rendered_result = read_output_text(result.get("output_path")) or result.get("rendered_result")
         if rendered_result:
@@ -172,6 +173,7 @@ def apply_complete(job_id: str, results: list[dict[str, Any]]) -> None:
         output_path=results[-1].get("output_path"),
         output_format=results[-1].get("output_format"),
         detected_language=results[-1].get("detected_language"),
+        saved_audio=saved_audio,
     )
 
 
@@ -275,7 +277,8 @@ def run_job(job_id: str, source_path: str) -> None:
 
     except Exception as exc:
         append_log(job_id, f"[error] {exc}")
-        update_job(job_id, status="failed", stage="result", error=str(exc))
+        current_error = get_job(job_id).error
+        update_job(job_id, status="failed", stage="result", error=current_error or str(exc))
 
 
 @app.get("/api/health")

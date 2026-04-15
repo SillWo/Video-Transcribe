@@ -17,6 +17,38 @@ CHECK_TIMEOUT_SECONDS = 15
 PLAYLIST_PREVIEW_LIMIT = 3
 FORMAT_SAMPLE_LIMIT = 5
 DETAIL_LIMIT = 6
+AUDIO_FILE_EXTENSIONS = {
+    "aac",
+    "aiff",
+    "alac",
+    "flac",
+    "m4a",
+    "mid",
+    "midi",
+    "mp2",
+    "mp3",
+    "oga",
+    "ogg",
+    "opus",
+    "wav",
+    "weba",
+    "wma",
+}
+MEDIA_CONTAINER_EXTENSIONS = {
+    "3gp",
+    "avi",
+    "flv",
+    "m2ts",
+    "m4v",
+    "mkv",
+    "mov",
+    "mp4",
+    "mpeg",
+    "mpg",
+    "mts",
+    "ts",
+    "webm",
+}
 
 
 @dataclass
@@ -108,13 +140,41 @@ def get_formats(info: dict[str, Any] | None) -> list[dict[str, Any]]:
     return []
 
 
+def inspect_audio_support(format_info: dict[str, Any]) -> tuple[bool, bool]:
+    acodec = str(format_info.get("acodec") or "").lower()
+    audio_ext = str(format_info.get("audio_ext") or "").lower()
+    resolution = str(format_info.get("resolution") or "").lower()
+    ext = str(format_info.get("ext") or "").lower()
+    protocol = str(format_info.get("protocol") or "").lower()
+
+    if acodec not in {"", "none"}:
+        return True, False
+
+    if audio_ext not in {"", "none"}:
+        return True, False
+
+    if resolution == "audio only":
+        return True, False
+
+    if ext in AUDIO_FILE_EXTENSIONS:
+        return True, False
+
+    # Generic direct-file URLs often omit codec metadata. In these cases,
+    # treat common media containers as audio-extractable candidates.
+    if format_info.get("url") and protocol in {"http", "https"} and ext in MEDIA_CONTAINER_EXTENSIONS:
+        return True, True
+
+    return False, False
+
+
 def has_audio_stream(format_info: dict[str, Any]) -> bool:
-    acodec = format_info.get("acodec")
-    return acodec not in {None, "", "none"}
+    supported, _ = inspect_audio_support(format_info)
+    return supported
 
 
 def summarize_format(format_info: dict[str, Any]) -> str:
     parts: list[str] = []
+    audio_supported, audio_inferred = inspect_audio_support(format_info)
     format_id = format_info.get("format_id")
     if format_id:
         parts.append(str(format_id))
@@ -136,8 +196,14 @@ def summarize_format(format_info: dict[str, Any]) -> str:
         except (TypeError, ValueError):
             parts.append(f"{abr} kbps")
 
-    if has_audio_stream(format_info):
-        parts.append(f"audio:{format_info.get('acodec')}")
+    if audio_supported:
+        acodec = format_info.get("acodec")
+        if acodec not in {None, "", "none"}:
+            parts.append(f"audio:{acodec}")
+        elif audio_inferred:
+            parts.append("audio:likely")
+        else:
+            parts.append("audio:available")
     elif format_info.get("vcodec") not in {None, "", "none"}:
         parts.append(f"video:{format_info.get('vcodec')}")
 
@@ -174,7 +240,9 @@ def build_source_info(url: str, info: dict[str, Any], details: list[str]) -> Sou
 
     formats = get_formats(representative)
     formats_available = bool(formats)
-    audio_extractable = any(has_audio_stream(fmt) for fmt in formats) or has_audio_stream(representative)
+    audio_flags = [inspect_audio_support(fmt) for fmt in formats]
+    audio_extractable = any(flag[0] for flag in audio_flags) or inspect_audio_support(representative)[0]
+    inferred_audio = any(flag[1] for flag in audio_flags) or inspect_audio_support(representative)[1]
     can_process = True
 
     is_playlist = bool(root_entries) or info.get("_type") == "playlist"
@@ -190,7 +258,7 @@ def build_source_info(url: str, info: dict[str, Any], details: list[str]) -> Sou
     source_id = representative.get("id") or info.get("id")
     site = representative.get("webpage_url_domain") or info.get("webpage_url_domain") or extractor
     format_sample = [summarize_format(fmt) for fmt in formats[:FORMAT_SAMPLE_LIMIT]]
-    audio_formats_count = sum(1 for fmt in formats if has_audio_stream(fmt))
+    audio_formats_count = sum(1 for supported, _ in audio_flags if supported)
 
     source_info = {
         "title": title,
@@ -218,6 +286,13 @@ def build_source_info(url: str, info: dict[str, Any], details: list[str]) -> Sou
     if formats_available:
         append_detail(details, f"Found {len(formats)} format(s); {audio_formats_count} with audio streams.")
 
+    if inferred_audio:
+        inferred_ext = representative.get("ext") or "media"
+        append_detail(
+            details,
+            f"Audio extractability was inferred from the direct .{inferred_ext} media URL because codec metadata was unavailable.",
+        )
+
     if source_info["availability"]:
         append_detail(details, f"Availability: {source_info['availability']}")
 
@@ -228,6 +303,8 @@ def build_source_info(url: str, info: dict[str, Any], details: list[str]) -> Sou
     elif not audio_extractable:
         diagnostic_code = "no_audio_formats"
         message = "yt-dlp found formats, but none of them expose an audio stream for transcription."
+    elif inferred_audio:
+        message = "yt-dlp extracted metadata and the source looks suitable for audio extraction."
     else:
         message = "yt-dlp extracted metadata and found audio-capable formats."
 
