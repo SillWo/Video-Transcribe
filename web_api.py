@@ -15,10 +15,17 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper.utils import available_models
+from pydantic import BaseModel
+
+from source_check import check_source
 
 APP_ROOT = Path(__file__).resolve().parent
 RUNS_DIR = APP_ROOT / "web_runs"
 JSON_EVENT_PREFIX = "__VT_JSON__ "
+
+
+class SourceCheckRequest(BaseModel):
+    url: str
 
 
 def utc_now() -> str:
@@ -286,6 +293,11 @@ def get_options():
         "languages": ["auto", "ru", "en", "de", "fr", "es", "it", "pt", "uk", "ja", "ko", "zh"],
         "maxCpuThreads": max_cpu_threads,
     }
+
+
+@app.post("/api/check-source")
+def check_source_endpoint(payload: SourceCheckRequest):
+    return check_source(payload.url)
 
 
 @app.post("/api/transcriptions")

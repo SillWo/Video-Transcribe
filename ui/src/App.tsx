@@ -1,4 +1,4 @@
-import { startTransition, useDeferredValue, useEffect, useMemo, useState } from 'react'
+import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Cpu,
   FileAudio,
@@ -60,6 +60,37 @@ type OptionsResponse = {
   maxCpuThreads: number
 }
 
+type SourceCheckResponse = {
+  ok: boolean
+  canProcess: boolean
+  message: string
+  details: string[]
+  sourceInfo: {
+    title: string | null
+    id: string | null
+    extractor: string | null
+    extractorKey: string | null
+    site: string | null
+    webpageUrl: string | null
+    kind: string | null
+    isPlaylist: boolean
+    playlistTitle: string | null
+    entryCount: number | null
+    checkedEntries: number | null
+    formatsCount: number
+    audioFormatsCount: number
+    audioExtractable: boolean
+    availability: string | null
+    formatSample: string[]
+  } | null
+  formatsAvailable: boolean
+  audioExtractable: boolean
+  extractor: string | null
+  title: string | null
+  id: string | null
+  diagnosticCode: string
+}
+
 type UiError =
   | {
       kind: 'message'
@@ -82,10 +113,36 @@ const DEFAULT_OPTIONS: OptionsResponse = {
   maxCpuThreads: FALLBACK_CPU_THREADS,
 }
 
+async function getErrorMessage(response: Response): Promise<string> {
+  const text = await response.text()
+  if (!text) {
+    return `Request failed with status ${response.status}`
+  }
+
+  try {
+    const payload = JSON.parse(text) as { detail?: unknown; message?: unknown }
+    if (typeof payload.detail === 'string') {
+      return payload.detail
+    }
+    if (typeof payload.message === 'string') {
+      return payload.message
+    }
+    if (Array.isArray(payload.detail) && payload.detail.length > 0) {
+      return payload.detail
+        .map((item) => (typeof item === 'string' ? item : JSON.stringify(item)))
+        .join(', ')
+    }
+  } catch {
+    // Keep the plain response text when the backend does not return JSON.
+  }
+
+  return text
+}
+
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, init)
   if (!response.ok) {
-    throw new Error(await response.text())
+    throw new Error(await getErrorMessage(response))
   }
   return response.json() as Promise<T>
 }
@@ -132,12 +189,17 @@ export default function App() {
   const [error, setError] = useState<UiError | null>(null)
   const [job, setJob] = useState<JobResponse | null>(null)
   const [options, setOptions] = useState<OptionsResponse>(DEFAULT_OPTIONS)
+  const [sourceCheck, setSourceCheck] = useState<SourceCheckResponse | null>(null)
+  const [isCheckingSource, setIsCheckingSource] = useState(false)
+  const [isSourceCheckExpanded, setIsSourceCheckExpanded] = useState(false)
+  const sourceCheckRequestRef = useRef(0)
 
   const deferredLogText = useDeferredValue(job?.logs.join('\n') ?? '')
   const deferredTranscript = useDeferredValue(job?.result_text ?? '')
   const deferredPreview = useDeferredValue(job?.rendered_result ?? '')
   const currentJobId = job?.id
   const currentJobStatus = job?.status
+  const normalizedUrl = url.trim()
 
   useEffect(() => {
     document.title = t('summary.title')
@@ -207,6 +269,13 @@ export default function App() {
     return () => window.clearInterval(timer)
   }, [currentJobId, currentJobStatus])
 
+  useEffect(() => {
+    sourceCheckRequestRef.current += 1
+    setSourceCheck(null)
+    setIsCheckingSource(false)
+    setIsSourceCheckExpanded(false)
+  }, [sourceType, url])
+
   const effectiveTimestamps = outputFormat === 'srt' ? true : useTimestamps
   const maxCpuThreads = Math.max(options.maxCpuThreads || 1, 1)
   const effectiveCpuThreads = Math.min(Math.max(nproc, 1), maxCpuThreads)
@@ -229,6 +298,30 @@ export default function App() {
 
     return error.kind === 'message' ? error.message : t(error.key)
   }, [error, t])
+
+  const sourceCheckStatusLabel = useMemo(() => {
+    if (isCheckingSource) {
+      return t('controls.sourceCheck.status.checking')
+    }
+    if (!sourceCheck) {
+      return t('controls.sourceCheck.status.idle')
+    }
+    return sourceCheck.ok
+      ? t('controls.sourceCheck.status.ready')
+      : t('controls.sourceCheck.status.failed')
+  }, [isCheckingSource, sourceCheck, t])
+
+  const sourceCheckToneClass = useMemo(() => {
+    if (isCheckingSource) {
+      return 'border-sky-200 bg-sky-50 text-sky-900'
+    }
+    if (!sourceCheck) {
+      return 'border-stone-200 bg-stone-50 text-stone-700'
+    }
+    return sourceCheck.ok
+      ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
+      : 'border-rose-200 bg-rose-50 text-rose-900'
+  }, [isCheckingSource, sourceCheck])
 
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -276,6 +369,78 @@ export default function App() {
       )
     } finally {
       setIsSubmitting(false)
+    }
+  }
+
+  async function handleCheckSource() {
+    if (sourceType !== 'url') {
+      return
+    }
+
+    if (!normalizedUrl) {
+      setSourceCheck({
+        ok: false,
+        canProcess: false,
+        message: t('errors.enterVideoUrl'),
+        details: [],
+        sourceInfo: null,
+        formatsAvailable: false,
+        audioExtractable: false,
+        extractor: null,
+        title: null,
+        id: null,
+        diagnosticCode: 'empty_url',
+      })
+      return
+    }
+
+    const requestId = sourceCheckRequestRef.current + 1
+    sourceCheckRequestRef.current = requestId
+
+    try {
+      setIsCheckingSource(true)
+      const result = await fetchJson<SourceCheckResponse>('/api/check-source', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ url: normalizedUrl }),
+      })
+
+      if (sourceCheckRequestRef.current !== requestId) {
+        return
+      }
+
+      startTransition(() => {
+        setSourceCheck(result)
+        setIsSourceCheckExpanded(false)
+      })
+    } catch (checkError) {
+      if (sourceCheckRequestRef.current !== requestId) {
+        return
+      }
+
+      setSourceCheck({
+        ok: false,
+        canProcess: false,
+        message:
+          checkError instanceof Error
+            ? checkError.message
+            : t('controls.sourceCheck.messages.requestFailed'),
+        details: [],
+        sourceInfo: null,
+        formatsAvailable: false,
+        audioExtractable: false,
+        extractor: null,
+        title: null,
+        id: null,
+        diagnosticCode: 'request_failed',
+      })
+      setIsSourceCheckExpanded(false)
+    } finally {
+      if (sourceCheckRequestRef.current === requestId) {
+        setIsCheckingSource(false)
+      }
     }
   }
 
@@ -353,17 +518,167 @@ export default function App() {
                 </div>
 
                 {sourceType === 'url' ? (
-                  <label className="grid gap-2">
-                    <span className="text-sm font-medium text-stone-700">
-                      {t('controls.fields.url')}
-                    </span>
-                    <input
-                      value={url}
-                      onChange={(event) => setUrl(event.target.value)}
-                      placeholder={t('controls.placeholders.url')}
-                      className="rounded-2xl border border-stone-200 bg-stone-50 px-4 py-3 outline-none ring-0 transition placeholder:text-stone-400 focus:border-orange-300 focus:bg-white"
-                    />
-                  </label>
+                  <div className="grid gap-3">
+                    <label className="grid gap-2">
+                      <span className="text-sm font-medium text-stone-700">
+                        {t('controls.fields.url')}
+                      </span>
+                      <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px]">
+                        <input
+                          value={url}
+                          onChange={(event) => setUrl(event.target.value)}
+                          placeholder={t('controls.placeholders.url')}
+                          className="rounded-2xl border border-stone-200 bg-stone-50 px-4 py-3 outline-none ring-0 transition placeholder:text-stone-400 focus:border-orange-300 focus:bg-white"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void handleCheckSource()
+                          }}
+                          disabled={!normalizedUrl || isCheckingSource}
+                          className="inline-flex items-center justify-center gap-2 rounded-2xl border border-stone-200 bg-white px-4 py-3 text-sm font-semibold text-stone-800 transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:border-stone-200 disabled:bg-stone-100 disabled:text-stone-400"
+                        >
+                          {isCheckingSource ? (
+                            <>
+                              <LoaderCircle className="h-4 w-4 animate-spin" />
+                              {t('controls.buttons.checkingSource')}
+                            </>
+                          ) : (
+                            <>
+                              <Globe className="h-4 w-4" />
+                              {t('controls.buttons.checkSource')}
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </label>
+
+                    <div className={`rounded-3xl border px-4 py-4 ${sourceCheckToneClass}`}>
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <div className="text-xs font-semibold uppercase tracking-[0.18em]">
+                            {t('controls.sourceCheck.title')}
+                          </div>
+                          <p className="mt-1 text-sm text-current/80">
+                            {t('controls.sourceCheck.description')}
+                          </p>
+                        </div>
+                        <div className="rounded-full border border-current/15 bg-white/70 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-current">
+                          {sourceCheckStatusLabel}
+                        </div>
+                      </div>
+
+                      {sourceCheck && !isCheckingSource ? (
+                        <div className="mt-4">
+                          <button
+                            type="button"
+                            onClick={() => setIsSourceCheckExpanded((value) => !value)}
+                            className="inline-flex items-center justify-center rounded-full border border-current/15 bg-white/70 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-current transition hover:bg-white"
+                          >
+                            {isSourceCheckExpanded
+                              ? t('controls.sourceCheck.actions.hideDetails')
+                              : t('controls.sourceCheck.actions.showDetails')}
+                          </button>
+                        </div>
+                      ) : null}
+
+                      {sourceCheck && !isCheckingSource && isSourceCheckExpanded ? (
+                        <div className="mt-4 grid gap-4 border-t border-current/10 pt-4">
+                          <div className="text-sm font-medium">
+                            {sourceCheck.message}
+                          </div>
+
+                          <p className="text-xs text-current/75">
+                            {t('controls.sourceCheck.hint')}
+                          </p>
+
+                          {sourceCheck.sourceInfo ? (
+                            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                              <div className="rounded-2xl border border-current/10 bg-white/70 px-3 py-3">
+                                <div className="text-xs font-semibold uppercase tracking-[0.16em] text-current/70">
+                                  {t('controls.sourceCheck.fields.title')}
+                                </div>
+                                <div className="mt-1 break-words text-sm font-medium text-current">
+                                  {sourceCheck.sourceInfo.title ?? t('controls.sourceCheck.values.unavailable')}
+                                </div>
+                              </div>
+                              <div className="rounded-2xl border border-current/10 bg-white/70 px-3 py-3">
+                                <div className="text-xs font-semibold uppercase tracking-[0.16em] text-current/70">
+                                  {t('controls.sourceCheck.fields.extractor')}
+                                </div>
+                                <div className="mt-1 break-words text-sm font-medium text-current">
+                                  {sourceCheck.sourceInfo.site ??
+                                    sourceCheck.extractor ??
+                                    t('controls.sourceCheck.values.unavailable')}
+                                </div>
+                              </div>
+                              <div className="rounded-2xl border border-current/10 bg-white/70 px-3 py-3">
+                                <div className="text-xs font-semibold uppercase tracking-[0.16em] text-current/70">
+                                  {t('controls.sourceCheck.fields.id')}
+                                </div>
+                                <div className="mt-1 break-all text-sm font-medium text-current">
+                                  {sourceCheck.sourceInfo.id ?? t('controls.sourceCheck.values.unavailable')}
+                                </div>
+                              </div>
+                              <div className="rounded-2xl border border-current/10 bg-white/70 px-3 py-3">
+                                <div className="text-xs font-semibold uppercase tracking-[0.16em] text-current/70">
+                                  {t('controls.sourceCheck.fields.formats')}
+                                </div>
+                                <div className="mt-1 text-sm font-medium text-current">
+                                  {sourceCheck.formatsAvailable
+                                    ? t('controls.sourceCheck.values.formatsReady', {
+                                        count: sourceCheck.sourceInfo.formatsCount,
+                                      })
+                                    : t('controls.sourceCheck.values.noFormats')}
+                                </div>
+                              </div>
+                              <div className="rounded-2xl border border-current/10 bg-white/70 px-3 py-3">
+                                <div className="text-xs font-semibold uppercase tracking-[0.16em] text-current/70">
+                                  {t('controls.sourceCheck.fields.audio')}
+                                </div>
+                                <div className="mt-1 text-sm font-medium text-current">
+                                  {sourceCheck.audioExtractable
+                                    ? t('controls.sourceCheck.values.audioReady')
+                                    : t('controls.sourceCheck.values.audioMissing')}
+                                </div>
+                              </div>
+                              <div className="rounded-2xl border border-current/10 bg-white/70 px-3 py-3">
+                                <div className="text-xs font-semibold uppercase tracking-[0.16em] text-current/70">
+                                  {t('controls.sourceCheck.fields.kind')}
+                                </div>
+                                <div className="mt-1 text-sm font-medium text-current">
+                                  {sourceCheck.sourceInfo.isPlaylist
+                                    ? t('controls.sourceCheck.values.playlist', {
+                                        count: sourceCheck.sourceInfo.checkedEntries ?? 0,
+                                      })
+                                    : t('controls.sourceCheck.values.single')}
+                                </div>
+                              </div>
+                            </div>
+                          ) : null}
+
+                          {sourceCheck?.sourceInfo?.formatSample?.length ? (
+                            <div className="grid gap-2">
+                              <div className="text-xs font-semibold uppercase tracking-[0.16em] text-current/70">
+                                {t('controls.sourceCheck.fields.formatSample')}
+                              </div>
+                              <div className="flex flex-wrap gap-2">
+                                {sourceCheck.sourceInfo.formatSample.map((item) => (
+                                  <span
+                                    key={item}
+                                    className="rounded-full border border-current/10 bg-white/80 px-3 py-1 text-xs text-current"
+                                  >
+                                    {item}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          ) : null}
+
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
                 ) : (
                   <label className="grid gap-2">
                     <span className="text-sm font-medium text-stone-700">
