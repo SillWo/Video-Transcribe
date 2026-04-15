@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -9,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import psutil
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -38,6 +40,22 @@ def safe_filename(name: str | None, fallback: str = "upload.bin") -> str:
     for invalid_char in '<>:"/\\|?*':
         clean_name = clean_name.replace(invalid_char, "_")
     return clean_name or fallback
+
+
+def logical_cpu_count() -> int:
+    return psutil.cpu_count(logical=True) or os.cpu_count() or 1
+
+
+def parse_int(value: str | int | None, default: int, minimum: int, maximum: int) -> int:
+    if value is None:
+        return default
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+
+    return max(minimum, min(parsed, maximum))
 
 
 @dataclass
@@ -104,13 +122,25 @@ def serialize_job(job: JobState) -> dict[str, Any]:
     return payload
 
 
+def read_output_text(output_path: str | None) -> str | None:
+    if not output_path:
+        return None
+
+    path = Path(output_path)
+    if not path.exists() or not path.is_file():
+        return None
+
+    return path.read_text(encoding="utf-8-sig")
+
+
 def apply_result(job_id: str, result: dict[str, Any]) -> None:
+    rendered_result = read_output_text(result.get("output_path")) or result.get("rendered_result")
     update_job(
         job_id,
         output_path=result.get("output_path"),
         output_format=result.get("output_format"),
         result_text=result.get("text"),
-        rendered_result=result.get("rendered_result"),
+        rendered_result=rendered_result,
         detected_language=result.get("detected_language"),
         saved_audio=result.get("saved_audio"),
     )
@@ -121,7 +151,12 @@ def apply_complete(job_id: str, results: list[dict[str, Any]]) -> None:
         return
 
     combined_text = "\n\n".join(result.get("text", "").strip() for result in results if result.get("text")).strip()
-    rendered_chunks = [result.get("rendered_result", "").strip() for result in results if result.get("rendered_result")]
+    rendered_chunks = []
+    for result in results:
+        rendered_result = read_output_text(result.get("output_path")) or result.get("rendered_result")
+        if rendered_result:
+            rendered_chunks.append(rendered_result.strip())
+
     update_job(
         job_id,
         results=results,
@@ -153,6 +188,9 @@ def build_command(job: JobState, source_path: str) -> list[str]:
         "--web_json",
     ]
 
+    if settings["device"] == "cpu":
+        command.extend(["-n", str(settings["nproc"])])
+
     if settings["saveAudio"]:
         command.append("-k")
 
@@ -169,6 +207,9 @@ def run_job(job_id: str, source_path: str) -> None:
 
     job = get_job(job_id)
     command = build_command(job, source_path)
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.setdefault("PYTHONUTF8", "1")
 
     update_job(job_id, status="running", stage="source")
     append_log(job_id, f"$ {' '.join(command)}")
@@ -182,6 +223,7 @@ def run_job(job_id: str, source_path: str) -> None:
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
             bufsize=1,
         )
 
@@ -236,11 +278,13 @@ def health_check():
 
 @app.get("/api/options")
 def get_options():
+    max_cpu_threads = logical_cpu_count()
     return {
         "models": available_models(),
         "devices": ["cpu", "cuda"],
         "outputFormats": ["txt", "srt", "json"],
-        "languages": ["ru", "en", "de", "fr", "es", "it", "pt", "uk", "ja", "ko", "zh"],
+        "languages": ["auto", "ru", "en", "de", "fr", "es", "it", "pt", "uk", "ja", "ko", "zh"],
+        "maxCpuThreads": max_cpu_threads,
     }
 
 
@@ -252,6 +296,7 @@ async def create_transcription(
     language: str = Form("ru"),
     model: str = Form("small"),
     device: str = Form("cpu"),
+    nproc: str | None = Form(None),
     outputFormat: str = Form("srt"),
     saveAudio: str = Form("false"),
     useTimestamps: str = Form("true"),
@@ -284,12 +329,14 @@ async def create_transcription(
         source_name = (url or "").strip()
         source_path = source_name
 
+    max_cpu_threads = logical_cpu_count()
     settings = {
         "sourceType": sourceType,
         "url": (url or "").strip(),
         "language": language.strip() or "ru",
         "model": model.strip() or "small",
         "device": device.strip() or "cpu",
+        "nproc": parse_int(nproc, default=max_cpu_threads, minimum=1, maximum=max_cpu_threads),
         "outputFormat": outputFormat.strip() or "srt",
         "saveAudio": parse_bool(saveAudio, default=False),
         "useTimestamps": parse_bool(useTimestamps, default=True),
