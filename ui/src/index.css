@@ -1,0 +1,39 @@
+@import "tailwindcss";
+
+:root {
+  font-family:
+    "Segoe UI Variable Display",
+    "Segoe UI",
+    "Inter",
+    sans-serif;
+  color: #1c1917;
+  background-color: #fafaf9;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+#root {
+  min-height: 100vh;
+}

@@ -170,7 +170,7 @@ class AudioProcess:
 
 		# single file as a source
 		if self.findarg(self.opts, 'filename') and Path(self.opts.filename).exists():
-			self.opts.filename, self.opts.output_dir = self.get_fullpath(os.getcwd(), self.opts.filename)
+			self.opts.filename = Path(self.opts.filename).resolve()
 			self.media_files.append(str(self.opts.filename))
 
 		# inputput_dir source
