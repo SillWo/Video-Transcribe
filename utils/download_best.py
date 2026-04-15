@@ -1,332 +1,257 @@
-from __future__ import unicode_literals
-import sys
-import os
-import youtube_dl
 import argparse
-import subprocess
 import shutil
-from pathlib import Path, PurePath
-import timeit
-import pdb
-import io
+import subprocess
 import sys
+import timeit
+from pathlib import Path
 
-default_model_bin        = "yt-dlp.exe"
-default_get_best_format  = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-default_get_video_format = "bestvideo[ext=mp4]/best[ext=mp4]"
+default_model_bin = "yt-dlp.exe"
+default_get_best_format = "bestvideo*+bestaudio/best"
+default_get_video_format = "bestvideo*/best"
 default_get_audio_format = "bestaudio/best"
-default_get_merge_format = 'mkv'
+default_get_merge_format = "mkv"
+
 
 class Download:
+    def findarg(self, args, key: str) -> bool:
+        return key in args and getattr(args, key)
 
-	# print unicode characters instead of ascii
-	#def printuni(text):
-	#
-	#	stdout_bytes = text.encode('utf-8')
-	#	print(f"bytes: {stdout_bytes}")
-	#
-	#	idxlist = []
-	#	for idx, byte_value in enumerate(stdout_bytes):
-	#		print(byte_value)
-	#		if byte_value < 32 or byte_value > 126:
-	#			# Non-printable character found
-	#			idxlist.append(idx)
-	#
-	#	print(f'size {idxlist}')
-	#
-	#	#print(c, end="") for idx, c in enumerate(stdout_bytes) if idx not in idxlist else print(ord(c), end="")
-	#
-	#	for idx, c in enumerate(text):
-	#		if idx not in idxlist:
-	#			print(f'{c}', end="")
-	#		else:
-	#			print(ord(c), end="")
-	#
-	#	print("")
+    def get_fullpath(self, output_dir, output_file) -> tuple[Path, str]:
+        output_filepath = Path(output_file).resolve()
 
-	# Input: str:output_dir, str:output_file
-	# Return: Path:output_dir/output_file
-	# Info: if output_file has a path, it overrides output_dir
+        if output_filepath.parent != Path(output_dir).resolve():
+            output_dir = output_filepath.parent
+            output_file = Path(output_file).name
 
-	def findarg(self, args, key: str) -> bool:
-		return key in args and getattr(args, key)
+        return Path(output_dir, output_file), output_dir
 
-	def get_fullpath(self, output_dir, output_file) -> tuple[Path, str]:
-		output_filepath = Path(output_file).resolve()
+    def resolve_model_cmd(self, candidate: str | None) -> list[str]:
+        if candidate:
+            resolved = shutil.which(candidate)
+            if resolved:
+                return [resolved]
 
-		if output_filepath.parent != Path(output_dir).resolve():
-			output_dir = output_filepath.parent
-			output_file = Path(output_file).name
+            explicit_path = Path(candidate)
+            if explicit_path.exists():
+                return [str(explicit_path.resolve())]
 
-		return Path(output_dir, output_file), output_dir
+        for fallback in ("yt-dlp.exe", "yt-dlp"):
+            resolved = shutil.which(fallback)
+            if resolved:
+                return [resolved]
 
-	def adjust_format(self, args):
+        try:
+            __import__("yt_dlp")
+            return [sys.executable, "-m", "yt_dlp"]
+        except ImportError as exc:
+            raise FileNotFoundError("yt-dlp executable was not found and Python package yt_dlp is not installed") from exc
 
-		try:
-			if self.findarg(args, 'bin'):
-				self.model_bin = str(Path(args.bin).resolve())
-		except FileNotFoundError as e:
-			print(e)
+    def adjust_format(self, args):
+        self.model_cmd = self.resolve_model_cmd(getattr(args, "bin", None))
 
-		if self.findarg(args, 'list'):
-			self.opts += ["-F", args.url]
-			return
+        if self.findarg(args, "list"):
+            self.opts = ["-F", args.url]
+            return
 
-		if self.findarg(args, 'audio_only'):
-			args.format = self.get_audio_format
-			args.merge = False
-		elif self.findarg(args, 'video_only'):
-			args.format = self.get_video_format
-			args.merge = False
+        if self.findarg(args, "audio_only"):
+            args.format = self.get_audio_format
+            args.merge = False
+        elif self.findarg(args, "video_only"):
+            args.format = self.get_video_format
+            args.merge = False
 
-		self.opts = [args.url, "-f", args.format]
+        self.opts = [args.url, "-f", args.format]
 
-		if self.findarg(args, 'keep'):
-			self.opts += ["-k"]
+        if self.findarg(args, "keep"):
+            self.opts += ["-k"]
 
-		if self.findarg(args, 'output_name'):
-			self.filepath, self.output_dir = self.get_fullpath(self.output_dir, args.output_name)
-			Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        if self.findarg(args, "output_name"):
+            self.filepath, self.output_dir = self.get_fullpath(self.output_dir, args.output_name)
+            Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+            self.opts += ["-o", str(self.filepath)]
 
-		elif self.findarg(args, 'output_dir'):
-			self.output_dir = Path(args.output_dir).resolve()
-			Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        elif self.findarg(args, "output_dir"):
+            self.output_dir = Path(args.output_dir).resolve()
+            Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+            self.opts += ["-P", str(self.output_dir)]
 
-			# need this for proper handle to file(s)
-			self.opts += ["--restrict-filenames"]
+        if self.findarg(args, "verbose"):
+            self.opts += ["--verbose"]
 
+        if "merge" in args and args.merge:
+            self.opts += ["--merge-output-format", args.merge[0]]
+        elif "merge" in args:
+            self.opts += ["--merge-output-format", self.get_merge_format]
 
-		if self.findarg(args, 'verbose'):
-			self.opts += ["--verbose"]
+        if self.findarg(args, "overwrite"):
+            self.opts += ["--yes-overwrites"]
 
-		if 'merge' in args and args.merge:
-			self.opts += ["--merge-output-format", args.merge[0]]
-		elif 'merge' in args:
-			self.opts += ["--merge-output-format", self.get_merge_format]
+        if self.findarg(args, "username"):
+            self.opts += ["-u", args.username]
+            if self.findarg(args, "password"):
+                self.opts += ["-p", args.password]
 
-		if self.findarg(args, 'overwrite'):
-			self.opts += ["--yes-overwrites"]
+        if self.findarg(args, "playlist_start"):
+            self.opts += ["--playlist-start", args.playlist_start]
 
-		if self.findarg(args, 'username'):
-			self.opts += ["-u", args.username]
-			if self.findarg(args, 'password'):
-				self.opts += ["-p", args.password]
+        if self.findarg(args, "playlist_end"):
+            self.opts += ["--playlist-end", args.playlist_end]
 
-		if self.findarg(args, 'playlist_start'):
-			self.opts += ["--playlist-start", args.playlist_start]
+        if self.findarg(args, "audio_format"):
+            self.opts += ["--extract-audio", "--audio-format", args.audio_format]
 
-		if self.findarg(args, 'playlist_end'):
-			self.opts += ["--playlist-end", args.playlist_end]
+        if self.findarg(args, "restrict_filenames"):
+            self.opts += ["--restrict-filenames"]
 
-		if self.findarg(args, 'audio_format'):
-			self.opts += ["--extract-audio", "--audio-format", args.audio_format]
+        if self.findarg(args, "timeout"):
+            self.timeout = float(args.timeout)
 
-		if self.findarg(args, 'restrict_filenames'):
-			self.opts += ["--restrict-filenames"]
+    def normalize_output_path(self, output_file: str) -> str:
+        output_path = Path(output_file)
+        if not output_path.is_absolute():
+            output_path = self.output_dir / output_path
+        return str(output_path.resolve())
 
-		if self.findarg(args, 'timeout'):
-			self.timeout = args.timeout
+    def get_youtube_vid(self, filepath=None):
+        if filepath:
+            self.filepath, self.output_dir = self.get_fullpath(self.output_dir, filepath)
+            Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+            if "-o" not in self.opts:
+                self.opts += ["-o", str(self.filepath)]
 
-	# Input: filename to use for output if using externally
-	# Return: [list of filenames] that were processed, and [retcode]
-	def get_youtube_vid(self, filepath = None):
-		if filepath:
-			self.filepath, self.output_dir = self.get_fullpath(self.output_dir, filepath)
-			Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        process = subprocess.Popen(
+            self.model_cmd + self.opts,
+            encoding="utf8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            text=True,
+        )
 
-		if self.filepath:
-			self.opts += ["-o", str(self.filepath)]
+        if self.debug_flag:
+            print(f"Parameters: {self.model_cmd + self.opts}\n")
 
-		process = subprocess.Popen([self.model_bin] + self.opts, encoding="utf8", stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1)
+        media_list = []
+        output_file = ""
+        start_time = timeit.default_timer()
 
-		if self.debug_flag == True:
-			print(f"Parameters: {self.opts}\n")
+        merger_pattern = "[Merger] Merging formats into \""
+        download_pattern = "[download] Destination: "
+        post_audio_fix_pattern = "[ExtractAudio] Destination: "
+        downloaded_pattern = " has already been downloaded"
 
-		media_list = []
-		output_file = ''
-		start_time = timeit.default_timer()
+        try:
+            assert process.stdout is not None
+            for stdout_line_str in process.stdout:
+                stdout_line_str = stdout_line_str.rstrip()
+                if not stdout_line_str:
+                    continue
 
-		while True:
-			stdout_line_str = process.stdout.readline()
-			if not stdout_line_str and process.poll() is not None:
-				break
+                if "-F" in self.opts:
+                    print(stdout_line_str, flush=True)
+                    continue
 
-			elif not stdout_line_str:
-				while True:
-					stdout_line_str = process.stderr.readline()
+                if stdout_line_str.startswith(merger_pattern):
+                    output_file = stdout_line_str[len(merger_pattern) : -1]
+                elif stdout_line_str.startswith(post_audio_fix_pattern):
+                    output_file = stdout_line_str[len(post_audio_fix_pattern) :]
+                elif output_file == "" and stdout_line_str.startswith(download_pattern):
+                    output_file = stdout_line_str[len(download_pattern) :]
+                elif output_file == "" and downloaded_pattern in stdout_line_str:
+                    output_file = stdout_line_str[len("[download] ") : stdout_line_str.index(downloaded_pattern)]
 
-					if not stdout_line_str and process.poll() is not None:
-						break
+                if output_file and "Extracting URL:" in stdout_line_str:
+                    media_list.append(self.normalize_output_path(output_file))
+                    output_file = ""
 
-					if stdout_line_str:
-						print(stdout_line_str.rstrip())
-					break
+                print(stdout_line_str, flush=True)
 
-			try:
-				stdout_line_str = stdout_line_str.rstrip()
-			except UnicodeDecodeError as e:
-				# Handle decoding error gracefully
-				print(f"Error decoding line from stdout: {e}")
-				print(f"Problematic byte sequence: {stdout_line_str}")
-				continue
-			except KeyboardInterrupt:
-				process.kill()
-				outs, errs = process.communicate(timeout = 60)
-				print("----------------------KILLED---------------------------")
-				print(f"Process interrupted with media list {media_list}\nouts = {outs.decode('utf-8').rstrip()}\nerrs = {errs.decode('utf-8').rstrip()}")
+                if self.timeout is not None and timeit.default_timer() - start_time > self.timeout:
+                    process.kill()
+                    raise TimeoutError(f"Process timed out after {self.timeout} seconds")
 
-			# if just listing the formats, then stop here
-			if "-F" in self.opts:
-				print(stdout_line_str, flush=True)
-				continue;
-			#out, err = process.communicate() #blocking process
+        except KeyboardInterrupt:
+            process.kill()
+            raise
 
-			# Read and print the output line by line
-			merger_pattern     = "[Merger] Merging formats into \""
-			download_pattern   = "[download] Destination: "
-			post_audio_fix_pattern   = "[ExtractAudio] Destination: "
-			downloaded_pattern = " has already been downloaded"
+        return_code = process.wait(timeout=self.timeout)
 
-			if stdout_line_str:
-				if stdout_line_str.startswith(merger_pattern):
-					output_file = stdout_line_str[len(merger_pattern):-1]
+        if output_file:
+            normalized = self.normalize_output_path(output_file)
+            if normalized not in media_list:
+                media_list.append(normalized)
 
-				elif stdout_line_str.startswith(post_audio_fix_pattern):
-					output_file = stdout_line_str[len(post_audio_fix_pattern):]
+        if not media_list and return_code == 0 and "-F" not in self.opts:
+            raise RuntimeError("Nothing was downloaded. Check the provided URL or format selection.")
 
-				elif output_file == '' and stdout_line_str.startswith(download_pattern):
-					output_file = stdout_line_str[len(download_pattern):]
+        if self.debug_flag:
+            for file in media_list:
+                print(f"Downloaded file {file}")
+            print(f"Returned code {return_code}")
+            print("-----------------------FINISHED------------------------")
 
-				elif output_file == '' and downloaded_pattern in stdout_line_str:
-					output_file = stdout_line_str[len("[download] "):stdout_line_str.index(downloaded_pattern)]
+        return media_list, return_code
 
-				if output_file and 'Extracting URL:' in stdout_line_str:
-					media_list.append(output_file)
-					output_file = ''
+    def run(self, filepath=None):
+        if self.debug_flag:
+            print("---------------------DOWNLOADING-----------------------")
 
-				print(stdout_line_str, flush=True)
+        video_names, retcode = self.get_youtube_vid(filepath)
+        return video_names, retcode
 
-			if self.timeout is not None and float(timeit.default_timer() - start_time) > float(self.timeout):
-				process.kill()
-				outs, errs = process.communicate(timeout = 60)
-				print("----------------------KILLED---------------------------")
-				print(f"Process timed out after {self.timeout} seconds\nouts = {outs.decode('utf-8').rstrip()}\nerrs = {errs.decode('utf-8').rstrip()}")
+    def __init__(self, args, debug=False):
+        self.debug_flag = debug
+        self.model_cmd = []
+        self.get_best_format = default_get_best_format
+        self.get_audio_format = default_get_audio_format
+        self.get_video_format = default_get_video_format
+        self.get_merge_format = default_get_merge_format
+        self.opts = []
+        self.output_dir = Path.cwd()
+        self.filepath = None
+        self.timeout = None
+        self.adjust_format(args)
 
-
-		if output_file and output_file not in media_list:
-			media_list.append(output_file)
-
-		# Wait for the process to finish
-		if self.timeout is not None:
-			outs, errs  = process.communicate(timeout = self.timeout)
-		else:
-			outs, errs  = process.communicate()
-		return_code = process.returncode
-
-		try:
-			if media_list and self.output_dir != Path(media_list[0]).parent.resolve():
-				for index in range(len(media_list)):
-
-					output_file = media_list[index]
-					dst = shutil.move(output_file, str(Path(self.output_dir, Path(output_file).resolve().name)))
-
-					# change the item in the list
-					media_list[index] = dst
-
-			elif not media_list:
-				raise Exception(f"Nothing to process\nouts = {outs.decode('utf-8').rstrip()}\nerrs = {errs.decode('utf-8').rstrip()}")
-
-		except (shutil.Error, OSError) as e:
-			print("Error moving file:", e)
-
-		except Exception as e:
-			print(e)
-
-		if self.debug_flag == True:
-			for file in media_list:
-				print(f"Downloaded file {file}")
-			print(f"Returned code {return_code}")
-			print("-----------------------FINISHED------------------------")
-
-		return media_list, return_code
-
-	def run(self, filepath = None):
-
-		if self.debug_flag:
-			print("---------------------DOWNLOADING-----------------------")
-
-		# download the media file from the internet
-		video_names, retcode = self.get_youtube_vid(filepath)
-
-		return video_names, retcode;
-
-	def __init__(self, args, debug = False):
-
-		global default_model_bin
-		global default_get_best_format
-		global default_get_video_format
-		global default_get_audio_format
-		global default_get_merge_format
-
-		# validate the executatable
-		if shutil.which(default_model_bin) is not None:
-			self.debug_flag       = debug
-			self.model_bin        = default_model_bin
-			self.get_best_format  = default_get_best_format
-			self.get_audio_format = default_get_audio_format
-			self.get_video_format = default_get_video_format
-			self.get_merge_format = default_get_merge_format
-			self.opts             = []
-			self.output_dir       = os.getcwd()
-			self.filepath         = ''
-			self.timeout          = None
-		else:
-			raise FileNotFoundError(f"Executable file has a problem or does not exist {default_model_bin}")
-
-		# parse input arguments
-		self.adjust_format(args)
 
 def main():
+    parser = argparse.ArgumentParser("Downloads the best quality video from source", add_help=True)
+    parser.add_argument("-l", "--url", help="URL or source of one or more videos", required=True)
+    parser.add_argument("-F", "--list", help="List all formats that can be downloaded", action="store_true")
+    parser.add_argument("--verbose", help="Verbose output", action="store_true")
+    parser.add_argument("-k", "--keep", help="Keep intermediate files", action="store_true")
+    parser.add_argument("-f", "--format", help="Format of the video to download", default=default_get_best_format)
+    parser.add_argument("-u", "--username", help="Username to login with")
+    parser.add_argument("-p", "--password", help="Password for the credentials. Used with username")
+    parser.add_argument("-o", "--output_name", help="Ouput filename")
+    parser.add_argument("-od", "--output_dir", help="Ouput directory", default=Path.cwd())
+    parser.add_argument("-a", "--audio_only", help="Audio only download", action="store_true")
+    parser.add_argument("-v", "--video_only", help="Video only download", action="store_true")
+    parser.add_argument("-b", "--bin", help="Path to the yt-dlp binary to choose")
+    parser.add_argument("-m", "--merge", help="Whether to merge the audio and video. Default format: mkv", nargs="*")
+    parser.add_argument("--quiet", help="Debug print off", action="store_true")
+    parser.add_argument("--overwrite", help="Overwrite an exising file", action="store_true")
+    parser.add_argument("--timeout", help="Amount of time to wait for the download to finish (seconds)")
+    parser.add_argument("--playlist_start", help="Starting position from a list of media, to start downloading from")
+    parser.add_argument("--playlist_end", help="Ending position from a list of media, to stop downloading at")
+    parser.add_argument("--audio_format", help="Specify the audio format to use in post-processing")
+    parser.add_argument("--restrict_filenames", help="Restrict filenames to only ASCII characters, and avoid '&' and spaces in filenames", action="store_true")
 
-	parser = argparse.ArgumentParser("Downloads the best quality video from source", add_help=True)
-	parser.add_argument("-l", "--url", help="URL or source of one or more videos", required=True)
-	parser.add_argument("-F", "--list", help="List all formats that can be downloaded", action='store_true')
-	parser.add_argument("--verbose", help="Verbose output", action='store_true')
-	parser.add_argument('-k', "--keep", help="Keep intermediate files", action='store_true')
-	parser.add_argument("-f", "--format", help="Format of the video to download", default=default_get_best_format)
-	parser.add_argument("-u", "--username", help="Username to login with")
-	parser.add_argument("-p", "--password", help="Password for the credentials. Used with username")
-	parser.add_argument("-o", "--output_name", help="Ouput filename")
-	parser.add_argument("-od", "--output_dir", help="Ouput directory", default=os.getcwd())
-	parser.add_argument("-a", "--audio_only", help="Audio only download", action='store_true')
-	parser.add_argument("-v", "--video_only", help="Video only download", action='store_true')
-	parser.add_argument("-b", "--bin", help="Path to the binary to choose")
-	parser.add_argument("-m", "--merge", help="Whether to merge the audio and video. Default format: mkv", nargs='*')
-	parser.add_argument("--quiet", help="Debug print off", action='store_true')
-	parser.add_argument("--overwrite", help="Overwrite an exising file", action='store_true')
-	parser.add_argument("--timeout", help="Amount of time to wait for the download to finish (seconds)")
-	parser.add_argument("--playlist_start", help="Starting position from a list of media, to start downloading from")
-	parser.add_argument("--playlist_end", help="Ending position from a list of media, to stop downloading at")
-	parser.add_argument("--audio_format", help="Specify the audio format to use in post-processing", action='store_true')
-	parser.add_argument("--restrict_filenames", help="Restrict filenames to only ASCII characters, and avoid '&' and spaces in filenames", action='store_true')
+    args = parser.parse_args()
+    downloader = Download(args, debug=not args.quiet)
 
-	args = parser.parse_args()
-	downloader = Download(args, debug=not args.quiet)
+    if not args.quiet:
+        print("-----------------------SETTINGS------------------------")
+        arguments = vars(args)
+        for key in arguments:
+            value = getattr(args, key)
+            if (key and type(value) is not bool and value is not None) or type(value) is bool:
+                print(key, "\t", value)
 
-	if not args.quiet:
+        print("---------------------DOWNLOADING-----------------------")
 
-		print("-----------------------SETTINGS------------------------")
-
-		arguments = vars(args);
-		for key in arguments:
-			value = getattr(args, key)
-			if (key and type(value) != bool and value != None) or type(value) == bool:
-				print(key, '\t', value)
-
-		print("---------------------DOWNLOADING-----------------------")
-
-	downloader.get_youtube_vid()
+    downloader.get_youtube_vid()
 
 
-if __name__ == '__main__':
-	main()
+if __name__ == "__main__":
+    main()

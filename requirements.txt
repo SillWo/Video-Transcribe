@@ -1,5 +1,8 @@
 ffmpeg-python
 faster_whisper
 psutil
-youtube_dl
+fastapi
+python-multipart
+uvicorn
 validators
+yt-dlp
