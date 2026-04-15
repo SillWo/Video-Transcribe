@@ -93,7 +93,7 @@ def initialize(args):
 
 	# initialize the model with given args
 	if args.device != "cuda":
-		threads = os.cpu_count()
+		threads = int(args.nproc)
 		model = whisper(
         	args.model_size,
         	cpu_threads=threads,
