@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import time
 import timeit
 from os.path import isfile, join
@@ -22,6 +23,10 @@ JSON_EVENT_PREFIX = "__VT_JSON__ "
 
 def sizes_supported() -> list[str]:
     return available_models()
+
+
+def logical_cpu_count() -> int:
+    return psutil.cpu_count(logical=True) or os.cpu_count() or 1
 
 
 def srt_format_timestamp(seconds: float) -> str:
@@ -64,6 +69,15 @@ def emit_event(args, event_type: str, **payload) -> None:
 
     event = {"type": event_type, **payload}
     print(f"{JSON_EVENT_PREFIX}{json.dumps(event, ensure_ascii=False)}", flush=True)
+
+
+def configure_web_stdio(args) -> None:
+    if not getattr(args, "web_json", False):
+        return
+
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 def get_fullpath(output_dir, output_file) -> tuple[Path, str]:
@@ -130,7 +144,11 @@ def build_output_payload(segments: list[dict], stats, use_timestamps: bool) -> d
 
 def write_output(args, segments: list[dict], stats, filename: str) -> tuple[Path, str]:
     output_suffix = args.output_format
-    output_path = Path(args.output_dir, Path(filename).stem + "." + time.strftime("%Y%m%d-%H%M%S") + f".{args.language}.{output_suffix}")
+    output_language = stats.language if args.language == "auto" else args.language
+    output_path = Path(
+        args.output_dir,
+        Path(filename).stem + "." + time.strftime("%Y%m%d-%H%M%S") + f".{output_language}.{output_suffix}",
+    )
 
     if args.output_format == "srt":
         with open(output_path, "w", encoding="utf-8") as srt_file:
@@ -158,7 +176,8 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
     emit_event(args, "stage", stage="recognition", status="in_progress", message=f"Transcribing {Path(filename).name}")
 
     start_time = timeit.default_timer()
-    segments_iter, stats = model.transcribe(full_filepath, beam_size=args.beam_size, language=args.language)
+    language = None if args.language == "auto" else args.language
+    segments_iter, stats = model.transcribe(full_filepath, beam_size=args.beam_size, language=language)
     segments = serialize_segments(list(segments_iter))
 
     print("\nDetected language '%s' with probability %f" % (stats.language, stats.language_probability))
@@ -200,7 +219,7 @@ def initialize(args):
         os.remove(audio_file)
 
     if args.device != "cuda":
-        threads = int(args.nproc or psutil.cpu_count(logical=False) or psutil.cpu_count() or 1)
+        threads = max(1, min(int(args.nproc or logical_cpu_count()), logical_cpu_count()))
         model = whisper(
             args.model_size,
             cpu_threads=threads,
@@ -300,7 +319,7 @@ def main():
     parser.add_argument("-s", "--model_size", help="Size of the model, default is small.", choices=sizes_supported(), nargs="?", default="small")
     parser.add_argument("--start", help="Start time in 00:00:00 format", type=AudioProcess.valid_time)
     parser.add_argument("--end", help="End time in 00:00:00 format", type=AudioProcess.valid_time)
-    parser.add_argument("-n", "--nproc", help="Number of CPUs to use", default=psutil.cpu_count(logical=False) or psutil.cpu_count() or 1, type=int)
+    parser.add_argument("-n", "--nproc", help="Number of CPUs to use", default=logical_cpu_count(), type=int)
     parser.add_argument("-k", "--keep", help="Keep intermediate files", action="store_true")
     parser.add_argument("--verbose", help="Verbose print from dependent processes", action="store_true")
     parser.add_argument("--quiet", help="Debug print off", action="store_true")
@@ -313,6 +332,7 @@ def main():
     parser.add_argument("--web_json", help=argparse.SUPPRESS, action="store_true")
 
     args = parser.parse_args()
+    configure_web_stdio(args)
     args.use_timestamps = False if args.no_timestamps else True
 
     if args.output_format == "srt":
