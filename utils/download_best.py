@@ -14,7 +14,7 @@ import sys
 default_model_bin        = "yt-dlp.exe"
 default_get_best_format  = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 default_get_video_format = "bestvideo[ext=mp4]/best[ext=mp4]"
-default_get_audio_format = "bestaudio[ext=m4a]/best[ext=aac]"
+default_get_audio_format = "bestaudio/best"
 default_get_merge_format = 'mkv'
 
 class Download:
