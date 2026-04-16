@@ -4,3 +4,9 @@ __pycache__/
 web_runs/
 ui/node_modules/
 ui/dist/
+build/
+artifacts/
+staging/
+runtime-binaries/
+*.spec.bak
+*.work.zip

@@ -1,0 +1,27 @@
+name: Windows Release Caller
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag, for example v1.2.3"
+        required: true
+        type: string
+      source_ref:
+        description: "Exact source ref from main, for example refs/tags/v1.2.3"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  dispatch-packaging:
+    uses: SillWo/Video-Transcribe/.github/workflows/windows-release-reusable.yml@windows_dist
+    with:
+      release_tag: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+      source_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref }}
+      source_sha: ${{ github.sha }}

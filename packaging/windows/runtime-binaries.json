@@ -1,0 +1,23 @@
+{
+  "ytDlp": {
+    "version": "2026.03.17",
+    "filename": "yt-dlp.exe",
+    "url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.03.17/yt-dlp.exe",
+    "sha256": "3db811b366b2da47337d2fcfdfe5bbd9a258dad3f350c54974f005df115a1545"
+  },
+  "deno": {
+    "version": "2.6.3",
+    "archiveName": "deno-x86_64-pc-windows-msvc.zip",
+    "archiveUrl": "https://github.com/denoland/deno/releases/download/v2.6.3/deno-x86_64-pc-windows-msvc.zip",
+    "archiveSha256": "a011a0c6f1ea120ec60a65969e9d549af894b999cf1d35fe5ee81e694227cce2",
+    "denoRelativePath": "deno.exe"
+  },
+  "ffmpeg": {
+    "version": "8.1",
+    "archiveName": "ffmpeg-release-essentials.zip",
+    "archiveUrl": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+    "archiveSha256": "8748283d821613d930b0e7be685aaa9df4ca6f0ad4d0c42fd02622b3623463c6",
+    "ffmpegRelativePath": "ffmpeg-8.1-essentials_build/bin/ffmpeg.exe",
+    "ffprobeRelativePath": "ffmpeg-8.1-essentials_build/bin/ffprobe.exe"
+  }
+}

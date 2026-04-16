@@ -142,6 +142,35 @@ def build_output_payload(segments: list[dict], stats, use_timestamps: bool) -> d
     return payload
 
 
+def _cuda_runtime_missing(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "cublas64_12.dll",
+            "cudart64_12.dll",
+            "cusparse64_12.dll",
+            "cannot be loaded",
+            "could not load",
+            "not found",
+        )
+    )
+
+
+def _create_model(args, device: str):
+    if device != "cuda":
+        threads = max(1, min(int(args.nproc or logical_cpu_count()), logical_cpu_count()))
+        return whisper(
+            args.model_size,
+            cpu_threads=threads,
+            num_workers=4,
+            device=device,
+            compute_type=args.precision,
+        )
+
+    return whisper(args.model_size, device=device, compute_type=args.precision)
+
+
 def write_output(args, segments: list[dict], stats, filename: str) -> tuple[Path, str]:
     output_suffix = args.output_format
     output_language = stats.language if args.language == "auto" else args.language
@@ -177,7 +206,16 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
 
     start_time = timeit.default_timer()
     language = None if args.language == "auto" else args.language
-    segments_iter, stats = model.transcribe(full_filepath, beam_size=args.beam_size, language=language)
+    try:
+        segments_iter, stats = model.transcribe(full_filepath, beam_size=args.beam_size, language=language)
+    except RuntimeError as exc:
+        if args.device == "cuda" and _cuda_runtime_missing(exc):
+            print("[warning] CUDA runtime libraries are unavailable; retrying transcription on CPU.")
+            args.device = "cpu"
+            model = initialize(args)
+            segments_iter, stats = model.transcribe(full_filepath, beam_size=args.beam_size, language=language)
+        else:
+            raise
     segments = serialize_segments(list(segments_iter))
 
     print("\nDetected language '%s' with probability %f" % (stats.language, stats.language_probability))
@@ -218,19 +256,14 @@ def initialize(args):
     if isfile(audio_file):
         os.remove(audio_file)
 
-    if args.device != "cuda":
-        threads = max(1, min(int(args.nproc or logical_cpu_count()), logical_cpu_count()))
-        model = whisper(
-            args.model_size,
-            cpu_threads=threads,
-            num_workers=4,
-            device=args.device,
-            compute_type=args.precision,
-        )
-    else:
-        model = whisper(args.model_size, device=args.device, compute_type=args.precision)
-
-    return model
+    try:
+        return _create_model(args, args.device)
+    except RuntimeError as exc:
+        if args.device == "cuda" and _cuda_runtime_missing(exc):
+            print("[warning] CUDA runtime libraries are unavailable; falling back to CPU.")
+            args.device = "cpu"
+            return _create_model(args, "cpu")
+        raise
 
 
 def close(args):

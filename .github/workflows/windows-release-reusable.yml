@@ -1,0 +1,112 @@
+name: Windows Release Reusable
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+      source_ref:
+        required: false
+        type: string
+      source_sha:
+        required: false
+        type: string
+      packaging_ref:
+        required: false
+        type: string
+        default: windows_dist
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref != '' && inputs.source_ref || inputs.source_sha }}
+          path: source
+          fetch-depth: 0
+
+      - name: Verify source commit belongs to main
+        shell: pwsh
+        run: |
+          git -C source fetch origin main --depth=1
+          git -C source merge-base --is-ancestor HEAD origin/main
+
+      - name: Checkout packaging branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.packaging_ref }}
+          path: packaging
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: source/ui/package-lock.json
+
+      - name: Install Inno Setup
+        id: inno
+        shell: pwsh
+        run: |
+          $path = & ".\packaging\scripts\windows\install-inno-setup.ps1"
+          "iscc_path=$path" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Build release installer
+        id: build
+        shell: pwsh
+        run: |
+          $sourceRef = "${{ inputs.source_ref }}"
+          $sourceSha = "${{ inputs.source_sha }}"
+          $installer = & ".\packaging\scripts\windows\build-release.ps1" `
+            -ReleaseTag "${{ inputs.release_tag }}" `
+            -SourceRef $sourceRef `
+            -SourceSha $sourceSha `
+            -PackagingRef "${{ inputs.packaging_ref }}" `
+            -SourceDir ".\source" `
+            -PackagingDir ".\packaging" `
+            -WorkRoot "$env:RUNNER_TEMP\vt-build" `
+            -PythonExe python `
+            -IsccPath "${{ steps.inno.outputs.iscc_path }}"
+          "installer_path=$installer" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "checksum_path=$installer.sha256" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-transcribe-installer-${{ inputs.release_tag }}
+          path: |
+            ${{ steps.build.outputs.installer_path }}
+            ${{ steps.build.outputs.checksum_path }}
+
+      - name: Publish GitHub release asset
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${{ inputs.release_tag }}" --repo "$env:GITHUB_REPOSITORY" *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create "${{ inputs.release_tag }}" `
+              "${{ steps.build.outputs.installer_path }}" `
+              "${{ steps.build.outputs.checksum_path }}" `
+              --title "${{ inputs.release_tag }}" `
+              --generate-notes `
+              --repo "$env:GITHUB_REPOSITORY"
+          } else {
+            gh release upload "${{ inputs.release_tag }}" `
+              "${{ steps.build.outputs.installer_path }}" `
+              "${{ steps.build.outputs.checksum_path }}" `
+              --clobber `
+              --repo "$env:GITHUB_REPOSITORY"
+          }
