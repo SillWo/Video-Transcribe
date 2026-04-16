@@ -1,5 +1,6 @@
 ffmpeg-python
 faster_whisper
+huggingface_hub
 psutil
 fastapi
 python-multipart
