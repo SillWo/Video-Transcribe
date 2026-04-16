@@ -9,6 +9,10 @@ The Windows release flow is split into two branches:
 - `main` contains the product source code.
 - `windows_dist` contains packaging-only logic: launcher, PyInstaller spec, Inno Setup script, build scripts, workflows, and release docs.
 
+This repository is a fork of [Video-Transcribe](https://github.com/a2nath/Video-Transcribe).
+
+Development and release maintenance are done with Codex.
+
 Release builds always use:
 
 - `source/` from an exact tagged commit in `main`
@@ -33,6 +37,15 @@ Result:
 - `build/windows/installer/VideoTranscribe-Setup-0.0.0-local.exe.sha256`
 
 User machines do not need manual installation of Python, Node.js, `ffmpeg`, or `yt-dlp`. The installer bundles the runtime and starts the local service automatically after installation.
+
+### Codex refresh notes
+
+If `main` changes product code, do not copy application source into `windows_dist`.
+
+- Keep `windows_dist` packaging-only.
+- Update `windows_dist` only when launcher, runtime config, PyInstaller, installer, or workflow logic must follow a product change.
+- Rebuild release assets from exact tagged source in `main` plus packaging files from `windows_dist`.
+- Never patch `source/` during the release build.
 
 ## Содержание
 
