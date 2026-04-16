@@ -2,50 +2,9 @@
 
 Локальный сервис для расшифровки аудио и видео с использованием `faster-whisper`, `FastAPI`, `yt-dlp`, `ffmpeg` и веб-интерфейса на React.
 
-## Windows Packaging Pipeline
+Этот репозиторий fork [Video-Transcribe](https://github.com/a2nath/Video-Transcribe).
 
-The Windows release flow is split into two branches:
-
-- `main` contains the product source code.
-- `windows_dist` contains packaging-only logic: launcher, PyInstaller spec, Inno Setup script, build scripts, workflows, and release docs.
-
-This repository is a fork of [Video-Transcribe](https://github.com/a2nath/Video-Transcribe).
-
-Development and release maintenance are done with Codex.
-
-Release builds always use:
-
-- `source/` from an exact tagged commit in `main`
-- `packaging/` from `windows_dist`
-
-Local installer build from the current checkout:
-
-```powershell
-$iscc = .\scripts\windows\install-inno-setup.ps1
-
-powershell -ExecutionPolicy Bypass -File .\scripts\windows\build-release.ps1 `
-  -ReleaseTag v0.0.0-local `
-  -SourceRef refs/heads/develop `
-  -PackagingDir . `
-  -RepositoryRoot . `
-  -IsccPath $iscc
-```
-
-Result:
-
-- `build/windows/installer/VideoTranscribe-Setup-0.0.0-local.exe`
-- `build/windows/installer/VideoTranscribe-Setup-0.0.0-local.exe.sha256`
-
-User machines do not need manual installation of Python, Node.js, `ffmpeg`, or `yt-dlp`. The installer bundles the runtime and starts the local service automatically after installation.
-
-### Codex refresh notes
-
-If `main` changes product code, do not copy application source into `windows_dist`.
-
-- Keep `windows_dist` packaging-only.
-- Update `windows_dist` only when launcher, runtime config, PyInstaller, installer, or workflow logic must follow a product change.
-- Rebuild release assets from exact tagged source in `main` plus packaging files from `windows_dist`.
-- Never patch `source/` during the release build.
+Разработка и сопровождение релизов осуществляются с помощью Codex.
 
 ## Содержание
 
@@ -265,3 +224,45 @@ http://127.0.0.1:5173
 ```env
 VITE_API_BASE_URL=http://127.0.0.1:8000
 ```
+
+
+## Windows Packaging Pipeline
+
+The Windows release flow is split into two branches:
+
+- `main` contains the product source code.
+- `windows_dist` contains packaging-only logic: launcher, PyInstaller spec, Inno Setup script, build scripts, workflows, and release docs.
+
+Release builds always use:
+
+- `source/` from an exact tagged commit in `main`
+- `packaging/` from `windows_dist`
+
+Local installer build from the current checkout:
+
+```powershell
+$iscc = .\scripts\windows\install-inno-setup.ps1
+
+powershell -ExecutionPolicy Bypass -File .\scripts\windows\build-release.ps1 `
+  -ReleaseTag v0.0.0-local `
+  -SourceRef refs/heads/develop `
+  -PackagingDir . `
+  -RepositoryRoot . `
+  -IsccPath $iscc
+```
+
+Result:
+
+- `build/windows/installer/VideoTranscribe-Setup-0.0.0-local.exe`
+- `build/windows/installer/VideoTranscribe-Setup-0.0.0-local.exe.sha256`
+
+User machines do not need manual installation of Python, Node.js, `ffmpeg`, or `yt-dlp`. The installer bundles the runtime and starts the local service automatically after installation.
+
+### Codex refresh notes
+
+If `main` changes product code, do not copy application source into `windows_dist`.
+
+- Keep `windows_dist` packaging-only.
+- Update `windows_dist` only when launcher, runtime config, PyInstaller, installer, or workflow logic must follow a product change.
+- Rebuild release assets from exact tagged source in `main` plus packaging files from `windows_dist`.
+- Never patch `source/` during the release build.
