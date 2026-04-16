@@ -2,6 +2,38 @@
 
 Локальный сервис для расшифровки аудио и видео с использованием `faster-whisper`, `FastAPI`, `yt-dlp`, `ffmpeg` и веб-интерфейса на React.
 
+## Windows Packaging Pipeline
+
+The Windows release flow is split into two branches:
+
+- `main` contains the product source code.
+- `windows_dist` contains packaging-only logic: launcher, PyInstaller spec, Inno Setup script, build scripts, workflows, and release docs.
+
+Release builds always use:
+
+- `source/` from an exact tagged commit in `main`
+- `packaging/` from `windows_dist`
+
+Local installer build from the current checkout:
+
+```powershell
+$iscc = .\scripts\windows\install-inno-setup.ps1
+
+powershell -ExecutionPolicy Bypass -File .\scripts\windows\build-release.ps1 `
+  -ReleaseTag v0.0.0-local `
+  -SourceRef refs/heads/develop `
+  -PackagingDir . `
+  -RepositoryRoot . `
+  -IsccPath $iscc
+```
+
+Result:
+
+- `build/windows/installer/VideoTranscribe-Setup-0.0.0-local.exe`
+- `build/windows/installer/VideoTranscribe-Setup-0.0.0-local.exe.sha256`
+
+User machines do not need manual installation of Python, Node.js, `ffmpeg`, or `yt-dlp`. The installer bundles the runtime and starts the local service automatically after installation.
+
 ## Содержание
 
 - [Описание проекта](#описание-проекта)
