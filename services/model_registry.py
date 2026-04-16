@@ -5,6 +5,10 @@ ModelLanguageScope = Literal["multilingual", "english"]
 ModelFamily = Literal["standard", "distil"]
 
 
+class ModelRegistryLookupError(KeyError):
+    """Raised when a model id is missing from the canonical registry."""
+
+
 @dataclass(frozen=True)
 class ModelRegistryEntry:
     id: str
@@ -143,6 +147,14 @@ MODEL_REGISTRY: tuple[ModelRegistryEntry, ...] = (
 
 def get_model_registry() -> tuple[ModelRegistryEntry, ...]:
     return MODEL_REGISTRY
+
+
+def get_model_registry_entry(model_id: str) -> ModelRegistryEntry:
+    for entry in MODEL_REGISTRY:
+        if entry.id == model_id:
+            return entry
+
+    raise ModelRegistryLookupError(f"Unsupported model id: {model_id}")
 
 
 def list_model_catalog() -> list[dict[str, str | bool]]:

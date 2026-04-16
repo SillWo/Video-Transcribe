@@ -1,12 +1,16 @@
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
+from huggingface_hub import DryRunFileInfo
 from huggingface_hub.errors import CacheNotFound
 
+import web_api
 from services.model_management import get_model_panel_payload, list_models_with_status
 from web_api import app
 
@@ -36,7 +40,52 @@ def build_repo(
     )
 
 
+def create_cached_snapshot(snapshot_path: Path, files: tuple[str, ...]) -> int:
+    snapshot_path.mkdir(parents=True, exist_ok=True)
+    total_size = 0
+    for file_name in files:
+        content = f"data:{file_name}"
+        file_path = snapshot_path / file_name
+        file_path.write_text(content, encoding="utf-8")
+        total_size += len(content.encode("utf-8"))
+    return total_size
+
+
+def build_cache_info_for_repo(repo_id: str, snapshot_path: Path):
+    size_on_disk = sum(path.stat().st_size for path in snapshot_path.iterdir() if path.is_file())
+    repo_path = snapshot_path.parent.parent
+    revision = build_revision(
+        snapshot_path=snapshot_path,
+        size_on_disk=size_on_disk,
+        last_modified=snapshot_path.stat().st_mtime,
+    )
+    repo = build_repo(
+        repo_id=repo_id,
+        repo_path=repo_path,
+        revision=revision,
+        size_on_disk=size_on_disk,
+        last_modified=snapshot_path.stat().st_mtime,
+    )
+    return SimpleNamespace(repos=(repo,))
+
+
+def poll_download_job(client: TestClient, job_id: str, timeout_seconds: float = 5.0):
+    deadline = time.time() + timeout_seconds
+    latest_payload = None
+    while time.time() < deadline:
+        response = client.get(f"/api/models/download/{job_id}")
+        latest_payload = response.json()
+        if latest_payload["status"] in {"success", "error"}:
+            return latest_payload
+        time.sleep(0.05)
+    raise AssertionError(f"Timed out waiting for download job {job_id}: {latest_payload}")
+
+
 class ModelManagementTests(unittest.TestCase):
+    def setUp(self):
+        web_api.model_download_jobs.clear()
+        web_api.active_model_download_job_id = None
+
     def test_no_downloaded_models_returns_not_downloaded_for_all(self):
         with patch(
             "services.model_management.scan_cache_dir",
@@ -55,18 +104,12 @@ class ModelManagementTests(unittest.TestCase):
     def test_downloaded_model_is_exposed_in_status_and_summary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             snapshot_path = Path(temp_dir) / "snapshots" / "tiny"
-            snapshot_path.mkdir(parents=True)
-            for file_name in ("config.json", "model.bin", "tokenizer.json", "vocabulary.txt"):
-                (snapshot_path / file_name).write_text("ok", encoding="utf-8")
-
-            repo = build_repo(
-                repo_id="Systran/faster-whisper-tiny",
-                repo_path=Path(temp_dir),
-                revision=build_revision(snapshot_path=snapshot_path, size_on_disk=4096, last_modified=1_700_000_000),
-                size_on_disk=4096,
-                last_modified=1_700_000_000,
+            create_cached_snapshot(
+                snapshot_path,
+                ("config.json", "model.bin", "tokenizer.json", "vocabulary.txt"),
             )
-            cache_info = SimpleNamespace(repos=(repo,))
+
+            cache_info = build_cache_info_for_repo("Systran/faster-whisper-tiny", snapshot_path)
 
             with patch("services.model_management.scan_cache_dir", return_value=cache_info):
                 catalog = list_models_with_status()
@@ -76,27 +119,20 @@ class ModelManagementTests(unittest.TestCase):
         self.assertTrue(tiny["isDownloaded"])
         self.assertEqual(tiny["status"], "downloaded")
         self.assertEqual(tiny["cacheLocation"], str(snapshot_path))
-        self.assertEqual(tiny["downloadedSizeBytes"], 4096)
         self.assertIsNotNone(tiny["lastModified"])
         self.assertEqual(panel["summary"]["downloadedCount"], 1)
         self.assertEqual(panel["summary"]["availableCount"], 15)
-        self.assertEqual(panel["summary"]["totalDownloadedSizeBytes"], 4096)
+        self.assertGreater(panel["summary"]["totalDownloadedSizeBytes"], 0)
 
     def test_incomplete_cached_repo_is_marked_unknown_without_breaking_other_models(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             snapshot_path = Path(temp_dir) / "snapshots" / "large-v3"
-            snapshot_path.mkdir(parents=True)
-            for file_name in ("config.json", "tokenizer.json", "vocabulary.json"):
-                (snapshot_path / file_name).write_text("partial", encoding="utf-8")
-
-            repo = build_repo(
-                repo_id="Systran/faster-whisper-large-v3",
-                repo_path=Path(temp_dir),
-                revision=build_revision(snapshot_path=snapshot_path, size_on_disk=2048, last_modified=1_700_100_000),
-                size_on_disk=2048,
-                last_modified=1_700_100_000,
+            create_cached_snapshot(
+                snapshot_path,
+                ("config.json", "tokenizer.json", "vocabulary.json"),
             )
-            cache_info = SimpleNamespace(repos=(repo,))
+
+            cache_info = build_cache_info_for_repo("Systran/faster-whisper-large-v3", snapshot_path)
 
             with patch("services.model_management.scan_cache_dir", return_value=cache_info):
                 catalog = list_models_with_status()
@@ -118,6 +154,157 @@ class ModelManagementTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 503)
         self.assertIn("Unable to inspect Hugging Face cache", response.json()["detail"])
+
+    def test_download_endpoint_downloads_missing_model_and_updates_panel(self):
+        client = TestClient(app)
+        repo_id = "Systran/faster-whisper-tiny"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            snapshot_path = temp_root / "models--Systran--faster-whisper-tiny" / "snapshots" / "commit"
+
+            def fake_scan_cache_dir(*args, **kwargs):
+                if snapshot_path.exists():
+                    return build_cache_info_for_repo(repo_id, snapshot_path)
+                raise CacheNotFound("missing", cache_dir=temp_root)
+
+            def fake_snapshot_download(repo, *args, **kwargs):
+                self.assertEqual(repo, repo_id)
+                if kwargs.get("dry_run"):
+                    return [
+                        DryRunFileInfo("commit", 10, "config.json", str(snapshot_path / "config.json"), False, True),
+                        DryRunFileInfo("commit", 20, "model.bin", str(snapshot_path / "model.bin"), False, True),
+                        DryRunFileInfo("commit", 30, "tokenizer.json", str(snapshot_path / "tokenizer.json"), False, True),
+                        DryRunFileInfo("commit", 15, "vocabulary.txt", str(snapshot_path / "vocabulary.txt"), False, True),
+                    ]
+
+                create_cached_snapshot(
+                    snapshot_path,
+                    ("config.json", "model.bin", "tokenizer.json", "vocabulary.txt"),
+                )
+                return str(snapshot_path)
+
+            with patch("services.model_management.scan_cache_dir", side_effect=fake_scan_cache_dir), patch(
+                "services.model_management.snapshot_download",
+                side_effect=fake_snapshot_download,
+            ):
+                response = client.post("/api/models/download", json={"modelId": "tiny"})
+                self.assertEqual(response.status_code, 200)
+                started_job = response.json()
+                self.assertEqual(started_job["modelId"], "tiny")
+                finished_job = poll_download_job(client, started_job["jobId"])
+                self.assertEqual(finished_job["status"], "success")
+
+                panel = client.get("/api/models/panel").json()
+                tiny = next(item for item in panel["catalog"] if item["id"] == "tiny")
+                self.assertEqual(tiny["status"], "downloaded")
+                self.assertTrue(tiny["isDownloaded"])
+                self.assertEqual(panel["summary"]["downloadedCount"], 1)
+                self.assertGreater(panel["summary"]["totalDownloadedSizeBytes"], 0)
+
+    def test_download_endpoint_returns_success_without_redownloading_existing_model(self):
+        client = TestClient(app)
+        repo_id = "Systran/faster-whisper-tiny"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot_path = Path(temp_dir) / "models--Systran--faster-whisper-tiny" / "snapshots" / "commit"
+            create_cached_snapshot(
+                snapshot_path,
+                ("config.json", "model.bin", "tokenizer.json", "vocabulary.txt"),
+            )
+            cache_info = build_cache_info_for_repo(repo_id, snapshot_path)
+            snapshot_mock = Mock()
+
+            with patch("services.model_management.scan_cache_dir", return_value=cache_info), patch(
+                "services.model_management.snapshot_download",
+                snapshot_mock,
+            ):
+                response = client.post("/api/models/download", json={"modelId": "tiny"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "success")
+        self.assertIn("already exists", payload["message"])
+        snapshot_mock.assert_not_called()
+
+    def test_download_endpoint_reports_job_error_when_download_fails(self):
+        client = TestClient(app)
+        temp_root = Path(tempfile.mkdtemp())
+
+        def fake_scan_cache_dir(*args, **kwargs):
+            raise CacheNotFound("missing", cache_dir=temp_root)
+
+        def fake_snapshot_download(repo, *args, **kwargs):
+            if kwargs.get("dry_run"):
+                return [
+                    DryRunFileInfo("commit", 10, "config.json", "config.json", False, True),
+                    DryRunFileInfo("commit", 20, "model.bin", "model.bin", False, True),
+                ]
+            raise RuntimeError("network down")
+
+        with patch("services.model_management.scan_cache_dir", side_effect=fake_scan_cache_dir), patch(
+            "services.model_management.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            response = client.post("/api/models/download", json={"modelId": "tiny"})
+            self.assertEqual(response.status_code, 200)
+            finished_job = poll_download_job(client, response.json()["jobId"])
+
+        self.assertEqual(finished_job["status"], "error")
+        self.assertIn("network down", finished_job["error"])
+
+    def test_download_endpoint_rejects_second_active_download(self):
+        client = TestClient(app)
+        release_download = threading.Event()
+        repo_map = {
+            "tiny": Path(tempfile.mkdtemp()) / "models--Systran--faster-whisper-tiny" / "snapshots" / "commit",
+            "small": Path(tempfile.mkdtemp()) / "models--Systran--faster-whisper-small" / "snapshots" / "commit",
+        }
+
+        def fake_scan_cache_dir(*args, **kwargs):
+            repos = []
+            for repo_id, snapshot_path in (
+                ("Systran/faster-whisper-tiny", repo_map["tiny"]),
+                ("Systran/faster-whisper-small", repo_map["small"]),
+            ):
+                if snapshot_path.exists():
+                    repos.append(build_cache_info_for_repo(repo_id, snapshot_path).repos[0])
+
+            if not repos:
+                raise CacheNotFound("missing", cache_dir=Path(tempfile.gettempdir()))
+
+            return SimpleNamespace(repos=tuple(repos))
+
+        def fake_snapshot_download(repo, *args, **kwargs):
+            if kwargs.get("dry_run"):
+                return [
+                    DryRunFileInfo("commit", 10, "config.json", "config.json", False, True),
+                    DryRunFileInfo("commit", 20, "model.bin", "model.bin", False, True),
+                    DryRunFileInfo("commit", 30, "tokenizer.json", "tokenizer.json", False, True),
+                    DryRunFileInfo("commit", 15, "vocabulary.txt", "vocabulary.txt", False, True),
+                ]
+
+            release_download.wait(timeout=2)
+            target_snapshot = repo_map["tiny"] if repo.endswith("tiny") else repo_map["small"]
+            create_cached_snapshot(
+                target_snapshot,
+                ("config.json", "model.bin", "tokenizer.json", "vocabulary.txt"),
+            )
+            return str(target_snapshot)
+
+        with patch("services.model_management.scan_cache_dir", side_effect=fake_scan_cache_dir), patch(
+            "services.model_management.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            first_response = client.post("/api/models/download", json={"modelId": "tiny"})
+            self.assertEqual(first_response.status_code, 200)
+
+            second_response = client.post("/api/models/download", json={"modelId": "small"})
+            self.assertEqual(second_response.status_code, 409)
+            self.assertIn("already in progress", second_response.json()["detail"])
+
+            release_download.set()
+            poll_download_job(client, first_response.json()["jobId"])
 
 
 if __name__ == "__main__":

@@ -18,10 +18,18 @@ from pydantic import BaseModel
 
 from services.model_management import (
     ModelCacheInspectionError,
+    ModelDownloadValidationError,
+    download_registered_model,
     get_model_panel_payload,
+    get_model_status,
     list_models_with_status,
 )
-from services.model_registry import list_enabled_backend_values, list_model_catalog
+from services.model_registry import (
+    ModelRegistryLookupError,
+    get_model_registry_entry,
+    list_enabled_backend_values,
+    list_model_catalog,
+)
 from source_check import check_source
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -31,6 +39,28 @@ JSON_EVENT_PREFIX = "__VT_JSON__ "
 
 class SourceCheckRequest(BaseModel):
     url: str
+
+
+class ModelDownloadRequest(BaseModel):
+    modelId: str
+
+
+@dataclass
+class ModelDownloadProgressState:
+    percent: int = 0
+    label: str = "Queued"
+
+
+@dataclass
+class ModelDownloadJobState:
+    job_id: str
+    model_id: str
+    status: str = "queued"
+    progress: ModelDownloadProgressState = field(default_factory=ModelDownloadProgressState)
+    message: str = "Download queued."
+    error: str | None = None
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 def utc_now() -> str:
@@ -92,6 +122,9 @@ class JobState:
 
 jobs: dict[str, JobState] = {}
 jobs_lock = threading.Lock()
+model_download_jobs: dict[str, ModelDownloadJobState] = {}
+model_download_jobs_lock = threading.Lock()
+active_model_download_job_id: str | None = None
 
 app = FastAPI(title="Video Transcribe Local API", version="1.0.0")
 app.add_middleware(
@@ -134,6 +167,138 @@ def serialize_job(job: JobState) -> dict[str, Any]:
     payload = asdict(job)
     payload["downloadUrl"] = f"/api/jobs/{job.id}/download" if job.output_path else None
     return payload
+
+
+def get_model_download_job(job_id: str) -> ModelDownloadJobState:
+    with model_download_jobs_lock:
+        job = model_download_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Model download job not found")
+        return job
+
+
+def serialize_model_download_job(job: ModelDownloadJobState) -> dict[str, Any]:
+    return {
+        "jobId": job.job_id,
+        "modelId": job.model_id,
+        "status": job.status,
+        "progress": {
+            "percent": job.progress.percent,
+            "label": job.progress.label,
+        },
+        "message": job.message,
+        "error": job.error,
+    }
+
+
+def update_model_download_job(
+    job_id: str,
+    *,
+    status: str | None = None,
+    percent: int | None = None,
+    label: str | None = None,
+    message: str | None = None,
+    error: str | None = None,
+) -> None:
+    with model_download_jobs_lock:
+        job = model_download_jobs[job_id]
+        if status is not None:
+            job.status = status
+        if percent is not None:
+            job.progress.percent = max(0, min(100, percent))
+        if label is not None:
+            job.progress.label = label
+        if message is not None:
+            job.message = message
+        job.error = error
+        job.updated_at = utc_now()
+
+
+def reserve_model_download_slot(model_id: str) -> str:
+    global active_model_download_job_id
+
+    with model_download_jobs_lock:
+        if active_model_download_job_id is not None:
+            active_job = model_download_jobs.get(active_model_download_job_id)
+            if active_job is not None and active_job.status in {"queued", "running"}:
+                active_model_name = active_job.model_id
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Model download for '{active_model_name}' is already in progress. "
+                        "Only one model download can run at a time."
+                    ),
+                )
+
+        job_id = uuid.uuid4().hex
+        model_download_jobs[job_id] = ModelDownloadJobState(job_id=job_id, model_id=model_id)
+        active_model_download_job_id = job_id
+        return job_id
+
+
+def release_model_download_slot(job_id: str) -> None:
+    global active_model_download_job_id
+
+    with model_download_jobs_lock:
+        if active_model_download_job_id == job_id:
+            active_model_download_job_id = None
+
+
+def run_model_download_job(job_id: str) -> None:
+    try:
+        job = get_model_download_job(job_id)
+        update_model_download_job(
+            job_id,
+            status="running",
+            percent=5,
+            label="Checking cache",
+            message="Checking whether the model is already available locally.",
+            error=None,
+        )
+
+        result = download_registered_model(
+            job.model_id,
+            progress_callback=lambda percent, label: update_model_download_job(
+                job_id,
+                status="running",
+                percent=percent,
+                label=label,
+                message=label,
+                error=None,
+            ),
+        )
+
+        message = (
+            "Model already exists in the local Hugging Face cache."
+            if result["alreadyDownloaded"]
+            else "Model downloaded and validated in the local Hugging Face cache."
+        )
+        update_model_download_job(
+            job_id,
+            status="success",
+            percent=100,
+            label="Complete",
+            message=message,
+            error=None,
+        )
+    except (ModelRegistryLookupError, ModelCacheInspectionError, ModelDownloadValidationError) as exc:
+        update_model_download_job(
+            job_id,
+            status="error",
+            label="Download failed",
+            message="Model download failed.",
+            error=str(exc),
+        )
+    except Exception as exc:
+        update_model_download_job(
+            job_id,
+            status="error",
+            label="Download failed",
+            message="Model download failed.",
+            error=str(exc),
+        )
+    finally:
+        release_model_download_slot(job_id)
 
 
 def read_output_text(output_path: str | None) -> str | None:
@@ -324,6 +489,46 @@ def get_models_panel():
         return get_model_panel_payload()
     except ModelCacheInspectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@model_management_router.post("/download")
+def start_model_download(payload: ModelDownloadRequest):
+    try:
+        entry = get_model_registry_entry(payload.modelId)
+    except ModelRegistryLookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    if not entry.enabled:
+        raise HTTPException(status_code=400, detail=f"Model '{payload.modelId}' is disabled.")
+
+    try:
+        current_status = get_model_status(payload.modelId)
+    except ModelCacheInspectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    if current_status["status"] == "downloaded":
+        job_id = uuid.uuid4().hex
+        job = ModelDownloadJobState(
+            job_id=job_id,
+            model_id=payload.modelId,
+            status="success",
+            progress=ModelDownloadProgressState(percent=100, label="Complete"),
+            message="Model already exists in the local Hugging Face cache.",
+            error=None,
+        )
+        with model_download_jobs_lock:
+            model_download_jobs[job_id] = job
+        return serialize_model_download_job(job)
+
+    job_id = reserve_model_download_slot(payload.modelId)
+    worker = threading.Thread(target=run_model_download_job, args=(job_id,), daemon=True)
+    worker.start()
+    return serialize_model_download_job(get_model_download_job(job_id))
+
+
+@model_management_router.get("/download/{job_id}")
+def get_model_download_status(job_id: str):
+    return serialize_model_download_job(get_model_download_job(job_id))
 
 
 @app.post("/api/check-source")
