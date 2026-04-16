@@ -1,7 +1,6 @@
 import { startTransition, useEffect, useMemo, useState } from 'react'
 import {
   AlertTriangle,
-  CheckCircle2,
   Download,
   FolderOpen,
   HardDriveDownload,
@@ -16,13 +15,16 @@ import { cn } from '../lib/utils'
 type ModelPanelStatus = 'downloaded' | 'not_downloaded' | 'unknown'
 type ModelLanguageScope = 'multilingual' | 'english'
 type ModelFamily = 'standard' | 'distil'
-type DownloadJobStatus = 'queued' | 'running' | 'success' | 'error'
+type OperationJobStatus = 'queued' | 'running' | 'success' | 'error'
+type OperationType = 'download' | 'delete'
 type ModelCardUiState =
   | 'downloaded'
   | 'not_downloaded'
   | 'unknown'
   | 'downloading'
   | 'download_error'
+  | 'deleting'
+  | 'delete_error'
 type NoticeKind = 'info' | 'success' | 'error'
 
 type ModelPanelItem = {
@@ -49,16 +51,22 @@ type ModelPanelResponse = {
   }
 }
 
-type ModelDownloadJobResponse = {
+type ModelOperationJobResponse = {
   jobId: string
   modelId: string
-  status: DownloadJobStatus
+  status: OperationJobStatus
   progress: {
     percent: number
     label: string
   }
   message: string
   error: string | null
+}
+
+type ActiveOperation = {
+  operationType: OperationType
+  jobId: string
+  modelId: string
 }
 
 type Notice = {
@@ -79,10 +87,10 @@ const COPY = {
     headerEyebrow: 'Model Management',
     headerTitle: 'Whisper model inventory',
     headerDescription:
-      'Download a Whisper model into the same local Hugging Face cache that faster-whisper will use later.',
+      'Preload and remove Whisper models in the same local Hugging Face cache used by faster-whisper.',
     refreshing: 'Refreshing',
     ready: 'Panel ready',
-    downloadingBusy: 'Download in progress',
+    operationBusy: 'Operation in progress',
     summaryDownloaded: 'Downloaded',
     summaryAvailable: 'Available',
     summaryTotalSize: 'Total size',
@@ -100,12 +108,28 @@ const COPY = {
     lastModified: 'Last modified',
     hfRepo: 'HF repo',
     localPath: 'Local path',
+    progress: 'Operation progress',
+    percent: 'Percent',
+    download: 'Download',
+    downloadRunning: 'Downloading',
+    downloadReady: 'Model is available locally.',
+    downloadFailed: 'Download failed',
+    delete: 'Delete',
+    deleteRunning: 'Deleting',
+    deleteDone: 'Model removed from local cache.',
+    deleteFailed: 'Delete failed',
+    deleteConfirm: (name: string) => `Delete the local model "${name}" from the Hugging Face cache?`,
+    queueMessage: 'The backend accepted the operation and started background processing.',
+    anotherOperation: 'Another model operation is already running.',
+    deleteDisabled: 'Delete is only available for downloaded models.',
     statusLabel: {
       downloaded: 'downloaded',
       not_downloaded: 'not_downloaded',
       unknown: 'unknown',
       downloading: 'downloading',
       download_error: 'download_error',
+      deleting: 'deleting',
+      delete_error: 'delete_error',
     },
     familyLabel: {
       standard: 'standard',
@@ -115,24 +139,15 @@ const COPY = {
       multilingual: 'multilingual',
       english: 'english',
     },
-    download: 'Download',
-    downloadRunning: 'Downloading',
-    delete: 'Delete',
-    anotherDownload: 'Another model download is already running.',
-    progress: 'Download progress',
-    percent: 'Percent',
-    downloadFailed: 'Download failed',
-    downloadReady: 'Model is available locally.',
-    queueMessage: 'The backend accepted the download job and started background processing.',
   },
   ru: {
     headerEyebrow: 'Управление моделями',
     headerTitle: 'Локальный каталог Whisper-моделей',
     headerDescription:
-      'Скачайте модель Whisper заранее в тот же локальный Hugging Face cache, который потом использует faster-whisper.',
+      'Предзагружайте и удаляйте Whisper-модели в том же локальном Hugging Face cache, который использует faster-whisper.',
     refreshing: 'Обновление',
     ready: 'Панель готова',
-    downloadingBusy: 'Идёт загрузка',
+    operationBusy: 'Идёт операция',
     summaryDownloaded: 'Загружено',
     summaryAvailable: 'Доступно',
     summaryTotalSize: 'Общий размер',
@@ -150,12 +165,28 @@ const COPY = {
     lastModified: 'Изменено',
     hfRepo: 'HF repo',
     localPath: 'Локальный путь',
+    progress: 'Прогресс операции',
+    percent: 'Процент',
+    download: 'Скачать',
+    downloadRunning: 'Загрузка',
+    downloadReady: 'Модель доступна локально.',
+    downloadFailed: 'Загрузка завершилась ошибкой',
+    delete: 'Удалить',
+    deleteRunning: 'Удаление',
+    deleteDone: 'Модель удалена из локального cache.',
+    deleteFailed: 'Удаление завершилось ошибкой',
+    deleteConfirm: (name: string) => `Удалить локальную модель "${name}" из Hugging Face cache?`,
+    queueMessage: 'Backend принял задачу и запустил фоновую операцию.',
+    anotherOperation: 'Сейчас уже выполняется другая операция с моделями.',
+    deleteDisabled: 'Удаление доступно только для скачанных моделей.',
     statusLabel: {
       downloaded: 'downloaded',
       not_downloaded: 'not_downloaded',
       unknown: 'unknown',
       downloading: 'downloading',
       download_error: 'download_error',
+      deleting: 'deleting',
+      delete_error: 'delete_error',
     },
     familyLabel: {
       standard: 'standard',
@@ -165,15 +196,6 @@ const COPY = {
       multilingual: 'multilingual',
       english: 'english',
     },
-    download: 'Скачать',
-    downloadRunning: 'Загрузка',
-    delete: 'Удалить',
-    anotherDownload: 'Сейчас уже выполняется загрузка другой модели.',
-    progress: 'Прогресс загрузки',
-    percent: 'Процент',
-    downloadFailed: 'Загрузка завершилась ошибкой',
-    downloadReady: 'Модель доступна локально.',
-    queueMessage: 'Backend принял задачу и запустил фоновую загрузку модели.',
   },
 } as const
 
@@ -208,11 +230,21 @@ function formatDate(value: string | null) {
   }).format(parsed)
 }
 
-function getUiState(item: ModelPanelItem, job?: ModelDownloadJobResponse): ModelCardUiState {
-  if (job?.status === 'queued' || job?.status === 'running') {
+function getUiState(
+  item: ModelPanelItem,
+  downloadJob?: ModelOperationJobResponse,
+  deleteJob?: ModelOperationJobResponse,
+): ModelCardUiState {
+  if (deleteJob?.status === 'queued' || deleteJob?.status === 'running') {
+    return 'deleting'
+  }
+  if (deleteJob?.status === 'error') {
+    return 'delete_error'
+  }
+  if (downloadJob?.status === 'queued' || downloadJob?.status === 'running') {
     return 'downloading'
   }
-  if (job?.status === 'error') {
+  if (downloadJob?.status === 'error') {
     return 'download_error'
   }
 
@@ -239,6 +271,16 @@ function getStateTone(state: ModelCardUiState) {
         badge: 'border-sky-200 bg-sky-50 text-sky-800',
       }
     case 'download_error':
+      return {
+        card: 'border-rose-200 bg-rose-50/55',
+        badge: 'border-rose-200 bg-rose-50 text-rose-800',
+      }
+    case 'deleting':
+      return {
+        card: 'border-orange-200 bg-orange-50/60',
+        badge: 'border-orange-200 bg-orange-50 text-orange-800',
+      }
+    case 'delete_error':
       return {
         card: 'border-rose-200 bg-rose-50/55',
         badge: 'border-rose-200 bg-rose-50 text-rose-800',
@@ -300,8 +342,9 @@ export function ModelManagementPanel() {
   const [panelData, setPanelData] = useState<ModelPanelResponse | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [activeJobId, setActiveJobId] = useState<string | null>(null)
-  const [downloadJobs, setDownloadJobs] = useState<Record<string, ModelDownloadJobResponse>>({})
+  const [activeOperation, setActiveOperation] = useState<ActiveOperation | null>(null)
+  const [downloadJobs, setDownloadJobs] = useState<Record<string, ModelOperationJobResponse>>({})
+  const [deleteJobs, setDeleteJobs] = useState<Record<string, ModelOperationJobResponse>>({})
   const [modelNotices, setModelNotices] = useState<Record<string, Notice>>({})
   const [globalNotice, setGlobalNotice] = useState<Notice | null>(null)
 
@@ -328,39 +371,57 @@ export function ModelManagementPanel() {
   }, [])
 
   useEffect(() => {
-    if (!activeJobId) {
+    if (!activeOperation) {
       return
     }
 
     let active = true
     const timer = window.setInterval(async () => {
       try {
-        const job = await fetchJson<ModelDownloadJobResponse>(`/api/models/download/${activeJobId}`)
+        const endpoint =
+          activeOperation.operationType === 'download'
+            ? `/api/models/download/${activeOperation.jobId}`
+            : `/api/models/delete/${activeOperation.jobId}`
+        const job = await fetchJson<ModelOperationJobResponse>(endpoint)
         if (!active) {
           return
         }
 
         startTransition(() => {
-          setDownloadJobs((current) => ({
-            ...current,
-            [job.modelId]: job,
-          }))
+          if (activeOperation.operationType === 'download') {
+            setDownloadJobs((current) => ({
+              ...current,
+              [job.modelId]: job,
+            }))
+          } else {
+            setDeleteJobs((current) => ({
+              ...current,
+              [job.modelId]: job,
+            }))
+          }
         })
 
         if (job.status === 'success') {
-          setActiveJobId(null)
+          const successMessage =
+            activeOperation.operationType === 'download'
+              ? job.message || copy.downloadReady
+              : job.message || copy.deleteDone
+          setActiveOperation(null)
           setModelNotices((current) => ({
             ...current,
-            [job.modelId]: { kind: 'success', text: job.message || copy.downloadReady },
+            [job.modelId]: { kind: 'success', text: successMessage },
           }))
-          setGlobalNotice({ kind: 'success', text: job.message || copy.downloadReady })
+          setGlobalNotice({ kind: 'success', text: successMessage })
           await loadPanel({ keepLoadingState: true })
         } else if (job.status === 'error') {
-          setActiveJobId(null)
-          const message = job.error || job.message || copy.downloadFailed
+          const failureMessage =
+            job.error ||
+            job.message ||
+            (activeOperation.operationType === 'download' ? copy.downloadFailed : copy.deleteFailed)
+          setActiveOperation(null)
           setModelNotices((current) => ({
             ...current,
-            [job.modelId]: { kind: 'error', text: message },
+            [job.modelId]: { kind: 'error', text: failureMessage },
           }))
         }
       } catch (pollError) {
@@ -368,10 +429,15 @@ export function ModelManagementPanel() {
           return
         }
 
-        setActiveJobId(null)
+        setActiveOperation(null)
         setGlobalNotice({
           kind: 'error',
-          text: pollError instanceof Error ? pollError.message : copy.downloadFailed,
+          text:
+            pollError instanceof Error
+              ? pollError.message
+              : activeOperation.operationType === 'download'
+                ? copy.downloadFailed
+                : copy.deleteFailed,
         })
       }
     }, 1000)
@@ -380,14 +446,17 @@ export function ModelManagementPanel() {
       active = false
       window.clearInterval(timer)
     }
-  }, [activeJobId, copy.downloadFailed, copy.downloadReady])
+  }, [
+    activeOperation,
+    copy.deleteDone,
+    copy.deleteFailed,
+    copy.downloadFailed,
+    copy.downloadReady,
+  ])
 
   const catalog = panelData?.catalog ?? []
   const summary = panelData?.summary ?? EMPTY_SUMMARY
   const shouldShowModelList = catalog.length > 0
-  const activeJob = activeJobId
-    ? Object.values(downloadJobs).find((job) => job.jobId === activeJobId)
-    : null
 
   const stateMessage = useMemo(() => {
     if (isLoading) {
@@ -410,16 +479,20 @@ export function ModelManagementPanel() {
     }
   }, [copy.emptyDescription, copy.emptyTitle, copy.errorTitle, copy.loadingDescription, copy.loadingTitle, error, isLoading])
 
-  async function handleDownload(modelId: string) {
-    setGlobalNotice(null)
+  function clearModelNotice(modelId: string) {
     setModelNotices((current) => {
       const next = { ...current }
       delete next[modelId]
       return next
     })
+  }
+
+  async function startOperation(modelId: string, operationType: OperationType) {
+    clearModelNotice(modelId)
+    setGlobalNotice(null)
 
     try {
-      const job = await fetchJson<ModelDownloadJobResponse>('/api/models/download', {
+      const job = await fetchJson<ModelOperationJobResponse>(`/api/models/${operationType}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -428,14 +501,25 @@ export function ModelManagementPanel() {
       })
 
       startTransition(() => {
-        setDownloadJobs((current) => ({
-          ...current,
-          [job.modelId]: job,
-        }))
+        if (operationType === 'download') {
+          setDownloadJobs((current) => ({
+            ...current,
+            [job.modelId]: job,
+          }))
+        } else {
+          setDeleteJobs((current) => ({
+            ...current,
+            [job.modelId]: job,
+          }))
+        }
       })
 
       if (job.status === 'queued' || job.status === 'running') {
-        setActiveJobId(job.jobId)
+        setActiveOperation({
+          operationType,
+          jobId: job.jobId,
+          modelId: job.modelId,
+        })
         setModelNotices((current) => ({
           ...current,
           [job.modelId]: { kind: 'info', text: job.message || copy.queueMessage },
@@ -444,28 +528,48 @@ export function ModelManagementPanel() {
       }
 
       if (job.status === 'success') {
+        const successMessage =
+          operationType === 'download' ? job.message || copy.downloadReady : job.message || copy.deleteDone
         setModelNotices((current) => ({
           ...current,
-          [job.modelId]: { kind: 'success', text: job.message || copy.downloadReady },
+          [job.modelId]: { kind: 'success', text: successMessage },
         }))
-        setGlobalNotice({ kind: 'success', text: job.message || copy.downloadReady })
+        setGlobalNotice({ kind: 'success', text: successMessage })
         await loadPanel({ keepLoadingState: true })
         return
       }
 
-      const message = job.error || job.message || copy.downloadFailed
+      const failureMessage =
+        job.error || job.message || (operationType === 'download' ? copy.downloadFailed : copy.deleteFailed)
       setModelNotices((current) => ({
         ...current,
-        [job.modelId]: { kind: 'error', text: message },
+        [job.modelId]: { kind: 'error', text: failureMessage },
       }))
-    } catch (downloadError) {
-      const message = downloadError instanceof Error ? downloadError.message : copy.downloadFailed
+    } catch (operationError) {
+      const message =
+        operationError instanceof Error
+          ? operationError.message
+          : operationType === 'download'
+            ? copy.downloadFailed
+            : copy.deleteFailed
       setGlobalNotice({ kind: 'error', text: message })
       setModelNotices((current) => ({
         ...current,
         [modelId]: { kind: 'error', text: message },
       }))
     }
+  }
+
+  async function handleDownload(modelId: string) {
+    await startOperation(modelId, 'download')
+  }
+
+  async function handleDelete(model: ModelPanelItem) {
+    if (!window.confirm(copy.deleteConfirm(model.displayName))) {
+      return
+    }
+
+    await startOperation(model.id, 'delete')
   }
 
   return (
@@ -481,7 +585,7 @@ export function ModelManagementPanel() {
               <p className="mt-2 text-sm text-stone-500">{copy.headerDescription}</p>
             </div>
             <div className="rounded-full border border-stone-200 bg-stone-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-stone-600">
-              {isLoading ? copy.refreshing : activeJob ? copy.downloadingBusy : copy.ready}
+              {isLoading ? copy.refreshing : activeOperation ? copy.operationBusy : copy.ready}
             </div>
           </div>
 
@@ -502,12 +606,18 @@ export function ModelManagementPanel() {
           <div className="grid gap-4">
             {catalog.map((item) => {
               const downloadJob = downloadJobs[item.id]
-              const uiState = getUiState(item, downloadJob)
+              const deleteJob = deleteJobs[item.id]
+              const uiState = getUiState(item, downloadJob, deleteJob)
               const tone = getStateTone(uiState)
-              const canDownload = item.status !== 'downloaded'
-              const isAnotherJobActive = activeJob != null && activeJob.modelId !== item.id
-              const isThisJobRunning = uiState === 'downloading'
               const notice = modelNotices[item.id]
+              const isOperationActiveForThisModel =
+                activeOperation != null && activeOperation.modelId === item.id
+              const isAnotherOperationActive =
+                activeOperation != null && activeOperation.modelId !== item.id
+              const operationJob =
+                uiState === 'deleting' || uiState === 'delete_error' ? deleteJob : downloadJob
+              const canDownload = item.status === 'not_downloaded' || item.status === 'unknown'
+              const canDelete = item.status === 'downloaded'
 
               return (
                 <article key={item.id} className={cn('rounded-3xl border px-4 py-4', tone.card)}>
@@ -554,21 +664,21 @@ export function ModelManagementPanel() {
                     />
                   </div>
 
-                  {isThisJobRunning && downloadJob ? (
+                  {(uiState === 'downloading' || uiState === 'deleting') && operationJob ? (
                     <div className="mt-4 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3">
                       <div className="flex items-center justify-between gap-3 text-sm font-medium text-sky-900">
-                        <span>{downloadJob.progress.label || copy.progress}</span>
+                        <span>{operationJob.progress.label || copy.progress}</span>
                         <span>
-                          {copy.percent}: {Math.max(0, Math.min(100, downloadJob.progress.percent))}%
+                          {copy.percent}: {Math.max(0, Math.min(100, operationJob.progress.percent))}%
                         </span>
                       </div>
                       <div className="mt-3 h-2 overflow-hidden rounded-full bg-sky-100">
                         <div
                           className="h-full rounded-full bg-sky-500 transition-[width]"
-                          style={{ width: `${Math.max(0, Math.min(100, downloadJob.progress.percent))}%` }}
+                          style={{ width: `${Math.max(0, Math.min(100, operationJob.progress.percent))}%` }}
                         />
                       </div>
-                      <p className="mt-3 text-sm text-sky-800">{downloadJob.message}</p>
+                      <p className="mt-3 text-sm text-sky-800">{operationJob.message}</p>
                     </div>
                   ) : null}
 
@@ -585,31 +695,47 @@ export function ModelManagementPanel() {
                         onClick={() => {
                           void handleDownload(item.id)
                         }}
-                        disabled={isAnotherJobActive || isThisJobRunning}
+                        disabled={isAnotherOperationActive || isOperationActiveForThisModel}
                         className="inline-flex items-center justify-center gap-2 rounded-2xl border border-stone-200 bg-white px-4 py-2 text-sm font-semibold text-stone-800 transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:border-stone-200 disabled:bg-stone-100 disabled:text-stone-400"
                       >
-                        {isThisJobRunning ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                        {isThisJobRunning ? copy.downloadRunning : copy.download}
+                        {uiState === 'downloading' ? (
+                          <LoaderCircle className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Download className="h-4 w-4" />
+                        )}
+                        {uiState === 'downloading' ? copy.downloadRunning : copy.download}
                       </button>
                     ) : (
-                      <div className="inline-flex items-center justify-center gap-2 rounded-2xl border border-emerald-200 bg-white px-4 py-2 text-sm font-semibold text-emerald-700">
-                        <CheckCircle2 className="h-4 w-4" />
-                        {copy.downloadReady}
-                      </div>
+                      <button
+                        type="button"
+                        disabled
+                        className="inline-flex items-center justify-center gap-2 rounded-2xl border border-stone-200 bg-white px-4 py-2 text-sm font-semibold text-stone-400"
+                      >
+                        <Download className="h-4 w-4" />
+                        {copy.download}
+                      </button>
                     )}
 
                     <button
                       type="button"
-                      disabled
-                      className="inline-flex items-center justify-center gap-2 rounded-2xl border border-stone-200 bg-white px-4 py-2 text-sm font-semibold text-stone-400"
+                      onClick={() => {
+                        void handleDelete(item)
+                      }}
+                      disabled={!canDelete || isAnotherOperationActive || isOperationActiveForThisModel}
+                      title={!canDelete ? copy.deleteDisabled : undefined}
+                      className="inline-flex items-center justify-center gap-2 rounded-2xl border border-stone-200 bg-white px-4 py-2 text-sm font-semibold text-stone-800 transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:border-stone-200 disabled:bg-stone-100 disabled:text-stone-400"
                     >
-                      <Trash2 className="h-4 w-4" />
-                      {copy.delete}
+                      {uiState === 'deleting' ? (
+                        <LoaderCircle className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Trash2 className="h-4 w-4" />
+                      )}
+                      {uiState === 'deleting' ? copy.deleteRunning : copy.delete}
                     </button>
                   </div>
 
-                  {isAnotherJobActive ? (
-                    <p className="mt-3 text-sm text-stone-500">{copy.anotherDownload}</p>
+                  {isAnotherOperationActive ? (
+                    <p className="mt-3 text-sm text-stone-500">{copy.anotherOperation}</p>
                   ) : null}
                 </article>
               )

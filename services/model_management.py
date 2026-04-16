@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from huggingface_hub import DryRunFileInfo, scan_cache_dir, snapshot_download
+from huggingface_hub import DryRunFileInfo, HFCacheInfo, scan_cache_dir, snapshot_download
 from huggingface_hub.errors import CacheNotFound
 from tqdm.auto import tqdm as base_tqdm
 
@@ -32,6 +32,10 @@ class ModelCacheInspectionError(RuntimeError):
 
 class ModelDownloadValidationError(RuntimeError):
     """Raised when a model download finishes without a valid local snapshot."""
+
+
+class ModelDeleteValidationError(RuntimeError):
+    """Raised when a model delete request cannot be executed safely."""
 
 
 @dataclass(frozen=True)
@@ -95,13 +99,19 @@ def _build_unknown_repo_state(repo_info: Any) -> dict[str, Any]:
     }
 
 
-def _scan_cache_index(cache_dir: str | Path | None = None) -> dict[str, dict[str, Any]]:
+def _scan_cache_info(cache_dir: str | Path | None = None) -> HFCacheInfo | None:
     try:
-        cache_info = scan_cache_dir(cache_dir=cache_dir)
+        return scan_cache_dir(cache_dir=cache_dir)
     except CacheNotFound:
-        return {}
+        return None
     except Exception as exc:
         raise ModelCacheInspectionError(f"Unable to inspect Hugging Face cache: {exc}") from exc
+
+
+def _scan_cache_index(cache_dir: str | Path | None = None) -> dict[str, dict[str, Any]]:
+    cache_info = _scan_cache_info(cache_dir=cache_dir)
+    if cache_info is None:
+        return {}
 
     repos: dict[str, dict[str, Any]] = {}
     for repo in cache_info.repos:
@@ -177,7 +187,16 @@ def list_models_with_status(cache_dir: str | Path | None = None) -> list[dict[st
 def get_model_panel_payload(cache_dir: str | Path | None = None) -> dict[str, Any]:
     catalog = list_models_with_status(cache_dir=cache_dir)
     downloaded_items = [item for item in catalog if item["enabled"] and item["status"] == "downloaded"]
-    total_downloaded_size_bytes = sum(int(item["downloadedSizeBytes"] or 0) for item in downloaded_items)
+    unique_downloaded_locations: set[str] = set()
+    total_downloaded_size_bytes = 0
+
+    for item in downloaded_items:
+        storage_key = str(item["cacheLocation"] or item["hfRepoId"])
+        if storage_key in unique_downloaded_locations:
+            continue
+        unique_downloaded_locations.add(storage_key)
+        total_downloaded_size_bytes += int(item["downloadedSizeBytes"] or 0)
+
     available_count = sum(1 for item in catalog if item["enabled"])
 
     return {
@@ -299,5 +318,72 @@ def download_registered_model(
         "modelId": entry.id,
         "alreadyDownloaded": False,
         "snapshotPath": str(snapshot_path),
+        "status": verified_status,
+    }
+
+
+def delete_registered_model(
+    model_id: str,
+    progress_callback: ModelDownloadProgressCallback | None = None,
+    cache_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    entry = get_model_registry_entry(model_id)
+    current_status = get_model_status(model_id, cache_dir=cache_dir)
+
+    if current_status["status"] == "not_downloaded":
+        _emit_progress(progress_callback, 100, "Model is not present in the local cache.")
+        return {
+            "modelId": entry.id,
+            "alreadyDeleted": True,
+            "status": current_status,
+        }
+
+    if current_status["status"] != "downloaded":
+        raise ModelDeleteValidationError(
+            "Model cache state is unknown. Refusing to delete the model without a verified local snapshot."
+        )
+
+    _emit_progress(progress_callback, 10, "Inspecting cached revisions.")
+    cache_info = _scan_cache_info(cache_dir=cache_dir)
+    if cache_info is None:
+        _emit_progress(progress_callback, 100, "Model is not present in the local cache.")
+        return {
+            "modelId": entry.id,
+            "alreadyDeleted": True,
+            "status": get_model_status(model_id, cache_dir=cache_dir),
+        }
+
+    cached_repo = next((repo for repo in cache_info.repos if repo.repo_id == entry.hfRepoId), None)
+    if cached_repo is None:
+        _emit_progress(progress_callback, 100, "Model is not present in the local cache.")
+        return {
+            "modelId": entry.id,
+            "alreadyDeleted": True,
+            "status": get_model_status(model_id, cache_dir=cache_dir),
+        }
+
+    revision_hashes = tuple(sorted(revision.commit_hash for revision in cached_repo.revisions))
+    if not revision_hashes:
+        raise ModelDeleteValidationError(
+            "Cached model repository has no deletable revisions. Refusing to delete an unresolved cache state."
+        )
+
+    _emit_progress(progress_callback, 35, "Preparing delete strategy.")
+    delete_strategy = cache_info.delete_revisions(*revision_hashes)
+
+    _emit_progress(progress_callback, 75, "Deleting cached model files.")
+    delete_strategy.execute()
+
+    _emit_progress(progress_callback, 90, "Verifying cache state.")
+    verified_status = get_model_status(model_id, cache_dir=cache_dir)
+    if verified_status["status"] == "downloaded":
+        raise ModelDeleteValidationError(
+            "Delete finished but the model still appears as downloaded in the local cache."
+        )
+
+    _emit_progress(progress_callback, 100, "Model removed from the local Hugging Face cache.")
+    return {
+        "modelId": entry.id,
+        "alreadyDeleted": False,
         "status": verified_status,
     }
