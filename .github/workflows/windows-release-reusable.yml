@@ -49,6 +49,14 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Ensure Git LFS
+        shell: pwsh
+        run: |
+          if (-not (Get-Command git-lfs -ErrorAction SilentlyContinue)) {
+            choco install git-lfs -y --no-progress
+          }
+          git lfs install --skip-smudge
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:

@@ -102,6 +102,9 @@ def _patch_backend_runtime(config) -> Any:
         if not settings["useTimestamps"] and settings["outputFormat"] != "srt":
             command.append("--no_timestamps")
 
+        if settings.get("restorePunctuation") and settings["language"] == "ru":
+            command.append("--restore_punctuation")
+
         return command
 
     web_api.build_command = packaged_build_command

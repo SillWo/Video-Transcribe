@@ -1,7 +1,9 @@
 ffmpeg-python
 faster_whisper
+git+https://huggingface.co/kontur-ai/sbert_punc_case_ru
 huggingface_hub
 psutil
+razdel
 fastapi
 python-multipart
 uvicorn

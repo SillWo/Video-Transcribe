@@ -74,7 +74,7 @@ export function TranscriberPage(props: { controller: TranscriberController }) {
   const pairedFieldWrapperClass = 'grid min-w-0 gap-2'
   const pairedFieldLabelClass = 'flex items-center gap-2 text-sm font-medium text-stone-700'
   const pairedFieldControlClass =
-    'h-[56px] w-full rounded-2xl border border-stone-200 bg-stone-50 px-4 py-3 outline-none transition focus:border-orange-300 focus:bg-white'
+    'h-[56px] w-full appearance-auto rounded-2xl border border-stone-200 bg-white px-4 py-3 text-stone-900 [color-scheme:light] outline-none transition focus:border-orange-300'
 
   return (
     <>
@@ -87,6 +87,7 @@ export function TranscriberPage(props: { controller: TranscriberController }) {
         outputFormat={controller.outputFormat}
         saveAudio={controller.saveAudio}
         useTimestamps={controller.effectiveTimestamps}
+        restorePunctuation={controller.restorePunctuation}
       />
 
       <StageProgress
@@ -98,6 +99,7 @@ export function TranscriberPage(props: { controller: TranscriberController }) {
         <SectionCard
           title={t('controls.title')}
           description={t('controls.description')}
+          className="backdrop-blur-none"
           action={
             <div className="rounded-full border border-stone-200 bg-stone-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-stone-600">
               {statusLabel}
@@ -437,6 +439,28 @@ export function TranscriberPage(props: { controller: TranscriberController }) {
                   />
                 </button>
               </label>
+
+              {controller.language === 'ru' ? (
+                <label className="flex items-center justify-between rounded-3xl border border-stone-200 bg-stone-50 px-4 py-3">
+                  <div>
+                    <div className="font-medium text-stone-800">
+                      {t('controls.toggles.restorePunctuation.title')}
+                    </div>
+                    <div className="text-sm text-stone-500">
+                      {t('controls.toggles.restorePunctuation.description')}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => controller.setRestorePunctuation((value) => !value)}
+                    className={`relative inline-flex h-7 w-12 shrink-0 rounded-full p-1 transition ${controller.restorePunctuation ? 'bg-stone-900' : 'bg-stone-300'}`}
+                  >
+                    <span
+                      className={`absolute left-1 top-1 h-5 w-5 rounded-full bg-white transition-transform ${controller.restorePunctuation ? 'translate-x-5' : 'translate-x-0'}`}
+                    />
+                  </button>
+                </label>
+              ) : null}
 
               <label className="flex items-center justify-between rounded-3xl border border-stone-200 bg-stone-50 px-4 py-3">
                 <div>

@@ -18,6 +18,7 @@ hiddenimports = sorted(
         + collect_submodules("utils")
         + collect_submodules("uvicorn")
         + collect_submodules("faster_whisper")
+        + collect_submodules("sbert_punc_case_ru")
         + [
             "psutil",
             "validators",
@@ -25,6 +26,8 @@ hiddenimports = sorted(
             "source_check",
             "ffmpeg",
             "yt_dlp",
+            "razdel",
+            "sbert_punc_case_ru",
         ]
     )
 )

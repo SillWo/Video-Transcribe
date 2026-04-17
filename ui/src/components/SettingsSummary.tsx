@@ -15,6 +15,7 @@ type SettingsSummaryProps = {
   outputFormat: 'txt' | 'srt' | 'json'
   saveAudio: boolean
   useTimestamps: boolean
+  restorePunctuation: boolean
 }
 
 const itemClass =
@@ -93,6 +94,14 @@ export function SettingsSummary(props: SettingsSummaryProps) {
         <span className={itemClass}>
           {t('summary.fields.keepAudio')}:{' '}
           {props.saveAudio ? t('summary.values.toggles.on') : t('summary.values.toggles.off')}
+        </span>
+        <span className={itemClass}>
+          {t('summary.fields.punctuation')}:{' '}
+          {props.language === 'ru'
+            ? props.restorePunctuation
+              ? t('summary.values.punctuation.on')
+              : t('summary.values.punctuation.off')
+            : t('summary.values.punctuation.unavailable')}
         </span>
       </div>
     </div>

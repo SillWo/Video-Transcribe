@@ -63,6 +63,7 @@ git status --short --branch
 git rev-parse --verify windows_dist
 python --version
 node --version
+git lfs version
 ```
 
 Build a release from the current local repository refs:

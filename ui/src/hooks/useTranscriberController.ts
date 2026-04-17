@@ -27,6 +27,7 @@ export type JobResponse = {
     outputFormat: OutputFormat
     saveAudio: boolean
     useTimestamps: boolean
+    restorePunctuation: boolean
   }
   status: JobStatus
   stage: StageId
@@ -91,9 +92,26 @@ export type UiError =
 
 const FALLBACK_CPU_THREADS =
   typeof navigator !== 'undefined' ? Math.max(navigator.hardwareConcurrency || 1, 1) : 1
+const DEFAULT_MODEL_OPTIONS = [
+  'tiny',
+  'base',
+  'small',
+  'medium',
+  'large-v1',
+  'large-v2',
+  'large-v3',
+  'large',
+  'distil-large-v2',
+  'distil-medium.en',
+  'distil-small.en',
+  'tiny.en',
+  'base.en',
+  'small.en',
+  'medium.en',
+]
 const DEFAULT_LANGUAGE_OPTIONS = ['ru', 'auto', 'en', 'de', 'fr', 'es', 'it', 'pt', 'uk', 'ja', 'ko', 'zh']
 const DEFAULT_OPTIONS: OptionsResponse = {
-  models: [],
+  models: DEFAULT_MODEL_OPTIONS,
   devices: ['cpu', 'cuda'],
   outputFormats: ['txt', 'srt', 'json'],
   languages: DEFAULT_LANGUAGE_OPTIONS,
@@ -137,6 +155,7 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
   const [outputFormat, setOutputFormat] = useState<OutputFormat>('srt')
   const [saveAudio, setSaveAudio] = useState(false)
   const [useTimestamps, setUseTimestamps] = useState(true)
+  const [restorePunctuation, setRestorePunctuation] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<UiError | null>(null)
   const [job, setJob] = useState<JobResponse | null>(null)
@@ -230,6 +249,12 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
     setIsSourceCheckExpanded(false)
   }, [sourceType, url])
 
+  useEffect(() => {
+    if (language !== 'ru') {
+      setRestorePunctuation(false)
+    }
+  }, [language])
+
   const effectiveTimestamps = outputFormat === 'srt' ? true : useTimestamps
   const maxCpuThreads = Math.max(options.maxCpuThreads || 1, 1)
   const effectiveCpuThreads = Math.min(Math.max(nproc, 1), maxCpuThreads)
@@ -268,6 +293,7 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
     formData.append('outputFormat', outputFormat)
     formData.append('saveAudio', String(saveAudio))
     formData.append('useTimestamps', String(effectiveTimestamps))
+    formData.append('restorePunctuation', String(language === 'ru' ? restorePunctuation : false))
 
     if (sourceType === 'file' && file) {
       formData.append('file', file)
@@ -397,6 +423,8 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
     setSaveAudio,
     useTimestamps,
     setUseTimestamps,
+    restorePunctuation,
+    setRestorePunctuation,
     isSubmitting,
     error,
     errorMessage,

@@ -2,6 +2,10 @@
 
 Локальный сервис для расшифровки аудио и видео с использованием `faster-whisper`, `FastAPI`, `yt-dlp`, `ffmpeg` и веб-интерфейса на React.
 
+Этот репозиторий fork [Video-Transcribe](https://github.com/a2nath/Video-Transcribe).
+
+Разработка и сопровождение релизов осуществляются с помощью Codex.
+
 ## Содержание
 
 - [Описание проекта](#описание-проекта)
@@ -23,7 +27,8 @@
 - backend API на `FastAPI`;
 - локальный web UI на `React + Vite`;
 - пайплайн извлечения аудио через `ffmpeg`;
-- распознавание речи через `faster-whisper`.
+- распознавание речи через `faster-whisper`;
+- для русского языка опциональную постобработку текста по цепочке `faster-whisper -> восстановление пунктуации -> финальная шлифовка предложений`.
 
 Для удалённых ссылок доступна отдельная предварительная проверка источника. Она позволяет до запуска полной расшифровки понять, поддерживается ли ссылка, доступны ли форматы и выглядит ли источник пригодным для извлечения аудио.
 
@@ -38,6 +43,7 @@
 - Поддержка `cpu` и `cuda` режимов выполнения.
 - Выбор языка распознавания или автоопределение.
 - Опциональное сохранение промежуточного извлечённого аудио.
+- Для явно выбранного русского языка доступен опциональный post-processing текста после `faster-whisper` через `kontur-ai/sbert_punc_case_ru` и `razdel`.
 
 ## Пример пользовательского сценария при работе с удалёнными ссылками
 
@@ -56,7 +62,8 @@
    - модель;
    - устройство выполнения;
    - формат результата;
-   - необходимость сохранения промежуточного аудио.
+   - необходимость сохранения промежуточного аудио;
+   - для языка `ru` при необходимости включает восстановление пунктуации.
 8. Нажимает `Начать расшифровку`.
 9. Сервис скачивает или извлекает источник, подготавливает аудио и запускает распознавание.
 10. Пользователь просматривает результат в интерфейсе и скачивает готовый файл.
@@ -72,7 +79,8 @@
    - модель;
    - устройство выполнения;
    - формат результата;
-   - необходимость сохранения промежуточного аудио.
+   - необходимость сохранения промежуточного аудио;
+   - для языка `ru` при необходимости включает восстановление пунктуации.
 6. Нажимает `Начать расшифровку`.
 7. Backend сохраняет загруженный файл во временную рабочую директорию.
 8. Если входной файл является видео, сервис извлекает из него аудио.
@@ -109,6 +117,8 @@ python -m venv .venv
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
+
+Примечание: зависимость `kontur-ai/sbert_punc_case_ru` устанавливается через Git VCS и требует заранее установленный `git-lfs`.
 
 ### 4. Установка frontend-зависимостей
 
@@ -181,6 +191,8 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+Примечание: зависимость `kontur-ai/sbert_punc_case_ru` устанавливается через Git VCS и требует заранее установленный `git-lfs`.
+
 ### 4. Установка frontend-зависимостей
 
 ```bash
@@ -220,3 +232,45 @@ http://127.0.0.1:5173
 ```env
 VITE_API_BASE_URL=http://127.0.0.1:8000
 ```
+
+
+## Windows Packaging Pipeline
+
+The Windows release flow is split into two branches:
+
+- `main` contains the product source code.
+- `windows_dist` contains packaging-only logic: launcher, PyInstaller spec, Inno Setup script, build scripts, workflows, and release docs.
+
+Release builds always use:
+
+- `source/` from an exact tagged commit in `main`
+- `packaging/` from `windows_dist`
+
+Local installer build from the current checkout:
+
+```powershell
+$iscc = .\scripts\windows\install-inno-setup.ps1
+
+powershell -ExecutionPolicy Bypass -File .\scripts\windows\build-release.ps1 `
+  -ReleaseTag v0.0.0-local `
+  -SourceRef refs/heads/develop `
+  -PackagingDir . `
+  -RepositoryRoot . `
+  -IsccPath $iscc
+```
+
+Result:
+
+- `build/windows/installer/VideoTranscribe-Setup-0.0.0-local.exe`
+- `build/windows/installer/VideoTranscribe-Setup-0.0.0-local.exe.sha256`
+
+User machines do not need manual installation of Python, Node.js, `ffmpeg`, or `yt-dlp`. The installer bundles the runtime and starts the local service automatically after installation.
+
+### Codex refresh notes
+
+If `main` changes product code, do not copy application source into `windows_dist`.
+
+- Keep `windows_dist` packaging-only.
+- Update `windows_dist` only when launcher, runtime config, PyInstaller, installer, or workflow logic must follow a product change.
+- Rebuild release assets from exact tagged source in `main` plus packaging files from `windows_dist`.
+- Never patch `source/` during the release build.

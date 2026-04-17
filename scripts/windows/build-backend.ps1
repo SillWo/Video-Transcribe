@@ -36,6 +36,17 @@ if (Test-Path $venvDir) {
 & $PythonExe -m venv $venvDir
 $venvPython = Join-Path $venvDir "Scripts\python.exe"
 
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    throw "git is required for backend packaging builds"
+}
+
+& git lfs version *> $null
+if ($LASTEXITCODE -ne 0) {
+    throw "git-lfs is required to install kontur-ai/sbert_punc_case_ru during the packaging build"
+}
+
+& git lfs install --skip-smudge | Out-Null
+
 & $venvPython -m pip install --upgrade pip
 & $venvPython -m pip install -r (Join-Path $resolvedSource "requirements.txt")
 & $venvPython -m pip install "pyinstaller==$PyInstallerVersion"
