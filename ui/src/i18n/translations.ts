@@ -25,6 +25,7 @@ const en = {
       format: 'format',
       timestamps: 'timestamps',
       keepAudio: 'keep audio',
+      punctuation: 'punctuation',
     },
     values: {
       sourceType: {
@@ -39,6 +40,11 @@ const en = {
       toggles: {
         on: 'on',
         off: 'off',
+      },
+      punctuation: {
+        on: 'on',
+        off: 'off',
+        unavailable: 'unavailable',
       },
     },
   },
@@ -79,6 +85,11 @@ const en = {
       saveAudio: {
         title: 'Save intermediate audio',
         description: 'Keep extracted MP3 in the output folder',
+      },
+      restorePunctuation: {
+        title: 'Restore punctuation',
+        description:
+          'After faster-whisper, run Russian text through kontur-ai/sbert_punc_case_ru and finish it with razdel.',
       },
       timestamps: {
         title: 'Use timestamps',
@@ -227,6 +238,7 @@ const ru: TranslationSchema = {
       format: 'формат',
       timestamps: 'таймкоды',
       keepAudio: 'аудио',
+      punctuation: 'пунктуация',
     },
     values: {
       sourceType: {
@@ -241,6 +253,11 @@ const ru: TranslationSchema = {
       toggles: {
         on: 'вкл',
         off: 'выкл',
+      },
+      punctuation: {
+        on: 'вкл',
+        off: 'выкл',
+        unavailable: 'недоступно',
       },
     },
   },
@@ -281,6 +298,11 @@ const ru: TranslationSchema = {
       saveAudio: {
         title: 'Сохранять промежуточное аудио',
         description: 'Оставлять извлеченный MP3 в папке результата',
+      },
+      restorePunctuation: {
+        title: 'Восстанавливать пунктуацию',
+        description:
+          'После faster-whisper прогонять русский текст через kontur-ai/sbert_punc_case_ru и финально шлифовать через razdel.',
       },
       timestamps: {
         title: 'Использовать таймкоды',
