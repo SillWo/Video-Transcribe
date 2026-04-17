@@ -16,6 +16,7 @@ from faster_whisper.utils import available_models
 
 from utils.download_best import Download
 from utils.get_audio import AudioProcess
+from utils.text_postprocess import build_polished_russian_text_from_segments, restore_russian_segment_text
 
 audio_file = "intermediate_audio_file.mp3"
 JSON_EVENT_PREFIX = "__VT_JSON__ "
@@ -117,21 +118,19 @@ def serialize_segments(segments) -> list[dict]:
     ]
 
 
-def build_plain_text(segments: list[dict], use_timestamps: bool) -> str:
-    lines = []
-    for segment in segments:
-        if use_timestamps:
-            lines.append(f"[{srt_format_timestamp(segment['start'])}] {segment['text']}")
-        else:
-            lines.append(segment["text"])
+def build_plain_text(segments: list[dict], combined_text: str, use_timestamps: bool) -> str:
+    if not use_timestamps:
+        return combined_text.strip() + "\n"
+
+    lines = [f"[{srt_format_timestamp(segment['start'])}] {segment['text']}" for segment in segments]
     return "\n".join(lines).strip() + "\n"
 
 
-def build_output_payload(segments: list[dict], stats, use_timestamps: bool) -> dict:
+def build_output_payload(segments: list[dict], stats, combined_text: str, use_timestamps: bool) -> dict:
     payload = {
         "language": stats.language,
         "language_probability": stats.language_probability,
-        "text": "\n".join(segment["text"] for segment in segments).strip(),
+        "text": combined_text,
     }
 
     if use_timestamps:
@@ -142,7 +141,7 @@ def build_output_payload(segments: list[dict], stats, use_timestamps: bool) -> d
     return payload
 
 
-def write_output(args, segments: list[dict], stats, filename: str) -> tuple[Path, str]:
+def write_output(args, segments: list[dict], combined_text: str, stats, filename: str) -> tuple[Path, str]:
     output_suffix = args.output_format
     output_language = stats.language if args.language == "auto" else args.language
     output_path = Path(
@@ -156,11 +155,11 @@ def write_output(args, segments: list[dict], stats, filename: str) -> tuple[Path
         rendered_result = output_path.read_text(encoding="utf-8")
 
     elif args.output_format == "txt":
-        rendered_result = build_plain_text(segments, use_timestamps=args.use_timestamps)
+        rendered_result = build_plain_text(segments, combined_text, use_timestamps=args.use_timestamps)
         output_path.write_text(rendered_result, encoding="utf-8")
 
     else:
-        payload = build_output_payload(segments, stats, use_timestamps=args.use_timestamps)
+        payload = build_output_payload(segments, stats, combined_text, use_timestamps=args.use_timestamps)
         rendered_result = json.dumps(payload, ensure_ascii=False, indent=2)
         output_path.write_text(rendered_result, encoding="utf-8")
 
@@ -179,10 +178,21 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
     language = None if args.language == "auto" else args.language
     segments_iter, stats = model.transcribe(full_filepath, beam_size=args.beam_size, language=language)
     segments = serialize_segments(list(segments_iter))
+    effective_restore_punctuation = bool(args.restore_punctuation and args.language == "ru")
 
     print("\nDetected language '%s' with probability %f" % (stats.language, stats.language_probability))
 
-    output_path, rendered_result = write_output(args, segments, stats, filename)
+    if effective_restore_punctuation:
+        print("Russian text post-processing enabled.")
+        print("Applying punctuation restoration to Russian segments.")
+        for segment in segments:
+            segment["text"] = restore_russian_segment_text(segment["text"])
+        combined_text = build_polished_russian_text_from_segments([segment["text"] for segment in segments])
+        print("Russian text post-processing completed.")
+    else:
+        combined_text = "\n".join(segment["text"] for segment in segments).strip()
+
+    output_path, rendered_result = write_output(args, segments, combined_text, stats, filename)
     elapsed_seconds = timeit.default_timer() - start_time
 
     print(filename, " took ", "{:.1f}".format(elapsed_seconds), " seconds")
@@ -195,7 +205,7 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
         "output_format": args.output_format,
         "detected_language": stats.language,
         "detected_language_probability": stats.language_probability,
-        "text": "\n".join(segment["text"] for segment in segments).strip(),
+        "text": combined_text,
         "rendered_result": rendered_result,
         "segments": segments if args.use_timestamps else [{"text": segment["text"]} for segment in segments],
         "elapsed_seconds": round(elapsed_seconds, 2),
@@ -329,6 +339,7 @@ def main():
     parser.add_argument("--bitrate", help="Audio bitrate to use")
     parser.add_argument("--output_format", help="Output format to create", choices=["txt", "srt", "json"], default="srt")
     parser.add_argument("--no_timestamps", help="Disable timestamps in txt/json output. Ignored for srt.", action="store_true")
+    parser.add_argument("--restore_punctuation", help="Restore punctuation for explicitly selected Russian transcription.", action="store_true")
     parser.add_argument("--web_json", help=argparse.SUPPRESS, action="store_true")
 
     args = parser.parse_args()

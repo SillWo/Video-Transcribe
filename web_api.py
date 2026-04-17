@@ -522,6 +522,9 @@ def build_command(job: JobState, source_path: str) -> list[str]:
     if not settings["useTimestamps"] and settings["outputFormat"] != "srt":
         command.append("--no_timestamps")
 
+    if settings.get("restorePunctuation") and settings["language"] == "ru":
+        command.append("--restore_punctuation")
+
     return command
 
 
@@ -761,6 +764,7 @@ async def create_transcription(
     outputFormat: str = Form("srt"),
     saveAudio: str = Form("false"),
     useTimestamps: str = Form("true"),
+    restorePunctuation: str = Form("false"),
 ):
     if sourceType not in {"url", "file"}:
         raise HTTPException(status_code=400, detail="sourceType must be 'url' or 'file'")
@@ -791,16 +795,19 @@ async def create_transcription(
         source_path = source_name
 
     max_cpu_threads = logical_cpu_count()
+    normalized_language = language.strip() or "ru"
+
     settings = {
         "sourceType": sourceType,
         "url": (url or "").strip(),
-        "language": language.strip() or "ru",
+        "language": normalized_language,
         "model": model.strip() or "small",
         "device": device.strip() or "cpu",
         "nproc": parse_int(nproc, default=max_cpu_threads, minimum=1, maximum=max_cpu_threads),
         "outputFormat": outputFormat.strip() or "srt",
         "saveAudio": parse_bool(saveAudio, default=False),
         "useTimestamps": parse_bool(useTimestamps, default=True),
+        "restorePunctuation": parse_bool(restorePunctuation, default=False) and (normalized_language == "ru"),
     }
 
     job = JobState(id=job_id, settings=settings, source_name=source_name)
