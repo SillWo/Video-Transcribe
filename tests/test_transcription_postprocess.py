@@ -20,6 +20,12 @@ class TextPostprocessTests(unittest.TestCase):
         model.punctuate.assert_called_once_with("привет мир")
         self.assertEqual(result, "Привет, мир.")
 
+    def test_restore_russian_segment_text_skips_empty_normalized_input(self):
+        with patch("utils.text_postprocess.load_punctuation_model") as model_loader:
+            result = text_postprocess.restore_russian_segment_text(" !!! ")
+        self.assertEqual(result, "")
+        model_loader.assert_not_called()
+
     def test_build_polished_russian_text_from_segments_drops_empty_items_and_returns_single_line(self):
         mock_sentences = [
             SimpleNamespace(text=" Привет, мир. "),
@@ -74,7 +80,7 @@ class CreateTranscriptionApiTests(unittest.TestCase):
     def test_create_transcription_disables_restore_punctuation_for_non_ru_language(self):
         client = TestClient(app)
 
-        with patch("web_api.threading.Thread") as thread_mock:
+        with patch("web_api.threading.Thread") as thread_mock, patch("web_api.importlib.util.find_spec", return_value=object()):
             response = client.post(
                 "/api/transcriptions",
                 data={
@@ -97,7 +103,7 @@ class CreateTranscriptionApiTests(unittest.TestCase):
     def test_create_transcription_keeps_restore_punctuation_for_ru_language(self):
         client = TestClient(app)
 
-        with patch("web_api.threading.Thread") as thread_mock:
+        with patch("web_api.threading.Thread") as thread_mock, patch("web_api.importlib.util.find_spec", return_value=object()):
             response = client.post(
                 "/api/transcriptions",
                 data={

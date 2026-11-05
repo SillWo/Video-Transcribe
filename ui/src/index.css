@@ -20,6 +20,9 @@
 
 html {
   scroll-behavior: smooth;
+  overflow-x: clip;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 body {
@@ -32,6 +35,46 @@ input,
 select,
 textarea {
   font: inherit;
+}
+
+button:not([role='switch']) {
+  min-height: 44px;
+}
+
+button[role='switch'] {
+  min-height: 0;
+  height: 28px;
+}
+
+:focus-visible {
+  outline: 2px solid #c2410c;
+  outline-offset: 2px;
+}
+
+h1,
+h2,
+h3 {
+  text-wrap: balance;
+}
+
+p {
+  text-wrap: pretty;
+}
+
+.tabular-nums,
+input[type='number'] {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 #root {

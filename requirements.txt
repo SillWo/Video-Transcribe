@@ -1,11 +1,11 @@
-ffmpeg-python
-faster_whisper
-git+https://huggingface.co/kontur-ai/sbert_punc_case_ru
-huggingface_hub
-psutil
-razdel
-fastapi
-python-multipart
-uvicorn
-validators
-yt-dlp
+# Core runtime only. The Russian punctuation model is opt-in in requirements-postprocess.txt.
+fastapi>=0.115,<1
+faster-whisper>=1.1.1,<2
+av>=14,<19
+ffmpeg-python>=0.2.0,<1
+huggingface-hub>=1.0,<3
+psutil>=6,<8
+python-multipart>=0.0.20,<1
+uvicorn>=0.34,<1
+validators>=0.34,<1
+yt-dlp>=2025.1.15

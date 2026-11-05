@@ -39,11 +39,21 @@ export type JobResponse = {
   detected_language: string | null
   error: string | null
   downloadUrl: string | null
+  effective_device?: string | null
+  effectiveDevice?: string | null
+  backend?: string | null
+  effective_backend?: string | null
+  effectiveBackend?: string | null
 }
 
 export type OptionsResponse = {
   models: string[]
   devices: string[]
+  deviceDetails: Array<{ id: string; available: boolean; name: string; reason: string | null }>
+  defaultDevice: string
+  vulkanModels: string[]
+  punctuationAvailable: boolean
+  modelsDirectory: string | null
   outputFormats: OutputFormat[]
   languages: string[]
   maxCpuThreads: number
@@ -90,8 +100,7 @@ export type UiError =
       key: string
     }
 
-const FALLBACK_CPU_THREADS =
-  typeof navigator !== 'undefined' ? Math.max(navigator.hardwareConcurrency || 1, 1) : 1
+const FALLBACK_CPU_THREADS = 1
 const DEFAULT_MODEL_OPTIONS = [
   'tiny',
   'base',
@@ -100,6 +109,7 @@ const DEFAULT_MODEL_OPTIONS = [
   'large-v1',
   'large-v2',
   'large-v3',
+  'large-v3-turbo',
   'large',
   'distil-large-v2',
   'distil-medium.en',
@@ -112,7 +122,17 @@ const DEFAULT_MODEL_OPTIONS = [
 const DEFAULT_LANGUAGE_OPTIONS = ['ru', 'auto', 'en', 'de', 'fr', 'es', 'it', 'pt', 'uk', 'ja', 'ko', 'zh']
 const DEFAULT_OPTIONS: OptionsResponse = {
   models: DEFAULT_MODEL_OPTIONS,
-  devices: ['cpu', 'cuda'],
+  devices: ['auto', 'cpu', 'vulkan', 'cuda'],
+  deviceDetails: [
+    { id: 'auto', available: true, name: 'Automatic', reason: null },
+    { id: 'cpu', available: true, name: 'CPU', reason: null },
+    { id: 'vulkan', available: false, name: 'Vulkan', reason: null },
+    { id: 'cuda', available: false, name: 'CUDA', reason: null },
+  ],
+  defaultDevice: 'auto',
+  vulkanModels: [],
+  punctuationAvailable: false,
+  modelsDirectory: null,
   outputFormats: ['txt', 'srt', 'json'],
   languages: DEFAULT_LANGUAGE_OPTIONS,
   maxCpuThreads: FALLBACK_CPU_THREADS,
@@ -135,12 +155,25 @@ function mergeOrderedValues(preferred: string[], incoming?: string[]) {
 }
 
 function normalizeOptionsResponse(payload: Partial<OptionsResponse> | null | undefined): OptionsResponse {
+  const deviceDetails = payload?.deviceDetails?.length ? payload.deviceDetails : DEFAULT_OPTIONS.deviceDetails
+  const availableDevices = deviceDetails.filter((item) => item.available).map((item) => item.id)
+  const backendThreadLimit = payload?.maxCpuThreads
   return {
     models: payload?.models?.length ? payload.models : DEFAULT_OPTIONS.models,
-    devices: mergeOrderedValues(DEFAULT_OPTIONS.devices, payload?.devices),
+    devices: mergeOrderedValues(availableDevices, payload?.devices).filter((id) =>
+      deviceDetails.some((item) => item.id === id && item.available),
+    ),
+    deviceDetails,
+    defaultDevice: payload?.defaultDevice ?? 'auto',
+    vulkanModels: payload?.vulkanModels ?? [],
+    punctuationAvailable: payload?.punctuationAvailable ?? false,
+    modelsDirectory: payload?.modelsDirectory ?? null,
     outputFormats: mergeOrderedValues(DEFAULT_OPTIONS.outputFormats, payload?.outputFormats) as OutputFormat[],
     languages: mergeOrderedValues(DEFAULT_LANGUAGE_OPTIONS, payload?.languages),
-    maxCpuThreads: Math.max(payload?.maxCpuThreads ?? 0, FALLBACK_CPU_THREADS, 1),
+    maxCpuThreads:
+      typeof backendThreadLimit === 'number' && Number.isFinite(backendThreadLimit) && backendThreadLimit > 0
+        ? Math.floor(backendThreadLimit)
+        : FALLBACK_CPU_THREADS,
   }
 }
 
@@ -150,7 +183,7 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
   const [file, setFile] = useState<File | null>(null)
   const [language, setLanguage] = useState('ru')
   const [model, setModel] = useState('small')
-  const [device, setDevice] = useState('cpu')
+  const [device, setDevice] = useState('auto')
   const [nproc, setNproc] = useState(FALLBACK_CPU_THREADS)
   const [outputFormat, setOutputFormat] = useState<OutputFormat>('srt')
   const [saveAudio, setSaveAudio] = useState(false)
@@ -163,8 +196,12 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
   const [sourceCheck, setSourceCheck] = useState<SourceCheckResponse | null>(null)
   const [isCheckingSource, setIsCheckingSource] = useState(false)
   const [isSourceCheckExpanded, setIsSourceCheckExpanded] = useState(false)
+  const [copyStatus, setCopyStatus] = useState<'success' | 'error' | null>(null)
+  const [optionsError, setOptionsError] = useState(false)
+  const [optionsRetryCount, setOptionsRetryCount] = useState(0)
+  const [optionsLoaded, setOptionsLoaded] = useState(false)
   const sourceCheckRequestRef = useRef(0)
-  const optionsLoadedRef = useRef(false)
+  const optionsRequestRef = useRef<Promise<void> | null>(null)
 
   const deferredLogText = useDeferredValue(job?.logs.join('\n') ?? '')
   const deferredTranscript = useDeferredValue(job?.result_text ?? '')
@@ -174,11 +211,10 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
   const normalizedUrl = url.trim()
 
   useEffect(() => {
-    if (!shouldLoadOptions || optionsLoadedRef.current) {
+    if (!shouldLoadOptions || optionsLoaded || optionsRequestRef.current) {
       return
     }
 
-    optionsLoadedRef.current = true
     let active = true
 
     async function loadOptions() {
@@ -190,7 +226,16 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
 
         startTransition(() => {
           const normalizedOptions = normalizeOptionsResponse(payload)
+          setOptionsError(false)
+          setOptionsLoaded(true)
           setOptions(normalizedOptions)
+          setDevice((current) =>
+            normalizedOptions.devices.includes(current)
+              ? current
+              : normalizedOptions.devices.includes(normalizedOptions.defaultDevice)
+                ? normalizedOptions.defaultDevice
+                : normalizedOptions.devices[0] ?? 'cpu',
+          )
           setModel((currentModel) =>
             normalizedOptions.models.length > 0 && !normalizedOptions.models.includes(currentModel)
               ? normalizedOptions.models[0]
@@ -201,24 +246,34 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
           )
         })
       } catch {
-        // Keep built-in fallback options when backend options are not available.
+        if (active) {
+          optionsRequestRef.current = null
+          setOptionsError(true)
+        }
       }
     }
 
-    void loadOptions()
+    const request = loadOptions()
+    optionsRequestRef.current = request
     return () => {
       active = false
+      if (!optionsLoaded && optionsRequestRef.current === request) optionsRequestRef.current = null
     }
-  }, [shouldLoadOptions])
+  }, [shouldLoadOptions, optionsLoaded, optionsRetryCount])
 
   useEffect(() => {
     if (!currentJobId || (currentJobStatus !== 'queued' && currentJobStatus !== 'running')) {
       return
     }
 
+    let active = true
+    let inFlight = false
     const timer = window.setInterval(async () => {
+      if (inFlight) return
+      inFlight = true
       try {
         const nextJob = await fetchJson<JobResponse>(`/api/jobs/${currentJobId}`)
+        if (!active) return
         startTransition(() => {
           setJob(nextJob)
         })
@@ -231,33 +286,56 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
           )
         }
       } catch (fetchError) {
+        if (!active) return
         setError(
           fetchError instanceof Error
             ? { kind: 'message', message: fetchError.message }
             : { kind: 'translation', key: 'errors.unableRefreshJob' },
         )
+      } finally {
+        inFlight = false
       }
     }, 1000)
 
-    return () => window.clearInterval(timer)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
   }, [currentJobId, currentJobStatus])
 
-  useEffect(() => {
+  function handleSourceChange() {
     sourceCheckRequestRef.current += 1
     setSourceCheck(null)
     setIsCheckingSource(false)
     setIsSourceCheckExpanded(false)
-  }, [sourceType, url])
+  }
 
-  useEffect(() => {
-    if (language !== 'ru') {
-      setRestorePunctuation(false)
-    }
-  }, [language])
+  function handleSetSourceType(value: SourceType) {
+    handleSourceChange()
+    setSourceType(value)
+  }
+
+  function handleSetUrl(value: string) {
+    handleSourceChange()
+    setUrl(value)
+  }
+
+  function handleSetLanguage(value: string) {
+    setLanguage(value)
+    if (value !== 'ru') setRestorePunctuation(false)
+  }
 
   const effectiveTimestamps = outputFormat === 'srt' ? true : useTimestamps
   const maxCpuThreads = Math.max(options.maxCpuThreads || 1, 1)
   const effectiveCpuThreads = Math.min(Math.max(nproc, 1), maxCpuThreads)
+  const availableModels = options.models.filter((item) =>
+    language === 'en' || (!item.endsWith('.en') && !item.startsWith('distil-')),
+  ).filter((item) => {
+    const vulkanMode = device === 'vulkan' || (device === 'auto' && options.deviceDetails.some((item) => item.id === 'vulkan' && item.available))
+    return !vulkanMode || options.vulkanModels.includes(item)
+  })
+
+  const selectedModel = availableModels.includes(model) ? model : availableModels[0] ?? model
 
   const errorMessage = useMemo(() => {
     if (!error) {
@@ -269,7 +347,9 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (isSubmitting || job?.status === 'queued' || job?.status === 'running') return
     setError(null)
+    setCopyStatus(null)
 
     if (sourceType === 'url' && !url.trim()) {
       setError({ kind: 'translation', key: 'errors.enterVideoUrl' })
@@ -285,9 +365,9 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
     formData.append('sourceType', sourceType)
     formData.append('url', url.trim())
     formData.append('language', language)
-    formData.append('model', model)
+    formData.append('model', selectedModel)
     formData.append('device', device)
-    if (device === 'cpu') {
+    if (device !== 'cuda') {
       formData.append('nproc', String(effectiveCpuThreads))
     }
     formData.append('outputFormat', outputFormat)
@@ -387,11 +467,17 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
   }
 
   async function handleCopy() {
-    if (!deferredTranscript) {
+    if (!deferredTranscript || typeof navigator.clipboard?.writeText !== 'function') {
+      setCopyStatus('error')
       return
     }
 
-    await navigator.clipboard.writeText(deferredTranscript)
+    try {
+      await navigator.clipboard.writeText(deferredTranscript)
+      setCopyStatus('success')
+    } catch {
+      setCopyStatus('error')
+    }
   }
 
   function handleDownload() {
@@ -404,13 +490,14 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
 
   return {
     sourceType,
-    setSourceType,
+    setSourceType: handleSetSourceType,
     url,
-    setUrl,
+    setUrl: handleSetUrl,
     file,
     setFile,
     language,
-    setLanguage,
+    setLanguage: handleSetLanguage,
+    selectedModel,
     model,
     setModel,
     device,
@@ -431,6 +518,9 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
     setError,
     job,
     options,
+    optionsError,
+    retryOptions: () => setOptionsRetryCount((count) => count + 1),
+    availableModels,
     sourceCheck,
     isCheckingSource,
     isSourceCheckExpanded,
@@ -438,6 +528,7 @@ export function useTranscriberController(shouldLoadOptions: boolean) {
     deferredLogText,
     deferredTranscript,
     deferredPreview,
+    copyStatus,
     normalizedUrl,
     effectiveTimestamps,
     maxCpuThreads,

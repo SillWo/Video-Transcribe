@@ -77,6 +77,14 @@ MODEL_REGISTRY: tuple[ModelRegistryEntry, ...] = (
         languageScope="multilingual",
         family="standard",
     ),
+    ModelRegistryEntry(
+        id="large-v3-turbo",
+        displayName="Large V3 Turbo",
+        backendValue="large-v3-turbo",
+        hfRepoId="mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+        languageScope="multilingual",
+        family="standard",
+    ),
     # The faster-whisper backend resolves "large" to the large-v3 repository.
     ModelRegistryEntry(
         id="large",
@@ -91,7 +99,7 @@ MODEL_REGISTRY: tuple[ModelRegistryEntry, ...] = (
         displayName="Distil Large V2",
         backendValue="distil-large-v2",
         hfRepoId="Systran/faster-distil-whisper-large-v2",
-        languageScope="multilingual",
+        languageScope="english",
         family="distil",
     ),
     ModelRegistryEntry(

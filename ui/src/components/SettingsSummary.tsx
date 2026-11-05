@@ -26,12 +26,12 @@ export function SettingsSummary(props: SettingsSummaryProps) {
 
   return (
     <div className="rounded-[28px] border border-stone-200 bg-white/85 p-4 shadow-[0_12px_40px_-24px_rgba(41,37,36,0.35)] backdrop-blur">
-      <div className="mb-3 flex items-center justify-between gap-3">
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.24em] text-orange-600">
             {t('summary.eyebrow')}
           </p>
-          <h1 className="mt-1 text-2xl font-semibold tracking-tight text-stone-900">
+        <h1 className="mt-1 max-w-2xl text-2xl font-semibold tracking-tight text-stone-900">
             {t('summary.title')}
           </h1>
         </div>
@@ -47,7 +47,7 @@ export function SettingsSummary(props: SettingsSummaryProps) {
                   type="button"
                   onClick={() => setLocale(item)}
                   aria-pressed={locale === item}
-                  className={`rounded-full px-3 py-1 text-xs font-semibold transition ${
+                  className={`min-h-11 rounded-full px-3 py-1 text-xs font-semibold transition-[background-color,color] ${
                     locale === item
                       ? 'bg-stone-900 text-white'
                       : 'text-stone-600 hover:bg-stone-100'

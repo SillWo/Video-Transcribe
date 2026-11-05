@@ -9,6 +9,7 @@ from os.path import isfile, join
 from pathlib import Path
 from typing import TextIO
 
+from services.model_paths import HF_HUB_CACHE
 import psutil
 import validators
 from faster_whisper import WhisperModel as whisper
@@ -17,6 +18,8 @@ from faster_whisper.utils import available_models
 from utils.download_best import Download
 from utils.get_audio import AudioProcess
 from utils.text_postprocess import build_polished_russian_text_from_segments, restore_russian_segment_text
+from services.runtime_devices import VULKAN_MODELS, get_device_details
+from services.whisper_cpp import WhisperCppModel
 
 audio_file = "intermediate_audio_file.mp3"
 JSON_EVENT_PREFIX = "__VT_JSON__ "
@@ -43,7 +46,7 @@ def srt_format_timestamp(seconds: float) -> str:
     seconds = milliseconds // 1_000
     milliseconds -= seconds * 1_000
 
-    return (f"{hours}:") + f"{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
 
 def write_srt(segments: list[dict], file: TextIO) -> None:
@@ -180,7 +183,9 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
     segments = serialize_segments(list(segments_iter))
     effective_restore_punctuation = bool(args.restore_punctuation and args.language == "ru")
 
-    print("\nDetected language '%s' with probability %f" % (stats.language, stats.language_probability))
+    probability = stats.language_probability
+    probability_text = f"{probability:f}" if probability is not None else "unavailable"
+    print(f"\nDetected language '{stats.language}' with probability {probability_text}")
 
     if effective_restore_punctuation:
         print("Russian text post-processing enabled.")
@@ -209,6 +214,8 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
         "rendered_result": rendered_result,
         "segments": segments if args.use_timestamps else [{"text": segment["text"]} for segment in segments],
         "elapsed_seconds": round(elapsed_seconds, 2),
+        "effective_device": getattr(model, "effective_device", getattr(args, "device", "cpu")),
+        "effective_backend": getattr(model, "effective_backend", "faster-whisper"),
     }
 
     emit_event(
@@ -222,24 +229,91 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
     return result
 
 
+def _faster_model(args, device: str):
+    threads = max(1, min(int(args.nproc or logical_cpu_count()), logical_cpu_count()))
+    precision = "int8" if device == "cpu" and args.precision == "auto" else args.precision
+    if device == "cpu":
+        return whisper(args.model_size, cpu_threads=threads, num_workers=1, device="cpu", compute_type=precision,
+                       download_root=str(HF_HUB_CACHE))
+    return whisper(args.model_size, device=device, compute_type=precision, download_root=str(HF_HUB_CACHE))
+
+
+class AutoFallbackModel:
+    """Fallback to CPU if GPU initialization succeeded but inference later failed."""
+    def __init__(self, model, args, backend: str):
+        self.model = model
+        self.args = args
+        self.effective_device = "vulkan" if backend == "whisper.cpp Vulkan" else "cuda"
+        self.effective_backend = backend
+
+    def transcribe(self, *args, **kwargs):
+        try:
+            segments, stats = self.model.transcribe(*args, **kwargs)
+            # faster-whisper performs GPU work lazily while iterating segments;
+            # consume inside the fallback boundary so deferred OOM/runtime errors are caught.
+            return list(segments), stats
+        except Exception as exc:
+            print(f"Automatic GPU transcription failed ({exc}); retrying this input on CPU.", flush=True)
+            self.model = _faster_model(self.args, "cpu")
+            self.effective_device = "cpu"
+            self.effective_backend = "faster-whisper CPU (int8)"
+            return self.model.transcribe(*args, **kwargs)
+
+
 def initialize(args):
     print("--------------------INITIALIZING-----------------------")
 
     if isfile(audio_file):
         os.remove(audio_file)
 
-    if args.device != "cuda":
-        threads = max(1, min(int(args.nproc or logical_cpu_count()), logical_cpu_count()))
-        model = whisper(
-            args.model_size,
-            cpu_threads=threads,
-            num_workers=4,
-            device=args.device,
-            compute_type=args.precision,
-        )
-    else:
-        model = whisper(args.model_size, device=args.device, compute_type=args.precision)
-
+    requested = args.device
+    choices = [item for item in get_device_details() if item["available"]]
+    available = {item["id"] for item in choices}
+    backend = requested
+    if requested == "auto":
+        backend = "vulkan" if "vulkan" in available else "cuda" if "cuda" in available else "cpu"
+        if backend == "vulkan" and args.model_size not in VULKAN_MODELS:
+            backend = "cuda" if "cuda" in available else "cpu"
+            print(f"{args.model_size} is not supported by Vulkan; automatic mode selected {backend}.", flush=True)
+        print(f"Automatic device selected: {backend}.", flush=True)
+    elif requested in {"vulkan", "cuda"} and requested not in available:
+        detail = next((item.get("reason") for item in choices if item["id"] == requested), None)
+        # Include the unavailable entry's reason, which isn't part of `choices`.
+        if not detail:
+            all_details = get_device_details()
+            detail = next((item.get("reason") for item in all_details if item["id"] == requested), None)
+        raise RuntimeError(f"{requested.upper()} is unavailable: {detail or 'no usable device was detected.'}")
+    if backend == "vulkan":
+        if args.model_size not in VULKAN_MODELS:
+            raise RuntimeError(f"Model '{args.model_size}' cannot run on Vulkan. Supported models: {', '.join(VULKAN_MODELS)}")
+        try:
+            model = WhisperCppModel(args.model_size, threads=args.nproc or logical_cpu_count(),
+                                    progress=lambda message: print(message, flush=True))
+            model.effective_device = "vulkan"
+            model.effective_backend = "whisper.cpp Vulkan"
+            return AutoFallbackModel(model, args, "whisper.cpp Vulkan") if requested == "auto" else model
+        except Exception as exc:
+            if requested != "auto":
+                raise
+            print(f"Vulkan initialization failed ({exc}); trying the next available backend.", flush=True)
+            if "cuda" in available:
+                backend = "cuda"
+            else:
+                backend = "cpu"
+    if backend == "cuda":
+        try:
+            model = _faster_model(args, "cuda")
+            model.effective_device = "cuda"
+            model.effective_backend = "faster-whisper CUDA"
+            return AutoFallbackModel(model, args, "faster-whisper CUDA") if requested == "auto" else model
+        except Exception as exc:
+            if requested != "auto":
+                raise
+            print(f"CUDA initialization failed ({exc}); retrying on CPU.", flush=True)
+            backend = "cpu"
+    model = _faster_model(args, "cpu")
+    model.effective_device = "cpu"
+    model.effective_backend = "faster-whisper CPU (int8)"
     return model
 
 
@@ -325,7 +399,7 @@ def main():
     parser.add_argument("-l", "--language", help="Language to be translated from", default="ru", type=str)
     parser.add_argument("-b", "--beam_size", help="Beam size parameter or best_of equivalent from Open-AI whisper", type=int, default=5)
     parser.add_argument("-p", "--precision", help="Precision to use to create the model", type=str, default="auto")
-    parser.add_argument("-d", "--device", help="Device to use such a CPU or GPU", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument("-d", "--device", help="Device to use", choices=["auto", "cpu", "vulkan", "cuda"], default="auto")
     parser.add_argument("-s", "--model_size", help="Size of the model, default is small.", choices=sizes_supported(), nargs="?", default="small")
     parser.add_argument("--start", help="Start time in 00:00:00 format", type=AudioProcess.valid_time)
     parser.add_argument("--end", help="End time in 00:00:00 format", type=AudioProcess.valid_time)

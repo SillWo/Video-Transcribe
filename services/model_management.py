@@ -3,9 +3,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+from .model_paths import HF_HUB_CACHE
+from .download_progress import create_download_progress_tqdm
 from huggingface_hub import DryRunFileInfo, HFCacheInfo, scan_cache_dir, snapshot_download
 from huggingface_hub.errors import CacheNotFound
-from tqdm.auto import tqdm as base_tqdm
 
 from .model_registry import (
     ModelRegistryEntry,
@@ -101,7 +102,7 @@ def _build_unknown_repo_state(repo_info: Any) -> dict[str, Any]:
 
 def _scan_cache_info(cache_dir: str | Path | None = None) -> HFCacheInfo | None:
     try:
-        return scan_cache_dir(cache_dir=cache_dir)
+        return scan_cache_dir(cache_dir=cache_dir or HF_HUB_CACHE)
     except CacheNotFound:
         return None
     except Exception as exc:
@@ -216,22 +217,16 @@ def _emit_progress(callback: ModelDownloadProgressCallback | None, percent: int,
     callback(max(0, min(100, percent)), label)
 
 
-class _SilentTqdm(base_tqdm):
-    def __init__(self, *args, **kwargs):
-        kwargs["disable"] = True
-        super().__init__(*args, **kwargs)
-
-
 def _build_download_plan(
     repo_id: str,
     cache_dir: str | Path | None = None,
 ) -> list[DryRunFileInfo]:
     return snapshot_download(
         repo_id,
-        cache_dir=cache_dir,
+        cache_dir=cache_dir or HF_HUB_CACHE,
         allow_patterns=MODEL_DOWNLOAD_ALLOW_PATTERNS,
         dry_run=True,
-        tqdm_class=_SilentTqdm,
+        tqdm_class=create_download_progress_tqdm(label="Preparing model download"),
     )
 
 
@@ -259,52 +254,23 @@ def download_registered_model(
         for item in download_plan
         if item.is_cached and not item.will_download
     )
-    bytes_to_download = max(total_bytes - already_cached_bytes, 0)
     initial_percent = int((already_cached_bytes / total_bytes) * 100) if total_bytes > 0 else 10
-    _emit_progress(progress_callback, max(10, initial_percent), "Downloading model files.")
+    initial_percent = min(99, max(10, initial_percent))
+    _emit_progress(progress_callback, initial_percent, "Downloading model files.")
 
-    class _DownloadProgressTqdm(base_tqdm):
-        def __init__(self, *args, **kwargs):
-            self._is_bytes_bar = kwargs.get("unit") == "B"
-            kwargs["disable"] = True
-            super().__init__(*args, **kwargs)
-            if self._is_bytes_bar:
-                self._emit()
-
-        def _emit(self) -> None:
-            if not self._is_bytes_bar:
-                return
-
-            if total_bytes <= 0:
-                _emit_progress(progress_callback, 90, "Finalizing downloaded files.")
-                return
-
-            downloaded_now = min(max(int(getattr(self, "n", 0)), 0), bytes_to_download)
-            completed_bytes = min(already_cached_bytes + downloaded_now, total_bytes)
-            percent = int((completed_bytes / total_bytes) * 100)
-            label = getattr(self, "desc", None) or "Downloading model files."
-            _emit_progress(progress_callback, percent, label)
-
-        def update(self, n: int | float | None = 1):
-            result = super().update(n)
-            self._emit()
-            return result
-
-        def refresh(self, *args, **kwargs):
-            result = super().refresh(*args, **kwargs)
-            self._emit()
-            return result
-
-        def set_description(self, desc=None, refresh=True):
-            result = super().set_description(desc, refresh)
-            self._emit()
-            return result
+    progress_tqdm = create_download_progress_tqdm(
+        total_bytes=total_bytes or None,
+        cached_bytes=already_cached_bytes,
+        initial_percent=initial_percent,
+        callback=(lambda percent, label: _emit_progress(progress_callback, percent, label)),
+        label="Downloading model files",
+    )
 
     snapshot_path = snapshot_download(
         entry.hfRepoId,
-        cache_dir=cache_dir,
+        cache_dir=cache_dir or HF_HUB_CACHE,
         allow_patterns=MODEL_DOWNLOAD_ALLOW_PATTERNS,
-        tqdm_class=_DownloadProgressTqdm,
+        tqdm_class=progress_tqdm,
     )
 
     verified_status = get_model_status(model_id, cache_dir=cache_dir)

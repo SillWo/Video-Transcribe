@@ -18,13 +18,15 @@ export const languageDisplayLabels: LocalizedLabelMap = {
 }
 
 export const deviceDisplayLabels: LocalizedLabelMap = {
+  auto: { ru: 'Автоматически', en: 'Automatic' },
+  vulkan: { ru: 'Видеокарта (Vulkan)', en: 'GPU (Vulkan)' },
   cpu: {
     ru: 'CPU',
     en: 'CPU',
   },
   cuda: {
-    ru: 'Видеокарта',
-    en: 'GPU',
+    ru: 'CUDA (NVIDIA)',
+    en: 'CUDA (NVIDIA)',
   },
 }
 
@@ -64,4 +66,12 @@ export function getDeviceDisplayLabel(locale: UiLocale, value: string) {
 
 export function getOutputFormatDisplayLabel(locale: UiLocale, value: string) {
   return getMappedLabel(locale, value, outputFormatDisplayLabels, (code) => code.toUpperCase())
+}
+
+export function getModelDisplayLabel(locale: UiLocale, value: string) {
+  return value === 'large-v3-turbo'
+    ? locale === 'ru'
+      ? 'Large v3 Turbo — быстрее'
+      : 'Large v3 Turbo — faster'
+    : value
 }

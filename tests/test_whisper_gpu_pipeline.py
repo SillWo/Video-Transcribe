@@ -38,7 +38,7 @@ class WhisperGpuOutputTests(unittest.TestCase):
             use_timestamps=True,
         )
 
-        self.assertEqual(result, "[0:00:01,000] first\n[0:00:03,000] second\n")
+        self.assertEqual(result, "[00:00:01,000] first\n[00:00:03,000] second\n")
 
     def test_build_output_payload_without_timestamps_keeps_text_only_segments(self):
         stats = SimpleNamespace(language="ru", language_probability=0.99)
@@ -54,6 +54,11 @@ class WhisperGpuOutputTests(unittest.TestCase):
 
         self.assertEqual(payload["text"], "combined text")
         self.assertEqual(payload["segments"], [{"text": "first"}, {"text": "second"}])
+
+    def test_build_output_payload_preserves_unavailable_language_probability_as_null(self):
+        stats = SimpleNamespace(language="ru", language_probability=None)
+        payload = whisper_gpu.build_output_payload([], stats, "recognized", use_timestamps=True)
+        self.assertIsNone(payload["language_probability"])
 
     def test_write_output_txt_without_timestamps_writes_combined_text(self):
         args = SimpleNamespace(
@@ -126,8 +131,8 @@ class WhisperGpuOutputTests(unittest.TestCase):
                 "input.wav",
             )
 
-            self.assertIn("1\n0:00:00,000 --> 0:00:01,000\nfirst line", rendered_result)
-            self.assertIn("2\n0:00:01,500 --> 0:00:03,000\nsecond line", rendered_result)
+            self.assertIn("1\n00:00:00,000 --> 00:00:01,000\nfirst line", rendered_result)
+            self.assertIn("2\n00:00:01,500 --> 00:00:03,000\nsecond line", rendered_result)
             self.assertEqual(output_path.read_text(encoding="utf-8"), rendered_result)
 
 
@@ -206,6 +211,45 @@ class WhisperGpuTranscribeTests(unittest.TestCase):
         restore_mock.assert_not_called()
         self.assertEqual(result["text"], "hello world")
         self.assertEqual(result["rendered_result"], "hello world\n")
+
+    def test_auto_gpu_fallback_catches_deferred_iteration_failure_without_partial_results(self):
+        class FailingGpu:
+            def transcribe(self, *_args, **_kwargs):
+                def partial_then_fail():
+                    yield SimpleNamespace(start=0, end=1, text="partial")
+                    raise RuntimeError("GPU allocation failed during lazy inference")
+                return partial_then_fail(), SimpleNamespace(language="ru", language_probability=0.9)
+
+        cpu_stats = SimpleNamespace(language="ru", language_probability=0.9)
+
+        class CpuModel:
+            def transcribe(self, *_args, **_kwargs):
+                return [SimpleNamespace(start=0, end=1, text="cpu result")], cpu_stats
+
+        args = SimpleNamespace(nproc=2)
+        model = whisper_gpu.AutoFallbackModel(FailingGpu(), args, "faster-whisper CUDA")
+        with patch.object(whisper_gpu, "_faster_model", return_value=CpuModel()) as cpu_factory:
+            segments, stats = model.transcribe("input.wav", language="ru")
+
+        cpu_factory.assert_called_once_with(args, "cpu")
+        self.assertEqual([segment.text for segment in segments], ["cpu result"])
+        self.assertEqual(stats.language, "ru")
+        self.assertEqual(model.effective_device, "cpu")
+        self.assertIn("CPU", model.effective_backend)
+
+    def test_explicit_unavailable_vulkan_reports_actionable_error_without_cpu_fallback(self):
+        args = SimpleNamespace(device="vulkan", model_size="small", precision="auto", nproc=2)
+        devices = [
+            {"id": "auto", "available": True},
+            {"id": "cpu", "available": True},
+            {"id": "vulkan", "available": False, "reason": "No non-CPU Vulkan GPU was detected."},
+            {"id": "cuda", "available": False, "reason": "No CUDA device is available."},
+        ]
+        with patch.object(whisper_gpu, "get_device_details", return_value=devices), \
+                patch.object(whisper_gpu, "_faster_model") as cpu_factory:
+            with self.assertRaisesRegex(RuntimeError, "VULKAN is unavailable: No non-CPU Vulkan GPU"):
+                whisper_gpu.initialize(args)
+        cpu_factory.assert_not_called()
 
 
 if __name__ == "__main__":

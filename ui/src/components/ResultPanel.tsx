@@ -2,11 +2,15 @@ import { Copy, Download } from 'lucide-react'
 
 import { SectionCard } from './SectionCard'
 import { useI18n } from '../i18n/useI18n'
+import { getDeviceDisplayLabel } from '../i18n/displayLabels'
 
 type ResultPanelProps = {
   text: string
   rawPreview: string
   canDownload: boolean
+  copyStatus: 'success' | 'error' | null
+  device?: string | null
+  engine?: string | null
   onCopy: () => void
   onDownload: () => void
 }
@@ -15,10 +19,14 @@ export function ResultPanel({
   text,
   rawPreview,
   canDownload,
+  copyStatus,
+  device,
+  engine,
   onCopy,
   onDownload,
 }: ResultPanelProps) {
-  const { t } = useI18n()
+  const { locale, t } = useI18n()
+  const deviceLabel = device ? getDeviceDisplayLabel(locale, device) : null
 
   return (
     <SectionCard
@@ -29,7 +37,8 @@ export function ResultPanel({
           <button
             type="button"
             onClick={onCopy}
-            className="inline-flex items-center gap-2 rounded-full border border-stone-200 bg-stone-50 px-3 py-2 text-sm font-medium text-stone-700 transition hover:bg-stone-100"
+            disabled={!text}
+            className="inline-flex min-h-11 items-center gap-2 rounded-full border border-stone-200 bg-stone-50 px-3 py-2 text-sm font-medium text-stone-700 transition-[background-color,color] hover:bg-stone-100 disabled:cursor-not-allowed disabled:text-stone-400"
           >
             <Copy className="h-4 w-4" />
             {t('panels.transcript.copy')}
@@ -38,17 +47,28 @@ export function ResultPanel({
             type="button"
             onClick={onDownload}
             disabled={!canDownload}
-            className="inline-flex items-center gap-2 rounded-full bg-stone-900 px-3 py-2 text-sm font-medium text-white transition hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+            className="inline-flex min-h-11 items-center gap-2 rounded-full bg-stone-900 px-3 py-2 text-sm font-medium text-white transition-[background-color] hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
           >
             <Download className="h-4 w-4" />
             {t('panels.transcript.download')}
           </button>
         </div>
       }
-      className="h-full"
     >
       <div className="grid gap-4">
-        <div className="min-h-[220px] rounded-3xl border border-stone-200 bg-stone-50 p-4">
+        {engine || device ? (
+          <p className="text-xs text-stone-500">
+            {engine ? <>{t('panels.transcript.engineUsed')}: {engine}</> : null}
+            {engine && deviceLabel ? ' · ' : null}
+            {deviceLabel ? <>{t('panels.transcript.deviceUsed')}: {deviceLabel}</> : null}
+          </p>
+        ) : null}
+        {copyStatus ? (
+          <p role="status" aria-live="polite" className="text-sm text-stone-600">
+            {copyStatus === 'success' ? t('panels.transcript.copied') : t('panels.transcript.copyFailed')}
+          </p>
+        ) : null}
+        <div className="min-h-0 rounded-2xl border border-stone-200 bg-stone-50 p-4">
           <p className="mb-2 text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">
             {t('panels.transcript.plainText')}
           </p>
@@ -57,7 +77,7 @@ export function ResultPanel({
           </pre>
         </div>
 
-        <div className="min-h-[180px] rounded-3xl bg-stone-950 p-4 text-stone-100">
+        <div className="min-h-0 rounded-2xl bg-stone-950 p-4 text-stone-100">
           <p className="mb-2 text-xs font-semibold uppercase tracking-[0.2em] text-stone-400">
             {t('panels.transcript.savedPreview')}
           </p>

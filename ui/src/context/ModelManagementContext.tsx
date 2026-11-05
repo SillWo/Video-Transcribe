@@ -87,6 +87,7 @@ type ModelManagementContextValue = {
   deleteJobs: Record<string, ModelOperationJobResponse>
   modelNotices: Record<string, Notice>
   globalNotice: Notice | null
+  modelsDirectory: string | null
   loadPanel: (options?: LoadPanelOptions) => Promise<void>
   startOperation: (modelId: string, operationType: OperationType) => Promise<void>
 }
@@ -102,6 +103,7 @@ export function ModelManagementProvider(props: { children: ReactNode }) {
   const [deleteJobs, setDeleteJobs] = useState<Record<string, ModelOperationJobResponse>>({})
   const [modelNotices, setModelNotices] = useState<Record<string, Notice>>({})
   const [globalNotice, setGlobalNotice] = useState<Notice | null>(null)
+  const [modelsDirectory, setModelsDirectory] = useState<string | null>(null)
 
   const loadPanel = useCallback(async (options?: LoadPanelOptions) => {
     if (!options?.keepLoadingState) {
@@ -122,8 +124,26 @@ export function ModelManagementProvider(props: { children: ReactNode }) {
   }, [])
 
   useEffect(() => {
-    void loadPanel()
-  }, [loadPanel])
+    let active = true
+    void fetchJson<ModelPanelResponse>('/api/models/panel')
+      .then((payload) => {
+        if (!active) return
+        startTransition(() => {
+          setPanelData(payload)
+          setError(null)
+        })
+      })
+      .catch((loadError) => {
+        if (active) setError(loadError instanceof Error ? loadError.message : 'Unable to load model catalog.')
+      })
+      .finally(() => {
+        if (active) setIsLoading(false)
+      })
+    void fetchJson<{ modelsDirectory?: string | null }>('/api/options')
+      .then((payload) => { if (active) setModelsDirectory(payload.modelsDirectory ?? null) })
+      .catch(() => { if (active) setModelsDirectory(null) })
+    return () => { active = false }
+  }, [])
 
   useEffect(() => {
     if (!activeOperation) {
@@ -275,6 +295,7 @@ export function ModelManagementProvider(props: { children: ReactNode }) {
       deleteJobs,
       modelNotices,
       globalNotice,
+      modelsDirectory,
       loadPanel,
       startOperation,
     }),
@@ -287,6 +308,7 @@ export function ModelManagementProvider(props: { children: ReactNode }) {
       isLoading,
       loadPanel,
       modelNotices,
+      modelsDirectory,
       panelData,
       startOperation,
     ],

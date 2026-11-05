@@ -1,5 +1,7 @@
 import re
 
+from services.model_paths import HF_HOME  # configure before lazy Transformers/PyTorch imports
+
 try:
     import razdel
 except Exception:
@@ -34,6 +36,8 @@ def restore_russian_segment_text(text: str) -> str:
         return ""
 
     normalized_input = normalize_whitespace(re.sub(r"[^\w\s]", " ", stripped_text, flags=re.UNICODE)).lower()
+    if not normalized_input:
+        return ""
     model = load_punctuation_model()
     try:
         punctuated_text = model.punctuate(normalized_input)

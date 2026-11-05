@@ -15,7 +15,7 @@ const en = {
   summary: {
     eyebrow: 'Current Setup',
     title: 'Local video transcription',
-    badge: 'Browser + FastAPI + Whisper',
+    badge: 'Private processing on this computer',
     fields: {
       source: 'source',
       lang: 'lang',
@@ -50,7 +50,7 @@ const en = {
   },
   controls: {
     title: 'Controls',
-    description: 'Pick a source, set Whisper options, then start the local pipeline.',
+    description: 'Choose a video link or file, set recognition options, and start transcription.',
     sourceLabel: 'Source',
     sourceOptions: {
       url: {
@@ -88,8 +88,8 @@ const en = {
       },
       restorePunctuation: {
         title: 'Restore punctuation',
-        description:
-          'After faster-whisper, run Russian text through kontur-ai/sbert_punc_case_ru and finish it with razdel.',
+        description: 'Improve punctuation and capitalization in Russian text.',
+        unavailable: 'This option is unavailable on the current setup.',
       },
       timestamps: {
         title: 'Use timestamps',
@@ -106,7 +106,7 @@ const en = {
     sourceCheck: {
       title: 'Source check',
       description: 'Validate the URL with yt-dlp before starting transcription.',
-      hint: 'No media is downloaded here. The backend only requests metadata and available formats.',
+      hint: 'No media is downloaded during this check. Only basic source information is checked.',
       actions: {
         showDetails: 'Show details',
         hideDetails: 'Hide details',
@@ -146,13 +146,17 @@ const en = {
   panels: {
     log: {
       title: 'Execution Log',
-      description: 'Live output from whisper-gpu.py',
+      description: 'Progress details for the current transcription',
       empty: 'Log output will appear here after you start a job.',
     },
     transcript: {
       title: 'Transcript',
       description: 'Final text and saved file preview',
       copy: 'Copy',
+      copied: 'Text copied.',
+      copyFailed: 'Could not copy text. Check clipboard access in your browser.',
+      deviceUsed: 'Processing device',
+      engineUsed: 'Recognition engine',
       download: 'Download',
       plainText: 'Plain text',
       plainTextEmpty: 'Completed transcription text will appear here.',
@@ -228,7 +232,7 @@ const ru: TranslationSchema = {
   summary: {
     eyebrow: 'Текущая конфигурация',
     title: 'Локальная расшифровка видео',
-    badge: 'Браузер + FastAPI + Whisper',
+    badge: 'Обработка на этом компьютере',
     fields: {
       source: 'источник',
       lang: 'язык',
@@ -263,7 +267,7 @@ const ru: TranslationSchema = {
   },
   controls: {
     title: 'Управление',
-    description: 'Выберите источник, настройте параметры Whisper и запустите локальный пайплайн.',
+    description: 'Выберите файл или ссылку, настройте распознавание и запустите расшифровку.',
     sourceLabel: 'Источник',
     sourceOptions: {
       url: {
@@ -301,8 +305,8 @@ const ru: TranslationSchema = {
       },
       restorePunctuation: {
         title: 'Восстанавливать пунктуацию',
-        description:
-          'После faster-whisper прогонять русский текст через kontur-ai/sbert_punc_case_ru и финально шлифовать через razdel.',
+        description: 'Улучшить пунктуацию и заглавные буквы в русском тексте.',
+        unavailable: 'Эта настройка недоступна в текущей конфигурации.',
       },
       timestamps: {
         title: 'Использовать таймкоды',
@@ -319,7 +323,7 @@ const ru: TranslationSchema = {
     sourceCheck: {
       title: 'Проверка источника',
       description: 'Проверьте URL через yt-dlp до запуска расшифровки.',
-      hint: 'Медиа здесь не скачивается. Backend запрашивает только метаданные и наличие форматов.',
+      hint: 'Во время проверки медиа не скачивается: проверяется только основная информация об источнике.',
       actions: {
         showDetails: 'Показать детали',
         hideDetails: 'Скрыть детали',
@@ -359,13 +363,17 @@ const ru: TranslationSchema = {
   panels: {
     log: {
       title: 'Журнал выполнения',
-      description: 'Живой вывод из whisper-gpu.py',
+      description: 'Ход выполнения текущей расшифровки',
       empty: 'Логи появятся здесь после запуска задачи.',
     },
     transcript: {
       title: 'Расшифровка',
       description: 'Итоговый текст и превью сохраненного файла',
       copy: 'Копировать',
+      copied: 'Текст скопирован.',
+      copyFailed: 'Не удалось скопировать текст. Проверьте доступ браузера к буферу обмена.',
+      deviceUsed: 'Устройство обработки',
+      engineUsed: 'Система распознавания',
       download: 'Скачать',
       plainText: 'Текст',
       plainTextEmpty: 'Готовый текст расшифровки появится здесь.',

@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -9,11 +10,14 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
+from services.model_paths import MODEL_STORAGE_ROOT
 import psutil
 from fastapi import APIRouter, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from services.model_management import (
@@ -32,6 +36,7 @@ from services.model_registry import (
     list_enabled_backend_values,
     list_model_catalog,
 )
+from services.runtime_devices import VULKAN_MODELS, get_device_details
 from source_check import check_source
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -131,10 +136,13 @@ class JobState:
     error: str | None = None
     saved_audio: str | None = None
     results: list[dict[str, Any]] = field(default_factory=list)
+    effective_device: str | None = None
+    effective_backend: str | None = None
 
 
 jobs: dict[str, JobState] = {}
 jobs_lock = threading.Lock()
+transcription_semaphore = threading.Semaphore(1)
 model_download_jobs: dict[str, ModelOperationJobState] = {}
 model_delete_jobs: dict[str, ModelOperationJobState] = {}
 model_operation_jobs_lock = threading.Lock()
@@ -466,6 +474,8 @@ def apply_result(job_id: str, result: dict[str, Any]) -> None:
         rendered_result=rendered_result,
         detected_language=result.get("detected_language"),
         saved_audio=result.get("saved_audio"),
+        effective_device=result.get("effective_device"),
+        effective_backend=result.get("effective_backend"),
     )
 
 
@@ -490,6 +500,8 @@ def apply_complete(job_id: str, results: list[dict[str, Any]]) -> None:
         output_format=results[-1].get("output_format"),
         detected_language=results[-1].get("detected_language"),
         saved_audio=saved_audio,
+        effective_device=results[-1].get("effective_device"),
+        effective_backend=results[-1].get("effective_backend"),
     )
 
 
@@ -529,20 +541,22 @@ def build_command(job: JobState, source_path: str) -> list[str]:
 
 
 def run_job(job_id: str, source_path: str) -> None:
-    job_dir = RUNS_DIR / job_id
-    output_dir = job_dir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    job = get_job(job_id)
-    command = build_command(job, source_path)
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    env.setdefault("PYTHONUTF8", "1")
-
-    update_job(job_id, status="running", stage="source")
-    append_log(job_id, f"$ {' '.join(command)}")
-
+    acquired = False
     try:
+        job = get_job(job_id)
+        append_log(job_id, "Waiting for the transcription runtime to become available…")
+        transcription_semaphore.acquire()
+        acquired = True
+        job_dir = RUNS_DIR / job_id
+        output_dir = job_dir / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        command = build_command(job, source_path)
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env.setdefault("PYTHONUTF8", "1")
+        update_job(job_id, status="running", stage="source")
+        append_log(job_id, f"$ {' '.join(command)}")
+
         process = subprocess.Popen(
             command,
             cwd=APP_ROOT,
@@ -595,22 +609,34 @@ def run_job(job_id: str, source_path: str) -> None:
         update_job(job_id, status="completed", stage="result")
 
     except Exception as exc:
-        append_log(job_id, f"[error] {exc}")
-        current_error = get_job(job_id).error
-        update_job(job_id, status="failed", stage="result", error=current_error or str(exc))
+        try:
+            append_log(job_id, f"[error] {exc}")
+            current_error = get_job(job_id).error
+            update_job(job_id, status="failed", stage="result", error=current_error or str(exc))
+        except (KeyError, HTTPException):
+            pass
+    finally:
+        if acquired:
+            transcription_semaphore.release()
 
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "appId": "video-transcribe"}
 
 
 @app.get("/api/options")
 def get_options():
     max_cpu_threads = logical_cpu_count()
+    punctuation_available = bool(importlib.util.find_spec("sbert_punc_case_ru") and importlib.util.find_spec("razdel"))
     return {
         "models": list_enabled_backend_values(),
-        "devices": ["cpu", "cuda"],
+        "devices": ["auto", "cpu", "vulkan", "cuda"],
+        "defaultDevice": "auto",
+        "deviceDetails": get_device_details(),
+        "vulkanModels": VULKAN_MODELS,
+        "punctuationAvailable": punctuation_available,
+        "modelsDirectory": str(MODEL_STORAGE_ROOT),
         "outputFormats": ["txt", "srt", "json"],
         "languages": ["auto", "ru", "en", "de", "fr", "es", "it", "pt", "uk", "ja", "ko", "zh"],
         "maxCpuThreads": max_cpu_threads,
@@ -698,6 +724,21 @@ def start_model_delete(payload: ModelDeleteRequest):
     if not entry.enabled:
         raise HTTPException(status_code=400, detail=f"Model '{payload.modelId}' is disabled.")
 
+    with jobs_lock:
+        active_same_model = False
+        for job in jobs.values():
+            if job.status not in {"queued", "running"}:
+                continue
+            try:
+                active_entry = get_model_registry_entry(job.settings.get("model", ""))
+            except ModelRegistryLookupError:
+                continue
+            if active_entry.hfRepoId == entry.hfRepoId:
+                active_same_model = True
+                break
+    if active_same_model:
+        raise HTTPException(status_code=409, detail=f"Model '{payload.modelId}' is in use by an active transcription.")
+
     try:
         current_status = get_model_status(payload.modelId)
     except ModelCacheInspectionError as exc:
@@ -759,18 +800,48 @@ async def create_transcription(
     file: UploadFile | None = File(None),
     language: str = Form("ru"),
     model: str = Form("small"),
-    device: str = Form("cpu"),
+    device: str = Form("auto"),
     nproc: str | None = Form(None),
     outputFormat: str = Form("srt"),
     saveAudio: str = Form("false"),
     useTimestamps: str = Form("true"),
     restorePunctuation: str = Form("false"),
 ):
+    normalized_device = device.strip().lower()
+    if normalized_device not in {"auto", "cpu", "vulkan", "cuda"}:
+        raise HTTPException(status_code=400, detail="device must be one of: auto, cpu, vulkan, cuda")
+    normalized_model = model.strip()
+    try:
+        model_entry = get_model_registry_entry(normalized_model)
+    except ModelRegistryLookupError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    normalized_language = language.strip().lower()
+    valid_languages = {"auto", "ru", "en", "de", "fr", "es", "it", "pt", "uk", "ja", "ko", "zh"}
+    if normalized_language not in valid_languages:
+        raise HTTPException(status_code=400, detail=f"Unsupported language '{normalized_language}'.")
+    if model_entry.languageScope == "english" and normalized_language not in {"auto", "en"}:
+        raise HTTPException(status_code=400, detail=f"Model '{normalized_model}' supports English only; choose English or another model.")
+    normalized_format = outputFormat.strip().lower()
+    if normalized_format not in {"txt", "srt", "json"}:
+        raise HTTPException(status_code=400, detail="outputFormat must be txt, srt, or json")
+    if normalized_device == "vulkan" and normalized_model not in VULKAN_MODELS:
+        raise HTTPException(status_code=400, detail=(
+            f"Model '{normalized_model}' is not supported by Vulkan. Available Vulkan models: {', '.join(VULKAN_MODELS)}"
+        ))
+    if normalized_language == "ru" and parse_bool(restorePunctuation, default=False) and not (
+        importlib.util.find_spec("sbert_punc_case_ru") and importlib.util.find_spec("razdel")
+    ):
+        raise HTTPException(status_code=400, detail="Russian punctuation restoration is unavailable. Install the optional punctuation package.")
+
     if sourceType not in {"url", "file"}:
         raise HTTPException(status_code=400, detail="sourceType must be 'url' or 'file'")
 
     if sourceType == "url" and not (url or "").strip():
         raise HTTPException(status_code=400, detail="URL is required")
+    if sourceType == "url":
+        parsed_url = urlsplit((url or "").strip())
+        if parsed_url.scheme.lower() not in {"http", "https"} or not parsed_url.hostname:
+            raise HTTPException(status_code=400, detail="URL must be an absolute http or https URL")
 
     if sourceType == "file" and file is None:
         raise HTTPException(status_code=400, detail="File is required")
@@ -795,16 +866,14 @@ async def create_transcription(
         source_path = source_name
 
     max_cpu_threads = logical_cpu_count()
-    normalized_language = language.strip() or "ru"
-
     settings = {
         "sourceType": sourceType,
         "url": (url or "").strip(),
         "language": normalized_language,
-        "model": model.strip() or "small",
-        "device": device.strip() or "cpu",
+        "model": normalized_model,
+        "device": normalized_device,
         "nproc": parse_int(nproc, default=max_cpu_threads, minimum=1, maximum=max_cpu_threads),
-        "outputFormat": outputFormat.strip() or "srt",
+        "outputFormat": normalized_format,
         "saveAudio": parse_bool(saveAudio, default=False),
         "useTimestamps": parse_bool(useTimestamps, default=True),
         "restorePunctuation": parse_bool(restorePunctuation, default=False) and (normalized_language == "ru"),
@@ -839,3 +908,36 @@ def download_result(job_id: str):
 
 
 app.include_router(model_management_router)
+
+
+UI_DIST = APP_ROOT / "ui" / "dist"
+if UI_DIST.is_dir() and (UI_DIST / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=UI_DIST / "assets"), name="ui-assets")
+
+
+@app.get("/")
+@app.get("/models")
+def serve_ui():
+    index = UI_DIST / "index.html"
+    if not index.is_file():
+        raise HTTPException(status_code=404, detail="UI build is unavailable")
+    return FileResponse(index)
+
+
+@app.get("/{asset_path:path}")
+def serve_ui_asset(asset_path: str):
+    # Keep unknown API endpoints as JSON 404s rather than falling through to SPA HTML.
+    if asset_path == "api" or asset_path.startswith("api/"):
+        raise HTTPException(status_code=404, detail="Not found")
+    candidate = (UI_DIST / asset_path).resolve()
+    try:
+        candidate.relative_to(UI_DIST.resolve())
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Not found")
+    if candidate.is_file():
+        return FileResponse(candidate)
+    # Browser-side routes use the built SPA entry point.
+    index = UI_DIST / "index.html"
+    if index.is_file():
+        return FileResponse(index)
+    raise HTTPException(status_code=404, detail="UI build is unavailable")

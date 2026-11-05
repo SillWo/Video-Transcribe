@@ -99,15 +99,14 @@ class AudioProcess:
 			stream = ffmpeg.output(stream, output_filename, **self.output_options)
 			#stream = ffmpeg.run(stream)#, **self.global_options)
 		except Exception as e:
-			# Handle the exception here
-			print("An error occurred:", e)
-			exit()
+			raise RuntimeError(f"Unable to prepare FFmpeg audio extraction: {e}") from e
 
 
 		print(f"** ffmpeg compiled as {stream.compile()} **")
 		# Start the subprocess
 		try:
-			if self.findarg(self.opts, 'overwrite'):
+			should_overwrite = overwrite if overwrite is not None else self.findarg(self.opts, 'overwrite')
+			if should_overwrite:
 				out, err = ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
 			else:
 				out, err = ffmpeg.run(stream, capture_stdout=True, capture_stderr=True)
@@ -117,7 +116,11 @@ class AudioProcess:
 			return 0, ""
 
 		except ffmpeg.Error as e:
-			print("Error", e.stderr.decode())
+			detail = e.stderr or e.stdout or str(e)
+			if isinstance(detail, bytes):
+				detail = detail.decode("utf-8", errors="replace")
+			detail = str(detail).strip()
+			raise RuntimeError(f"FFmpeg audio extraction failed: {detail[-1200:] or e}") from e
 
 	def extract_audio_list(self, list = None):
 		if list is not None:

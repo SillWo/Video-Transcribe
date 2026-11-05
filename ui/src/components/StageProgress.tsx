@@ -7,11 +7,19 @@ type StageId = 'source' | 'audio' | 'recognition' | 'result'
 
 type StageProgressProps = {
   currentStage: StageId
-  status: 'queued' | 'running' | 'completed' | 'failed'
+  status: 'idle' | 'queued' | 'running' | 'completed' | 'failed'
 }
 
 export function StageProgress({ currentStage, status }: StageProgressProps) {
   const { t } = useI18n()
+  if (status === 'idle') {
+    return (
+      <div className="flex items-center gap-3 rounded-2xl border border-stone-200 bg-white/75 px-4 py-3 text-sm text-stone-600">
+        <CircleDashed className="h-4 w-4 shrink-0 text-stone-400" />
+        <span>{t('status.idle')}</span>
+      </div>
+    )
+  }
   const stages: Array<{ id: StageId; label: string; description: string }> = [
     {
       id: 'source',
@@ -39,7 +47,7 @@ export function StageProgress({ currentStage, status }: StageProgressProps) {
   return (
     <div className="grid gap-3 rounded-[28px] border border-stone-200 bg-white/85 p-4 shadow-[0_12px_40px_-24px_rgba(41,37,36,0.35)] backdrop-blur md:grid-cols-4">
       {stages.map((stage, index) => {
-        const isDone = status === 'completed' || index < currentIndex
+        const isDone = status === 'completed' || (status !== 'failed' && index < currentIndex)
         const isActive = status === 'running' && index === currentIndex
         const isFailed = status === 'failed' && index === currentIndex
 
@@ -47,7 +55,7 @@ export function StageProgress({ currentStage, status }: StageProgressProps) {
           <div
             key={stage.id}
             className={cn(
-              'rounded-3xl border p-4 transition',
+              'min-w-0 rounded-2xl border p-3 transition-[background-color,border-color,color] duration-150',
               isDone && 'border-emerald-200 bg-emerald-50',
               isActive && 'border-orange-200 bg-orange-50',
               isFailed && 'border-rose-200 bg-rose-50',

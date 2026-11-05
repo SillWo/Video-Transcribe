@@ -1,7 +1,6 @@
 import {
   AlertTriangle,
   Download,
-  FolderOpen,
   HardDriveDownload,
   LoaderCircle,
   Trash2,
@@ -22,42 +21,44 @@ import { cn } from '../lib/utils'
 const COPY = {
   en: {
     refreshing: 'Refreshing',
-    ready: 'Dashboard ready',
+    ready: 'Models are up to date',
+    errorStatus: 'Could not load models',
     operationBusy: 'Operation in progress',
     summaryDownloaded: 'Downloaded',
     summaryAvailable: 'Available',
     summaryTotalSize: 'Total size',
     loadingTitle: 'Loading model catalog',
-    loadingDescription: 'Requesting /api/models/panel and preparing the Whisper model inventory.',
+    loadingDescription: 'Loading the locally managed CPU and CUDA models.',
     errorTitle: 'Model panel unavailable',
-    emptyTitle: 'No models in catalog',
-    emptyDescription: 'The backend returned an empty catalog. The dashboard is waiting for registry data.',
-    hfCacheState: 'HF cache state',
-    emptyErrorState: 'Empty / Error State',
-    backendValue: 'backendValue',
+    emptyTitle: 'No models available',
+    emptyDescription: 'No locally managed models are available yet.',
+    retry: 'Try again',
+    vulkanNote: 'Vulkan models download automatically the first time you transcribe with a GPU through Vulkan.',
+    backendValue: 'Model name',
     family: 'Family',
     languageScope: 'Language scope',
     size: 'Size',
     lastModified: 'Last modified',
-    hfRepo: 'HF repo',
-    localPath: 'Local path',
+    hfRepo: 'Model source',
+    localPath: 'Saved location',
     progress: 'Operation progress',
     percent: 'Percent',
+    modelFolder: 'Project model folder',
     download: 'Download',
     downloadRunning: 'Downloading',
     delete: 'Delete',
     deleteRunning: 'Deleting',
-    deleteConfirm: (name: string) => `Delete the local model "${name}" from the Hugging Face cache?`,
+    deleteConfirm: (name: string) => `Remove the local model "${name}" from this project?`,
     anotherOperation: 'Another model operation is already running.',
     deleteDisabled: 'Delete is only available for downloaded models.',
     statusLabel: {
       downloaded: 'downloaded',
-      not_downloaded: 'not_downloaded',
+      not_downloaded: 'not downloaded',
       unknown: 'unknown',
       downloading: 'downloading',
-      download_error: 'download_error',
+      download_error: 'download failed',
       deleting: 'deleting',
-      delete_error: 'delete_error',
+      delete_error: 'delete failed',
     },
     familyLabel: {
       standard: 'standard',
@@ -70,32 +71,34 @@ const COPY = {
   },
   ru: {
     refreshing: 'Обновление',
-    ready: 'Dashboard готов',
+    ready: 'Список моделей обновлён',
+    errorStatus: 'Не удалось загрузить модели',
     operationBusy: 'Идёт операция',
     summaryDownloaded: 'Загружено',
     summaryAvailable: 'Доступно',
     summaryTotalSize: 'Общий размер',
     loadingTitle: 'Загрузка каталога моделей',
-    loadingDescription: 'Запрашиваем /api/models/panel и собираем локальный каталог Whisper-моделей.',
-    errorTitle: 'Панель моделей недоступна',
-    emptyTitle: 'Каталог моделей пуст',
-    emptyDescription: 'Backend вернул пустой каталог. Dashboard ждёт данные реестра моделей.',
-    hfCacheState: 'Состояние HF cache',
-    emptyErrorState: 'Пустое / ошибочное состояние',
-    backendValue: 'backendValue',
+    loadingDescription: 'Загружаем модели Whisper для CPU и CUDA.',
+    errorTitle: 'Не удалось загрузить список моделей',
+    emptyTitle: 'Пока нет доступных моделей',
+    emptyDescription: 'Список локально управляемых моделей пока пуст.',
+    retry: 'Повторить',
+    vulkanNote: 'Модели Vulkan автоматически загружаются при первой расшифровке через Vulkan на видеокарте.',
+    backendValue: 'Название модели',
     family: 'Семейство',
     languageScope: 'Языковой охват',
     size: 'Размер',
     lastModified: 'Изменено',
-    hfRepo: 'HF repo',
-    localPath: 'Локальный путь',
+    hfRepo: 'Источник модели',
+    localPath: 'Место хранения',
     progress: 'Прогресс операции',
     percent: 'Процент',
+    modelFolder: 'Папка моделей проекта',
     download: 'Скачать',
     downloadRunning: 'Загрузка',
     delete: 'Удалить',
     deleteRunning: 'Удаление',
-    deleteConfirm: (name: string) => `Удалить локальную модель "${name}" из Hugging Face cache?`,
+    deleteConfirm: (name: string) => `Удалить модель "${name}" из папки проекта?`,
     anotherOperation: 'Сейчас уже выполняется другая операция с моделями.',
     deleteDisabled: 'Удаление доступно только для скачанных моделей.',
     statusLabel: {
@@ -108,12 +111,12 @@ const COPY = {
       delete_error: 'delete_error',
     },
     familyLabel: {
-      standard: 'standard',
-      distil: 'distil',
+      standard: 'Обычная',
+      distil: 'Дистиллированная',
     },
     languageLabel: {
-      multilingual: 'multilingual',
-      english: 'english',
+      multilingual: 'Многоязычная',
+      english: 'Английский',
     },
   },
 } as const
@@ -124,7 +127,7 @@ function SummaryCard(props: { label: string; value: string | number }) {
       <div className="text-xs font-semibold uppercase tracking-[0.18em] text-stone-500">
         {props.label}
       </div>
-      <div className="mt-2 text-2xl font-semibold text-stone-900">{props.value}</div>
+      <div className="mt-2 text-2xl font-semibold tabular-nums text-stone-900">{props.value}</div>
     </div>
   )
 }
@@ -171,6 +174,8 @@ export function ModelManagementDashboard() {
     modelNotices,
     globalNotice,
     startOperation,
+    loadPanel,
+    modelsDirectory,
   } = useModelManagement()
 
   const shouldShowModelList = catalog.length > 0
@@ -186,7 +191,7 @@ export function ModelManagementDashboard() {
     if (error) {
       return {
         title: copy.errorTitle,
-        description: error,
+        description: copy.errorStatus,
       }
     }
 
@@ -213,17 +218,21 @@ export function ModelManagementDashboard() {
       <div className="grid gap-6">
         <header className="grid gap-4 border-b border-stone-200 pb-5">
           <div className="flex flex-wrap items-start justify-between gap-3">
-            <div className="max-w-3xl">
+          <div className="min-w-0 max-w-3xl">
               <div className="text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">
-                API: /api/models/panel
+              {locale === 'ru' ? 'Библиотека моделей' : 'Model library'}
               </div>
-              <h2 className="mt-2 text-2xl font-semibold text-stone-900">ModelManagementDashboard</h2>
+            <h2 className="mt-2 break-words text-2xl font-semibold text-stone-900">
+              {locale === 'ru' ? 'Управление моделями' : 'Manage models'}
+            </h2>
               <p className="mt-2 text-sm text-stone-500">
-                Detailed inventory and local cache actions are rendered from the existing backend panel and operation endpoints.
+              {locale === 'ru'
+                ? 'Скачивайте и удаляйте модели, используемые на CPU и CUDA.'
+                : 'Download or remove models used with CPU and CUDA.'}
               </p>
             </div>
-            <div className="rounded-full border border-stone-200 bg-stone-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-stone-600">
-              {isLoading ? copy.refreshing : activeOperation ? copy.operationBusy : copy.ready}
+                    <div className="max-w-full break-words rounded-full border border-stone-200 bg-stone-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.12em] text-stone-600">
+              {isLoading ? copy.refreshing : error ? copy.errorStatus : activeOperation ? copy.operationBusy : copy.ready}
             </div>
           </div>
 
@@ -233,10 +242,28 @@ export function ModelManagementDashboard() {
             <SummaryCard label={copy.summaryTotalSize} value={formatModelBytes(summary.totalDownloadedSizeBytes)} />
           </div>
 
+          <p className="rounded-2xl border border-orange-200 bg-orange-50 px-4 py-3 text-sm text-orange-900">
+            {copy.vulkanNote}
+          </p>
+          {modelsDirectory ? (
+            <p className="break-all rounded-2xl border border-stone-200 bg-stone-50 px-4 py-3 text-sm text-stone-600">
+              {copy.modelFolder}: <span className="font-medium text-stone-800">{modelsDirectory}</span>
+            </p>
+          ) : null}
+
           {globalNotice ? (
-            <div className={cn('rounded-2xl border px-4 py-3 text-sm font-medium', getNoticeTone(globalNotice.kind))}>
+            <div role="status" aria-live={globalNotice.kind === 'error' ? 'assertive' : 'polite'} className={cn('rounded-2xl border px-4 py-3 text-sm font-medium', getNoticeTone(globalNotice.kind))}>
               {globalNotice.text}
             </div>
+          ) : null}
+          {error && shouldShowModelList ? (
+            <button
+              type="button"
+              onClick={() => { void loadPanel() }}
+              className="min-h-11 justify-self-start rounded-xl bg-stone-900 px-4 py-2 text-sm font-semibold text-white hover:bg-stone-800"
+            >
+              {copy.retry}
+            </button>
           ) : null}
         </header>
 
@@ -266,7 +293,7 @@ export function ModelManagementDashboard() {
                       </div>
                       <h3 className="mt-1 text-lg font-semibold text-stone-900">{item.displayName}</h3>
                       <p className="mt-1 text-sm text-stone-500">
-                        {copy.backendValue}:{' '}
+                  {copy.backendValue}:{' '}
                         <span className="font-medium text-stone-700">{item.backendValue}</span>
                       </p>
                     </div>
@@ -392,16 +419,15 @@ export function ModelManagementDashboard() {
               <div>
                 <div className="text-base font-semibold text-stone-900">{stateMessage.title}</div>
                 <p className="mt-2 text-sm text-stone-600">{stateMessage.description}</p>
-                <div className="mt-4 flex flex-wrap gap-3 text-xs font-medium text-stone-500">
-                  <span className="inline-flex items-center gap-2 rounded-full border border-stone-200 bg-white px-3 py-1">
-                    <FolderOpen className="h-4 w-4" />
-                    {copy.hfCacheState}
-                  </span>
-                  <span className="inline-flex items-center gap-2 rounded-full border border-stone-200 bg-white px-3 py-1">
-                    <AlertTriangle className="h-4 w-4" />
-                    {copy.emptyErrorState}
-                  </span>
-                </div>
+                {error ? (
+                  <button
+                    type="button"
+                    onClick={() => { void loadPanel() }}
+                    className="mt-4 inline-flex min-h-11 items-center rounded-xl bg-stone-900 px-4 py-2 text-sm font-semibold text-white hover:bg-stone-800"
+                  >
+                    {copy.retry}
+                  </button>
+                ) : null}
               </div>
             </div>
           </div>

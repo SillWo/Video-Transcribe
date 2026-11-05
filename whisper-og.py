@@ -1,6 +1,11 @@
 # open-AIs version of the implmentation
 import os
 from os.path import isfile, join
+
+# Configure the project-local model/cache directories before importing Whisper
+# or any dependency that may import PyTorch or Hugging Face libraries.
+from services.model_paths import MODEL_STORAGE_ROOT
+
 import argparse
 import psutil
 import ffmpeg
@@ -93,7 +98,11 @@ def initialize(args):
 
 
 	# initialize the model with given args
-	model = whisper.load_model(args.model_size, device='cpu')
+	model = whisper.load_model(
+		args.model_size,
+		device='cpu',
+		download_root=str(MODEL_STORAGE_ROOT / "openai-whisper"),
+	)
 
 	return model;
 

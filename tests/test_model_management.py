@@ -101,11 +101,11 @@ class ModelManagementTests(unittest.TestCase):
             catalog = list_models_with_status()
             panel = get_model_panel_payload()
 
-        self.assertEqual(len(catalog), 15)
+        self.assertEqual(len(catalog), 16)
         self.assertTrue(all(item["status"] == "not_downloaded" for item in catalog))
         self.assertTrue(all(item["isDownloaded"] is False for item in catalog))
         self.assertEqual(panel["summary"]["downloadedCount"], 0)
-        self.assertEqual(panel["summary"]["availableCount"], 15)
+        self.assertEqual(panel["summary"]["availableCount"], 16)
         self.assertEqual(panel["summary"]["totalDownloadedSizeBytes"], 0)
 
     def test_downloaded_model_is_exposed_in_status_and_summary(self):
@@ -128,7 +128,7 @@ class ModelManagementTests(unittest.TestCase):
         self.assertEqual(tiny["cacheLocation"], str(snapshot_path))
         self.assertIsNotNone(tiny["lastModified"])
         self.assertEqual(panel["summary"]["downloadedCount"], 1)
-        self.assertEqual(panel["summary"]["availableCount"], 15)
+        self.assertEqual(panel["summary"]["availableCount"], 16)
         self.assertGreater(panel["summary"]["totalDownloadedSizeBytes"], 0)
 
     def test_incomplete_cached_repo_is_marked_unknown_without_breaking_other_models(self):
@@ -150,7 +150,7 @@ class ModelManagementTests(unittest.TestCase):
         self.assertFalse(large_v3["isDownloaded"])
         self.assertEqual(large_v3["cacheLocation"], str(snapshot_path))
         self.assertEqual(panel["summary"]["downloadedCount"], 0)
-        self.assertEqual(panel["summary"]["availableCount"], 15)
+        self.assertEqual(panel["summary"]["availableCount"], 16)
         self.assertEqual(panel["summary"]["totalDownloadedSizeBytes"], 0)
         self.assertEqual(next(item for item in catalog if item["id"] == "tiny")["status"], "not_downloaded")
 
