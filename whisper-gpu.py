@@ -75,6 +75,35 @@ def emit_event(args, event_type: str, **payload) -> None:
     print(f"{JSON_EVENT_PREFIX}{json.dumps(event, ensure_ascii=False)}", flush=True)
 
 
+def progress_callback(args, stage: str, message: str):
+    """Build a throttled structured progress callback for the simple UI path."""
+    last_time = 0.0
+    last_percent = None
+
+    def report(values):
+        nonlocal last_time, last_percent
+        values = values or {}
+        percent = values.get("percent")
+        now = timeit.default_timer()
+        if percent is not None:
+            try:
+                percent = max(0.0, min(100.0, float(percent)))
+            except (TypeError, ValueError):
+                percent = None
+        changed_enough = percent is not None and (last_percent is None or abs(percent - last_percent) >= 1.0)
+        if last_time and now - last_time < 1.0 and not changed_enough:
+            return
+        last_time = now
+        if percent is not None:
+            last_percent = percent
+        emit_event(args, "progress", stage=stage, percent=percent,
+                   completedBytes=values.get("completedBytes"), totalBytes=values.get("totalBytes"),
+                   processedSeconds=values.get("processedSeconds"), totalSeconds=values.get("totalSeconds"),
+                   message=values.get("message", message))
+
+    return report
+
+
 def configure_web_stdio(args) -> None:
     if not getattr(args, "web_json", False):
         return
@@ -179,23 +208,84 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
 
     start_time = timeit.default_timer()
     language = None if args.language == "auto" else args.language
+    total_seconds = None
+    native_progress = None
+    uses_native_whisper_cpp = isinstance(model, WhisperCppModel) or (
+        isinstance(model, AutoFallbackModel) and isinstance(model.model, WhisperCppModel)
+    )
+    if getattr(args, "single_source", False):
+        if isinstance(model, WhisperCppModel):
+            native_progress = progress_callback(args, "recognition", "Распознавание речи.")
+            model.transcription_progress = native_progress
+        elif isinstance(model, AutoFallbackModel) and isinstance(model.model, WhisperCppModel):
+            native_progress = progress_callback(args, "recognition", "Распознавание речи.")
+            model.model.transcription_progress = native_progress
+        elif not isinstance(model, AutoFallbackModel):
+            native_progress = progress_callback(args, "recognition", "Распознавание речи.")
+
+    def report_segment_progress(segment, completed, total_hint=None):
+        nonlocal total_seconds
+        if native_progress is None:
+            return
+        total = total_hint if total_hint is not None else getattr(stats, "duration", None)
+        try:
+            total = float(total)
+            if total <= 0:
+                total = None
+        except (TypeError, ValueError):
+            total = None
+        total_seconds = total
+        processed = max(0.0, float(getattr(segment, "end", 0.0)))
+        percent = min(99.0, processed * 100.0 / total) if total else None
+        native_progress({"percent": percent, "processedSeconds": processed, "totalSeconds": total})
+
     segments_iter, stats = model.transcribe(full_filepath, beam_size=args.beam_size, language=language)
-    segments = serialize_segments(list(segments_iter))
-    effective_restore_punctuation = bool(args.restore_punctuation and args.language == "ru")
+    if native_progress is not None and not uses_native_whisper_cpp:
+        # Consume the real lazy generator so progress follows completed segments.
+        segment_list = []
+        for index, segment in enumerate(segments_iter, start=1):
+            segment_list.append(segment)
+            report_segment_progress(segment, index)
+        segments = serialize_segments(segment_list)
+    else:
+        segments = serialize_segments(list(segments_iter))
+    if native_progress is not None and not uses_native_whisper_cpp:
+        native_progress({"percent": 100.0 if total_seconds else None,
+                         "processedSeconds": total_seconds, "totalSeconds": total_seconds})
+    emit_event(args, "stage", stage="recognition", status="completed", message="Распознавание завершено.")
+    effective_language = stats.language if args.language == "auto" else args.language
+    effective_restore_punctuation = bool(args.restore_punctuation and effective_language.lower() == "ru")
 
     probability = stats.language_probability
     probability_text = f"{probability:f}" if probability is not None else "unavailable"
     print(f"\nDetected language '{stats.language}' with probability {probability_text}")
 
+    postprocess_notice = None
+    emit_event(args, "stage", stage="postprocess",
+               status="in_progress" if effective_restore_punctuation else "skipped",
+               message="Восстанавливаем пунктуацию в русском тексте." if effective_restore_punctuation else
+               ("Пунктуация пропущена: обнаружен не русский язык." if args.restore_punctuation else
+                "Восстановление пунктуации выключено."))
     if effective_restore_punctuation:
         print("Russian text post-processing enabled.")
         print("Applying punctuation restoration to Russian segments.")
-        for segment in segments:
+        postprocess_progress = progress_callback(args, "postprocess", "Восстанавливаем пунктуацию.") if getattr(args, "single_source", False) else None
+        total_segments = len(segments)
+        for index, segment in enumerate(segments, start=1):
             segment["text"] = restore_russian_segment_text(segment["text"])
+            if postprocess_progress:
+                postprocess_progress({"percent": min(99.0, index * 100.0 / max(1, total_segments)),
+                                      "message": f"Обработано фрагментов {index} из {total_segments}."})
         combined_text = build_polished_russian_text_from_segments([segment["text"] for segment in segments])
+        if postprocess_progress:
+            postprocess_progress({"percent": 100.0, "message": "Пунктуация восстановлена."})
         print("Russian text post-processing completed.")
+        emit_event(args, "stage", stage="postprocess", status="completed", message="Пунктуация восстановлена.")
     else:
         combined_text = "\n".join(segment["text"] for segment in segments).strip()
+        if args.restore_punctuation:
+            postprocess_notice = "Пунктуация не восстановлена: обнаружен не русский язык."
+            print(postprocess_notice)
 
     output_path, rendered_result = write_output(args, segments, combined_text, stats, filename)
     elapsed_seconds = timeit.default_timer() - start_time
@@ -217,6 +307,8 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
         "effective_device": getattr(model, "effective_device", getattr(args, "device", "cpu")),
         "effective_backend": getattr(model, "effective_backend", "faster-whisper"),
     }
+    if postprocess_notice:
+        result["notice"] = postprocess_notice
 
     emit_event(
         args,
@@ -232,6 +324,9 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
 def _faster_model(args, device: str):
     threads = max(1, min(int(args.nproc or logical_cpu_count()), logical_cpu_count()))
     precision = "int8" if device == "cpu" and args.precision == "auto" else args.precision
+    if device == "cuda":
+        from services.cuda_runtime import register_local_cuda_runtime
+        register_local_cuda_runtime()
     if device == "cpu":
         return whisper(args.model_size, cpu_threads=threads, num_workers=1, device="cpu", compute_type=precision,
                        download_root=str(HF_HUB_CACHE))
@@ -263,7 +358,7 @@ class AutoFallbackModel:
 def initialize(args):
     print("--------------------INITIALIZING-----------------------")
 
-    if isfile(audio_file):
+    if not getattr(args, "single_source", False) and isfile(audio_file):
         os.remove(audio_file)
 
     requested = args.device
@@ -289,6 +384,8 @@ def initialize(args):
         try:
             model = WhisperCppModel(args.model_size, threads=args.nproc or logical_cpu_count(),
                                     progress=lambda message: print(message, flush=True))
+            if getattr(args, "single_source", False):
+                model.transcription_progress = progress_callback(args, "recognition", "Распознавание речи.")
             model.effective_device = "vulkan"
             model.effective_backend = "whisper.cpp Vulkan"
             return AutoFallbackModel(model, args, "whisper.cpp Vulkan") if requested == "auto" else model
@@ -335,7 +432,8 @@ def add_media_files(args, media_files, debug=False, verbose=False):
 
             emit_event(args, "stage", stage="source", status="in_progress", message=f"Downloading source from {args.filename}")
 
-            download = Download(args, debug)
+            download_progress = progress_callback(args, "source", "Загружаем исходный файл.") if getattr(args, "single_source", False) else None
+            download = Download(args, debug, progress_callback=download_progress)
             audio_file_list, retcode = download.run()
 
             if retcode == 0:
@@ -414,6 +512,7 @@ def main():
     parser.add_argument("--output_format", help="Output format to create", choices=["txt", "srt", "json"], default="srt")
     parser.add_argument("--no_timestamps", help="Disable timestamps in txt/json output. Ignored for srt.", action="store_true")
     parser.add_argument("--restore_punctuation", help="Restore punctuation for explicitly selected Russian transcription.", action="store_true")
+    parser.add_argument("--single-source", help=argparse.SUPPRESS, action="store_true")
     parser.add_argument("--web_json", help=argparse.SUPPRESS, action="store_true")
 
     args = parser.parse_args()
@@ -447,7 +546,7 @@ def main():
 
     try:
         add_media_files(args, media_files, debug=not args.quiet, verbose=args.verbose)
-        model = initialize(args)
+        model = None if getattr(args, "single_source", False) else initialize(args)
         results = []
 
         for media_file in media_files:
@@ -481,10 +580,19 @@ def main():
             ):
                 print("Extracting audio")
                 emit_event(args, "stage", stage="audio", status="in_progress", message=f"Extracting audio from {Path(media_file).name}")
-                audio_processor.extract_audio(input_filepath=media_file, output_filepath=audio_file, overwrite=True)
+                audio_progress = progress_callback(args, "audio", "Подготавливаем аудио.") if getattr(args, "single_source", False) else None
+                audio_processor.extract_audio(input_filepath=media_file, output_filepath=audio_file, overwrite=True,
+                                              progress_callback=audio_progress)
                 transcription_input = audio_file
                 extracted_audio = True
                 emit_event(args, "stage", stage="audio", status="completed", message=f"Audio ready for {Path(media_file).name}")
+            elif getattr(args, "single_source", False):
+                emit_event(args, "stage", stage="audio", status="skipped", message="Подготовка аудио не требуется.")
+
+            if getattr(args, "single_source", False):
+                emit_event(args, "stage", stage="recognition", status="in_progress",
+                           message="Загружаем модель в память.")
+                model = initialize(args)
 
             result = transcribe(args, model, transcription_input, media_file)
 

@@ -8,6 +8,7 @@ from typing import Callable
 from tqdm.auto import tqdm as base_tqdm
 
 ProgressCallback = Callable[[int, str], None]
+ByteProgressCallback = Callable[[int, int | None], None]
 
 
 class _NullProgressFile:
@@ -40,6 +41,7 @@ def create_download_progress_tqdm(
     cached_bytes: int = 0,
     initial_percent: int = 10,
     callback: ProgressCallback | None = None,
+    byte_callback: ByteProgressCallback | None = None,
     label: str = "Downloading model files",
 ):
     """Create a tqdm class with real counters and no terminal output.
@@ -51,7 +53,7 @@ def create_download_progress_tqdm(
     """
     cached_bytes = max(0, int(cached_bytes))
     initial_percent = max(0, min(int(initial_percent), 99))
-    state = {"highest_n": 0, "last_percent": None, "last_bucket": None}
+    state = {"highest_n": 0, "last_percent": None, "last_bucket": None, "last_bytes": 0}
     state_lock = threading.RLock()
 
     class SilentDownloadProgressTqdm(base_tqdm):
@@ -81,13 +83,18 @@ def create_download_progress_tqdm(
                 self._emit_progress_locked()
 
         def _emit_progress_locked(self):
-            if not self._tracks_progress or callback is None:
+            if not self._tracks_progress or (callback is None and byte_callback is None):
                 return
 
             current_n = max(0, int(getattr(self, "n", 0) or 0))
             state["highest_n"] = max(state["highest_n"], current_n)
             completed = cached_bytes + state["highest_n"]
             denominator = int(total_bytes or getattr(self, "total", 0) or 0)
+            actual_completed = min(completed, denominator) if denominator > 0 else completed
+            if actual_completed > state["last_bytes"]:
+                state["last_bytes"] = actual_completed
+                if byte_callback is not None:
+                    byte_callback(actual_completed, denominator or None)
             if denominator > 0:
                 completed = min(completed, denominator)
                 percent = max(
@@ -103,7 +110,8 @@ def create_download_progress_tqdm(
                     return
                 state["last_percent"] = percent
                 message = f"{label} ({percent}%: {format_bytes(completed)} / {format_bytes(denominator)})"
-                callback(percent, message)
+                if callback is not None:
+                    callback(percent, message)
                 return
 
             # If the server did not disclose a content length, report in 8 MiB
@@ -113,7 +121,8 @@ def create_download_progress_tqdm(
                 return
             state["last_bucket"] = bucket
             message = f"{label}: {format_bytes(completed)} received"
-            callback(initial_percent, message)
+            if callback is not None:
+                callback(initial_percent, message)
 
         def update(self, n=1):
             with self.get_lock(), state_lock:

@@ -1,4 +1,8 @@
 import importlib.util
+import argparse
+import json
+import io
+import contextlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -197,9 +201,144 @@ class WhisperGpuTranscribeTests(unittest.TestCase):
         self.assertEqual(result["text"], "hello world")
         self.assertEqual(result["segments"], [{"text": "hello world"}])
 
-    def test_transcribe_ignores_restore_flag_for_auto_language(self):
-        segments = [SimpleNamespace(start=0.0, end=1.0, text="hello world")]
+    def test_transcribe_restores_russian_punctuation_for_auto_detected_russian(self):
+        segments = [SimpleNamespace(start=0.0, end=1.0, text="privet mir")]
         model, _stats = self.build_model(segments)
+        args = self.build_args(language="auto", restore_punctuation=True, output_format="txt", use_timestamps=False)
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+            patch.object(whisper_gpu.time, "strftime", return_value="20260417-120000"), \
+            patch.object(whisper_gpu, "restore_russian_segment_text", return_value="Привет, мир.") as restore_mock:
+            args.output_dir = temp_dir
+            result = whisper_gpu.transcribe(args, model, "input.wav", "media.wav")
+
+        restore_mock.assert_called_once_with("privet mir")
+        self.assertEqual(result["text"], "Привет, мир.")
+        self.assertEqual(result["rendered_result"], "Привет, мир.\n")
+
+    def test_single_source_emits_progress_from_real_segment_iteration_and_completes_before_postprocess(self):
+        segments = [SimpleNamespace(start=0.0, end=1.0, text="first"),
+                    SimpleNamespace(start=1.0, end=3.0, text="second")]
+        model, stats = self.build_model(segments)
+        stats.duration = 4.0
+        args = self.build_args(language="en", restore_punctuation=False)
+        args.single_source = True
+        args.web_json = True
+        events = []
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.object(whisper_gpu.time, "strftime", return_value="20260417-120000"), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            args.output_dir = temp_dir
+            result = whisper_gpu.transcribe(args, model, "input.wav", "media.wav")
+        for line in output.getvalue().splitlines():
+            if line.startswith(whisper_gpu.JSON_EVENT_PREFIX):
+                events.append(json.loads(line[len(whisper_gpu.JSON_EVENT_PREFIX):]))
+
+        recognition = [event for event in events if event.get("type") == "progress" and event.get("stage") == "recognition"]
+        self.assertEqual([event["percent"] for event in recognition], [25.0, 75.0, 100.0])
+        self.assertTrue(all(event["processedSeconds"] is not None and event["totalSeconds"] == 4.0 for event in recognition))
+        self.assertEqual(result["text"], "first\nsecond")
+        self.assertLess(next(i for i, event in enumerate(events) if event.get("stage") == "recognition" and event.get("status") == "completed"),
+                        next(i for i, event in enumerate(events) if event.get("stage") == "postprocess" and event.get("status") == "skipped"))
+
+    def test_single_source_recognition_uses_indeterminate_progress_without_duration(self):
+        segments = [SimpleNamespace(start=0.0, end=1.0, text="hello")]
+        model, _stats = self.build_model(segments)
+        args = self.build_args(language="en", restore_punctuation=False)
+        args.single_source = True
+        args.web_json = True
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.object(whisper_gpu.time, "strftime", return_value="20260417-120000"), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            args.output_dir = temp_dir
+            whisper_gpu.transcribe(args, model, "input.wav", "media.wav")
+        progress_events = [json.loads(line[len(whisper_gpu.JSON_EVENT_PREFIX):])
+                           for line in output.getvalue().splitlines()
+                           if line.startswith(whisper_gpu.JSON_EVENT_PREFIX)
+                           and '"type": "progress"' in line]
+        recognition = [event for event in progress_events if event["stage"] == "recognition"]
+        self.assertEqual([event["percent"] for event in recognition], [None])
+        self.assertIsNone(recognition[0]["totalSeconds"])
+
+    def test_single_source_prepares_audio_before_model_warmup_and_preserves_it_for_transcription(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source.mp4"
+            source.touch()
+            class MainArgs(argparse.Namespace):
+                def __contains__(self, key):
+                    return hasattr(self, key)
+
+            args = MainArgs(
+                filename=str(source), input_dir=None, output_name=None, output_dir=temp_dir,
+                language="ru", beam_size=5, precision="auto", device="cpu", model_size="tiny",
+                start=None, end=None, nproc=1, keep=False, verbose=False, quiet=True,
+                playlist_start=None, playlist_end=None, codec=None, bitrate=None,
+                output_format="json", no_timestamps=False, restore_punctuation=False,
+                single_source=True, web_json=True,
+            )
+            audio_path = Path(temp_dir) / "intermediate_audio_file.mp3"
+            timeline = []
+            original_emit_event = whisper_gpu.emit_event
+
+            def record_event(event_args, event_type, **payload):
+                if event_type == "stage":
+                    timeline.append(("stage", payload.get("stage"), payload.get("status"), payload.get("message")))
+                return original_emit_event(event_args, event_type, **payload)
+
+            def add_source(_args, media_files, **_kwargs):
+                media_files.append(str(source))
+                record_event(args, "stage", stage="source", status="completed", message="Source ready")
+
+            class FakeAudioProcess:
+                valid_time = staticmethod(lambda value: value)
+
+                def __init__(self, _args):
+                    pass
+
+                def audio_only(self, _path):
+                    return False
+
+                def extract_audio(self, *, output_filepath, progress_callback=None, **_kwargs):
+                    timeline.append(("audio_written",))
+                    Path(output_filepath).write_bytes(b"prepared")
+
+            def load_model(_args, _device):
+                self.assertTrue(audio_path.is_file(), "initialize must not remove the prepared simple-source audio")
+                timeline.append(("model_loaded",))
+                return SimpleNamespace()
+
+            def transcribe(_args, _model, full_filepath, _filename):
+                self.assertEqual(Path(full_filepath), audio_path)
+                self.assertTrue(audio_path.is_file(), "prepared audio must remain available until transcription starts")
+                timeline.append(("transcribe",))
+                return {"text": "done"}
+
+            with patch.object(whisper_gpu.argparse.ArgumentParser, "parse_args", return_value=args), \
+                    patch.object(whisper_gpu, "add_media_files", side_effect=add_source), \
+                    patch.object(whisper_gpu, "AudioProcess", FakeAudioProcess), \
+                    patch.object(whisper_gpu, "get_device_details", return_value=[{"id": "cpu", "available": True}]), \
+                    patch.object(whisper_gpu, "_faster_model", side_effect=load_model), \
+                    patch.object(whisper_gpu, "transcribe", side_effect=transcribe), \
+                    patch.object(whisper_gpu, "emit_event", side_effect=record_event), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(whisper_gpu.main(), 0)
+
+            audio_ready = next(index for index, item in enumerate(timeline)
+                               if item[:3] == ("stage", "audio", "completed"))
+            warmup_started = next(index for index, item in enumerate(timeline)
+                                   if item[:3] == ("stage", "recognition", "in_progress")
+                                   and "Загружаем модель" in item[3])
+            model_loaded = next(index for index, item in enumerate(timeline) if item[0] == "model_loaded")
+            transcribe_started = next(index for index, item in enumerate(timeline) if item[0] == "transcribe")
+            self.assertLess(audio_ready, warmup_started)
+            self.assertLess(warmup_started, model_loaded)
+            self.assertLess(model_loaded, transcribe_started)
+            self.assertFalse(audio_path.exists(), "audio is cleaned up after successful transcription")
+
+    def test_transcribe_skips_punctuation_for_auto_detected_english(self):
+        segments = [SimpleNamespace(start=0.0, end=1.0, text="hello world")]
+        model, stats = self.build_model(segments)
+        stats.language = "en"
         args = self.build_args(language="auto", restore_punctuation=True, output_format="txt", use_timestamps=False)
 
         with tempfile.TemporaryDirectory() as temp_dir, \
@@ -210,7 +349,7 @@ class WhisperGpuTranscribeTests(unittest.TestCase):
 
         restore_mock.assert_not_called()
         self.assertEqual(result["text"], "hello world")
-        self.assertEqual(result["rendered_result"], "hello world\n")
+        self.assertIn("не русский язык", result["notice"])
 
     def test_auto_gpu_fallback_catches_deferred_iteration_failure_without_partial_results(self):
         class FailingGpu:

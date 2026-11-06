@@ -5,6 +5,7 @@ from pathlib import Path, PurePath
 import time
 import re
 import pdb
+import subprocess
 
 class AudioProcess:
 
@@ -68,7 +69,7 @@ class AudioProcess:
 
 	# Input: Path(media_file)
 	# Return: return code
-	def extract_audio(self, input_filepath, output_filepath = None, overwrite = None):
+	def extract_audio(self, input_filepath, output_filepath = None, overwrite = None, progress_callback=None):
 
 		media_file = Path(input_filepath).resolve()
 
@@ -102,10 +103,63 @@ class AudioProcess:
 			raise RuntimeError(f"Unable to prepare FFmpeg audio extraction: {e}") from e
 
 
-		print(f"** ffmpeg compiled as {stream.compile()} **")
+		command = stream.compile()
+		if progress_callback is None:
+			print(f"** ffmpeg compiled as {command} **")
 		# Start the subprocess
 		try:
 			should_overwrite = overwrite if overwrite is not None else self.findarg(self.opts, 'overwrite')
+			if progress_callback is not None:
+				try:
+					probe = ffmpeg.probe(media_file)
+					total_seconds = float(probe.get('format', {}).get('duration'))
+					if total_seconds <= 0:
+						total_seconds = None
+				except Exception:
+					total_seconds = None
+				command = list(command)
+				if should_overwrite:
+					command.insert(1, '-y')
+				command[-1:-1] = ['-progress', 'pipe:1', '-nostats', '-loglevel', 'error']
+				process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+									   text=True, encoding='utf-8', errors='replace', bufsize=1)
+				diagnostics = []
+				last_seconds = 0.0
+				try:
+					assert process.stdout is not None
+					for line in process.stdout:
+						line = line.strip()
+						if line.startswith('out_time_us='):
+							try:
+								last_seconds = max(last_seconds, int(line.split('=', 1)[1]) / 1_000_000)
+							except ValueError:
+								pass
+						elif line.startswith('out_time='):
+							try:
+								last_seconds = max(last_seconds, self._parse_progress_time(line.split('=', 1)[1]))
+							except ValueError:
+								pass
+						elif line.startswith('progress='):
+							percent = min(99.0, last_seconds * 100.0 / total_seconds) if total_seconds else None
+							progress_callback({"processedSeconds": last_seconds, "totalSeconds": total_seconds,
+											   "percent": percent})
+						elif line and not line.startswith(('frame=', 'fps=', 'stream_', 'bitrate=', 'total_size=', 'dup_frames=', 'drop_frames=', 'speed=', 'progress=')):
+							diagnostics.append(line)
+							diagnostics = diagnostics[-20:]
+					return_code = process.wait()
+				except Exception:
+					process.kill()
+					process.wait()
+					raise
+				finally:
+					if process.stdout is not None:
+						process.stdout.close()
+				if return_code:
+					detail = '\n'.join(diagnostics).strip() or f'FFmpeg exited with code {return_code}'
+					raise RuntimeError(f"FFmpeg audio extraction failed: {detail[-1200:]}")
+				progress_callback({"processedSeconds": last_seconds, "totalSeconds": total_seconds,
+								   "percent": 100.0 if total_seconds else None})
+				return 0, ""
 			if should_overwrite:
 				out, err = ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
 			else:
@@ -121,6 +175,11 @@ class AudioProcess:
 				detail = detail.decode("utf-8", errors="replace")
 			detail = str(detail).strip()
 			raise RuntimeError(f"FFmpeg audio extraction failed: {detail[-1200:] or e}") from e
+
+	@staticmethod
+	def _parse_progress_time(value):
+		hours, minutes, seconds = value.split(':')
+		return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 	def extract_audio_list(self, list = None):
 		if list is not None:

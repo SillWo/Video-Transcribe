@@ -104,7 +104,7 @@ def enumerate_vulkan_gpus() -> list[dict[str, Any]]:
         get_properties.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         get_properties.restype = None
         found = []
-        for device in devices[:count.value]:
+        for physical_index, device in enumerate(devices[:count.value]):
             raw = ctypes.create_string_buffer(1024)
             get_properties(device, raw)
             props = ctypes.cast(raw, ctypes.POINTER(_VkPhysicalDevicePropertiesPrefix)).contents
@@ -112,7 +112,8 @@ def enumerate_vulkan_gpus() -> list[dict[str, Any]]:
             if props.deviceType == 4:
                 continue
             name = props.deviceName.split(b"\0", 1)[0].decode("utf-8", "replace") or "Vulkan GPU"
-            found.append({"name": name, "type": props.deviceType, "vendorId": props.vendorID})
+            found.append({"name": name, "type": props.deviceType, "vendorId": props.vendorID,
+                          "deviceIndex": physical_index})
         return found
     finally:
         destroy_instance.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
@@ -121,6 +122,8 @@ def enumerate_vulkan_gpus() -> list[dict[str, Any]]:
 
 def cuda_device_count() -> int:
     try:
+        from services.cuda_runtime import register_local_cuda_runtime
+        register_local_cuda_runtime()
         import ctranslate2
         return int(ctranslate2.get_cuda_device_count())
     except Exception:
@@ -131,16 +134,79 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
+def _windows_gpu_inventory() -> list[dict[str, Any]]:
+    if not _is_windows():
+        return []
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_VideoController | Select-Object Name,PNPDeviceID | ConvertTo-Json -Compress"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode:
+            return []
+        import json
+        rows = json.loads(result.stdout or "[]")
+        if isinstance(rows, dict):
+            rows = [rows]
+        found = []
+        for row in rows:
+            name = str(row.get("Name") or "").strip()
+            pnp = str(row.get("PNPDeviceID") or "").upper()
+            vendor_id = 0x10DE if "VEN_10DE" in pnp else 0x1002 if "VEN_1002" in pnp else 0x8086 if "VEN_8086" in pnp else None
+            if name and vendor_id:
+                found.append({"name": name, "vendorId": vendor_id})
+        return found
+    except Exception:
+        return []
+
+
+def get_simple_gpu_details() -> dict[str, Any]:
+    """Choose the supported GPU for the simple UI, separating hardware from runtime readiness."""
+    vulkan = enumerate_vulkan_gpus()
+    inventory = _windows_gpu_inventory()
+    candidates = vulkan + [item for item in inventory if not any(item["name"] == v["name"] for v in vulkan)]
+    nvidia = next((gpu for gpu in candidates if gpu["vendorId"] == 0x10DE), None)
+    amd = next((gpu for gpu in candidates if gpu["vendorId"] == 0x1002), None)
+    if nvidia:
+        count = cuda_device_count()
+        ready, reason = cuda_runtime_status(count)
+        if ready:
+            return {"available": True, "name": nvidia["name"], "reason": None, "backend": "cuda"}
+        return {"available": False, "name": nvidia["name"], "reason": reason or "NVIDIA CUDA runtime is unavailable.", "backend": "cuda"}
+    if amd:
+        vk = next((gpu for gpu in vulkan if gpu["vendorId"] == 0x1002), None)
+        if not vk:
+            return {"available": False, "name": amd["name"], "reason": "AMD GPU was detected, but no Vulkan runtime device is available.", "backend": "vulkan"}
+        exe = find_whisper_cpp_executable()
+        if not exe:
+            return {"available": False, "name": amd["name"], "reason": "AMD GPU was detected, but the Vulkan Whisper runtime is missing.", "backend": "vulkan", "deviceIndex": vk.get("deviceIndex")}
+        return {"available": True, "name": vk["name"], "reason": None, "backend": "vulkan", "deviceIndex": vk.get("deviceIndex")}
+    return {"available": False, "name": None, "reason": "No supported NVIDIA or AMD GPU was detected; transcription will use CPU.", "backend": None}
+
+
 def cuda_runtime_status(device_count: int) -> tuple[bool, str | None]:
     if device_count <= 0:
+        if _is_windows():
+            try:
+                from services.cuda_runtime import local_cuda_ready
+                if not local_cuda_ready():
+                    return False, "CTranslate2 reports no CUDA device and the project-local CUDA 12/cuDNN 9 runtime is missing. Run start.ps1; an NVIDIA driver is also required."
+            except Exception:
+                pass
+            return False, "No CUDA device is available through CTranslate2. Confirm the NVIDIA driver is installed and active."
         return False, "No CUDA device is available through CTranslate2."
     if not _is_windows():
         return True, None
     try:
+        from services.cuda_runtime import register_local_cuda_runtime
+        register_local_cuda_runtime()
         for library in CUDA_RUNTIME_DLLS:
             _CUDA_DLL_HANDLES.append(ctypes.WinDLL(library))
     except (AttributeError, OSError) as exc:
-        return False, f"CUDA libraries are missing ({exc}). Use Vulkan or install CUDA 12 and cuDNN 9."
+        return False, f"CUDA libraries are missing ({exc}). Run start.ps1 to prepare the project-local CUDA 12 and cuDNN 9 runtime, or use Vulkan."
     return True, None
 
 

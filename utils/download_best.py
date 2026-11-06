@@ -13,6 +13,30 @@ default_get_merge_format = "mkv"
 
 
 class Download:
+    def _validate_single_source(self) -> None:
+        """Probe URL metadata without credentials/cookies before downloading one item."""
+        try:
+            import yt_dlp
+        except ImportError as exc:
+            raise RuntimeError("Single-source validation needs yt-dlp metadata support. Install dependencies and retry.") from exc
+        options = {"quiet": True, "no_warnings": True, "skip_download": True, "extract_flat": True,
+                   "noplaylist": True}
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(self.single_source_url, download=False)
+        except Exception as exc:
+            raise RuntimeError(f"Could not validate this source before downloading: {exc}") from exc
+        if not isinstance(info, dict):
+            raise RuntimeError("The source did not provide usable video metadata. Check the URL and try again.")
+        entries = info.get("entries")
+        kind = info.get("_type")
+        if kind in {"playlist", "multi_video"} or (entries is not None and (not info.get("id") or len(list(entries)) != 1)):
+            raise RuntimeError("This link contains a playlist or multiple videos. Open one video and copy its direct link.")
+        was_live = bool(info.get("was_live"))
+        live_status = str(info.get("live_status") or "").lower()
+        if not was_live and (info.get("is_live") or info.get("is_upcoming") or live_status in {"is_live", "is_upcoming", "post_live"}):
+            raise RuntimeError("Live streams and upcoming broadcasts cannot be transcribed. Try again after the recording has finished.")
+
     def findarg(self, args, key: str) -> bool:
         return key in args and getattr(args, key)
 
@@ -61,6 +85,11 @@ class Download:
             args.merge = False
 
         self.opts = [args.url, "-f", args.format]
+        self.single_source_url = args.url
+
+        if getattr(args, "single_source", False):
+            self._validate_single_source()
+            self.opts += ["--no-playlist"]
 
         if self.findarg(args, "keep"):
             self.opts += ["-k"]
@@ -140,12 +169,37 @@ class Download:
         download_pattern = "[download] Destination: "
         post_audio_fix_pattern = "[ExtractAudio] Destination: "
         downloaded_pattern = " has already been downloaded"
+        progress_marker = "__VT_PROGRESS__"
 
         try:
             assert process.stdout is not None
             for stdout_line_str in process.stdout:
                 stdout_line_str = stdout_line_str.rstrip()
                 if not stdout_line_str:
+                    continue
+
+                if progress_marker in stdout_line_str:
+                    marker_data = stdout_line_str.split(progress_marker, 1)[1].strip()
+                    fields = marker_data.split("\t", 1)
+                    try:
+                        downloaded_bytes = max(0, int(fields[0]))
+                    except (ValueError, IndexError):
+                        downloaded_bytes = None
+                    try:
+                        total_bytes = max(0, int(fields[1]))
+                    except (ValueError, IndexError):
+                        total_bytes = None
+                    if total_bytes == 0:
+                        total_bytes = None
+                    percent = None
+                    if downloaded_bytes is not None and total_bytes is not None:
+                        percent = min(99.0, downloaded_bytes * 100.0 / total_bytes)
+                    if self.progress_callback:
+                        self.progress_callback({
+                            "completedBytes": downloaded_bytes,
+                            "totalBytes": total_bytes,
+                            "percent": percent,
+                        })
                     continue
 
                 if "-F" in self.opts:
@@ -200,7 +254,7 @@ class Download:
         video_names, retcode = self.get_youtube_vid(filepath)
         return video_names, retcode
 
-    def __init__(self, args, debug=False):
+    def __init__(self, args, debug=False, progress_callback=None):
         self.debug_flag = debug
         self.model_cmd = []
         self.get_best_format = default_get_best_format
@@ -211,7 +265,15 @@ class Download:
         self.output_dir = Path.cwd()
         self.filepath = None
         self.timeout = None
+        self.progress_callback = progress_callback
         self.adjust_format(args)
+
+        if self.progress_callback and "-F" not in self.opts:
+            self.opts += [
+                "--newline",
+                "--progress-template",
+                "download:__VT_PROGRESS__%(progress.downloaded_bytes)s\t%(progress.total_bytes)s",
+            ]
 
 
 def main():

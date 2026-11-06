@@ -161,6 +161,21 @@ function Invoke-Python([string[]]$Arguments) {
     }
 }
 
+function Invoke-CudaRuntimePreparation([switch]$NoDownload) {
+    $arguments = @('-m', 'services.cuda_runtime')
+    if ($NoDownload) { $arguments += '--check-only' }
+    Invoke-Python $arguments
+    if ($LASTEXITCODE -ne 0) { Fail 'Подготовка локального CUDA runtime не завершена. Исправьте указанную выше причину и повторите запуск.' }
+}
+
+function Invoke-RequiredModelPreparation([switch]$NoDownload) {
+    $arguments = @('-m', 'services.prepare_models')
+    if ($NoDownload) { $arguments += '--check-only' }
+    if (-not $script:IncludePostprocess) { $arguments += '--skip-postprocess' }
+    Invoke-Python $arguments
+    if ($LASTEXITCODE -ne 0) { Fail 'Подготовка обязательных моделей не завершена. Повторный запуск продолжит загрузку с уже сохранённых файлов.' }
+}
+
 function Get-ExecutableVersion([string]$Path, [string]$Argument) {
     if (-not $Path) { return $null }
     try { return ((& $Path $Argument 2>$null | Select-Object -First 1).Trim()) } catch { return $null }
@@ -410,6 +425,12 @@ function Ensure-Environment {
             else { Write-Host 'Русская постобработка не установлена; запустите start.ps1 или start.ps1 -InstallPostprocess для установки.' }
         } else { Write-Host 'Проверка русской постобработки пропущена по -SkipPostprocess.' }
         if (-not (Test-Path (Join-Path $Root 'ui\dist\index.html'))) { Fail 'Production UI ещё не собран. Запустите start.ps1.' }
+        Invoke-CudaRuntimePreparation -NoDownload
+        if ($SetupOnly) {
+            Invoke-RequiredModelPreparation -NoDownload
+        } else {
+            Write-Host 'Проверка моделей пропущена: выбранные веса будут подготовлены при запуске задачи.'
+        }
         Write-Host 'Проверки окружения пройдены.'
         return
     }
@@ -484,6 +505,8 @@ function Ensure-Environment {
         if (-not (Test-Path $distIndex)) { Fail 'npm завершился успешно, но ui/dist/index.html не создан.' }
         Set-Content -LiteralPath $buildMarker -Value $uiFingerprint -NoNewline -Encoding ascii
     }
+    Invoke-CudaRuntimePreparation
+    if ($SetupOnly) { Invoke-RequiredModelPreparation }
 }
 
 function Get-HealthyApp {

@@ -234,6 +234,7 @@ def download_registered_model(
     model_id: str,
     progress_callback: ModelDownloadProgressCallback | None = None,
     cache_dir: str | Path | None = None,
+    byte_progress_callback: Callable[[int, int | None], None] | None = None,
 ) -> dict[str, Any]:
     entry = get_model_registry_entry(model_id)
     current_status = get_model_status(model_id, cache_dir=cache_dir)
@@ -263,6 +264,7 @@ def download_registered_model(
         cached_bytes=already_cached_bytes,
         initial_percent=initial_percent,
         callback=(lambda percent, label: _emit_progress(progress_callback, percent, label)),
+        byte_callback=byte_progress_callback,
         label="Downloading model files",
     )
 

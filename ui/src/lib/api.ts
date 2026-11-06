@@ -30,7 +30,9 @@ async function getErrorMessage(response: Response): Promise<string> {
 export async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, init)
   if (!response.ok) {
-    throw new Error(await getErrorMessage(response))
+    const error = new Error(await getErrorMessage(response)) as Error & { status?: number }
+    error.status = response.status
+    throw error
   }
   return response.json() as Promise<T>
 }

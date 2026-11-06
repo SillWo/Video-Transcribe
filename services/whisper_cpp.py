@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -37,7 +38,7 @@ def model_filename(model_name: str) -> str:
     return f"ggml-{normalized}.bin"
 
 
-def resolve_model_path(model_name: str, *, progress=None) -> Path:
+def resolve_model_path(model_name: str, *, progress=None, byte_progress=None) -> Path:
     filename = model_filename(model_name)
     try:
         from huggingface_hub import hf_hub_download, try_to_load_from_cache
@@ -45,6 +46,9 @@ def resolve_model_path(model_name: str, *, progress=None) -> Path:
         raise RuntimeError("Install huggingface_hub to download Vulkan Whisper models.") from exc
     cached_path = try_to_load_from_cache(repo_id=MODEL_REPO, filename=filename, cache_dir=str(MODEL_CACHE))
     if isinstance(cached_path, str) and Path(cached_path).is_file():
+        if byte_progress:
+            cached_size = Path(cached_path).stat().st_size
+            byte_progress(cached_size, cached_size)
         if progress:
             progress(f"Using cached Vulkan model {model_name}.")
         return Path(cached_path)
@@ -53,6 +57,7 @@ def resolve_model_path(model_name: str, *, progress=None) -> Path:
     progress_tqdm = create_download_progress_tqdm(
         initial_percent=10,
         callback=(lambda _percent, message: progress(message)) if progress else None,
+        byte_callback=byte_progress,
         label=f"Downloading Vulkan model {model_name}",
     )
     try:
@@ -122,13 +127,17 @@ def _add_runtime_dll_path(executable: str) -> None:
 
 
 class WhisperCppModel:
-    def __init__(self, model_name: str, *, threads: int = 1, progress=None):
+    """whisper.cpp adapter; `transcription_progress` accepts progress dictionaries during native inference."""
+    def __init__(self, model_name: str, *, threads: int = 1, progress=None, gpu_index: int | None = None,
+                 transcription_progress=None):
         self.executable = find_whisper_cpp_executable()
         if not self.executable:
             raise RuntimeError("Vulkan Whisper runtime is not installed. Run the application's GPU setup and restart it.")
         self.model_path = resolve_model_path(model_name, progress=progress)
         self.threads = max(1, int(threads))
         self.model_name = model_name
+        self.gpu_index = gpu_index
+        self.transcription_progress = transcription_progress
         _add_runtime_dll_path(self.executable)
 
     def transcribe(self, media_path: str, beam_size: int = 5, language: str | None = None):
@@ -145,12 +154,53 @@ class WhisperCppModel:
                 raise RuntimeError(f"FFmpeg could not prepare audio: {detail[-1200:]}")
             command = [self.executable, "-m", str(self.model_path), "-f", str(wav_path), "-l", language or "auto",
                        "-t", str(self.threads), "-bs", str(max(1, int(beam_size))), "-oj", "-of", str(output_base)]
-            completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
-            if completed.returncode:
-                detail = (completed.stderr or completed.stdout or "unknown whisper.cpp error").strip()
-                raise RuntimeError(f"Vulkan transcription failed (whisper.cpp exit {completed.returncode}): {detail[-1600:]}")
-            runtime_log = f"{completed.stdout or ''}\n{completed.stderr or ''}"
-            if "using vulkan" not in runtime_log.lower():
+            selected_index = getattr(self, "gpu_index", None)
+            if selected_index is None and os.environ.get("VT_VULKAN_DEVICE_INDEX"):
+                try:
+                    selected_index = int(os.environ["VT_VULKAN_DEVICE_INDEX"])
+                except ValueError as exc:
+                    raise RuntimeError("VT_VULKAN_DEVICE_INDEX must be an integer physical GPU index.") from exc
+            if selected_index is not None:
+                if selected_index < 0:
+                    raise RuntimeError("Vulkan device index cannot be negative.")
+                command += ["-dev", str(selected_index)]
+            callback = getattr(self, "transcription_progress", None)
+            if callback is None:
+                completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                return_code = completed.returncode
+                runtime_log = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+                saw_vulkan = "using vulkan" in runtime_log.lower()
+            else:
+                command.append("-pp")
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           text=True, encoding="utf-8", errors="replace", bufsize=1)
+                runtime_log = ""
+                saw_vulkan = False
+                last_percent = None
+                try:
+                    assert process.stdout is not None
+                    for line in process.stdout:
+                        if "using vulkan" in line.lower():
+                            saw_vulkan = True
+                        runtime_log = (runtime_log + line)[-8000:]
+                        match = re.search(r"progress\s*=\s*(\d+(?:\.\d+)?)\s*%", line, re.IGNORECASE)
+                        if match:
+                            value = min(99.0, float(match.group(1)))
+                            if last_percent is None or value > last_percent:
+                                last_percent = value
+                                callback({"percent": value, "processedSeconds": None, "totalSeconds": None})
+                    return_code = process.wait()
+                except Exception:
+                    process.kill()
+                    process.wait()
+                    raise
+                finally:
+                    if process.stdout is not None:
+                        process.stdout.close()
+            if return_code:
+                detail = (runtime_log or "unknown whisper.cpp error").strip()
+                raise RuntimeError(f"Vulkan transcription failed (whisper.cpp exit {return_code}): {detail[-1600:]}")
+            if not saw_vulkan:
                 raise RuntimeError(
                     "whisper.cpp did not confirm Vulkan GPU execution. Check that the installed runtime includes Vulkan support and restart the app."
                 )
@@ -161,4 +211,7 @@ class WhisperCppModel:
                 raise RuntimeError("whisper.cpp completed without creating its JSON transcription output.") from exc
             except json.JSONDecodeError as exc:
                 raise RuntimeError(f"whisper.cpp created malformed JSON output: {exc}") from exc
-            return parse_whisper_cpp_json(payload)
+            result = parse_whisper_cpp_json(payload)
+            if callback is not None:
+                callback({"percent": 100.0, "processedSeconds": None, "totalSeconds": None})
+            return result

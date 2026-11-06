@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -79,6 +80,75 @@ class WhisperCppParsingTests(unittest.TestCase):
             self.assertEqual(segments[0].text, "hello")
             self.assertEqual(stats.language, "en")
 
+    def test_whisper_cpp_streams_native_progress_and_validates_vulkan_before_100_percent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_file = Path(temp_dir) / "model.bin"
+            model_file.touch()
+            model = whisper_cpp.WhisperCppModel.__new__(whisper_cpp.WhisperCppModel)
+            model.executable, model.model_path, model.threads, model.model_name = "whisper-cli", model_file, 2, "tiny"
+            progress = []
+            model.transcription_progress = progress.append
+
+            class FakeProcess:
+                stdout = io.StringIO(
+                    "whisper_backend_init_gpu: using Vulkan0 backend\n"
+                    + "whisper log: " + ("x" * 9000) + "\n"
+                    "whisper_print_progress_callback: progress = 0%\n"
+                    "progress = 50%\nprogress = 100%\n"
+                )
+
+                def wait(self):
+                    return 0
+
+                def kill(self):
+                    pass
+
+            def fake_run(command, **_kwargs):
+                if command[0] == "ffmpeg.exe":
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                raise AssertionError("recognition should stream through Popen when a callback is set")
+
+            def fake_popen(command, **kwargs):
+                self.assertIn("-pp", command)
+                self.assertIs(kwargs["stderr"], whisper_cpp.subprocess.STDOUT)
+                output_json = Path(command[command.index("-of") + 1] + ".json")
+                output_json.write_text(json.dumps({
+                    "transcription": [{"offsets": {"from": 0, "to": 900}, "text": "hello"}],
+                    "result": {"language": "en"},
+                }), encoding="utf-8")
+                return FakeProcess()
+
+            with patch.object(whisper_cpp, "_find_ffmpeg", return_value="ffmpeg.exe"), \
+                    patch.object(whisper_cpp.subprocess, "run", side_effect=fake_run), \
+                    patch.object(whisper_cpp.subprocess, "Popen", side_effect=fake_popen):
+                segments, _stats = model.transcribe("movie.webm")
+
+        self.assertEqual(segments[0].text, "hello")
+        percentages = [item["percent"] for item in progress]
+        self.assertEqual(percentages, [0.0, 50.0, 99.0, 100.0])
+        self.assertEqual(percentages, sorted(percentages))
+        self.assertTrue(all(item["processedSeconds"] is None and item["totalSeconds"] is None for item in progress))
+
+    def test_whisper_cpp_streaming_still_rejects_missing_vulkan_confirmation(self):
+        model = whisper_cpp.WhisperCppModel.__new__(whisper_cpp.WhisperCppModel)
+        model.executable, model.model_path, model.threads = "whisper-cli", Path("model.bin"), 1
+        model.transcription_progress = lambda _progress: None
+
+        class FakeProcess:
+            stdout = io.StringIO("progress = 50%\n")
+
+            def wait(self):
+                return 0
+
+            def kill(self):
+                pass
+
+        with patch.object(whisper_cpp, "_find_ffmpeg", return_value="ffmpeg.exe"), \
+                patch.object(whisper_cpp.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
+                patch.object(whisper_cpp.subprocess, "Popen", return_value=FakeProcess()):
+            with self.assertRaisesRegex(RuntimeError, "did not confirm Vulkan GPU execution"):
+                model.transcribe("movie.webm")
+
     def test_ffmpeg_failures_are_reported(self):
         model = whisper_cpp.WhisperCppModel.__new__(whisper_cpp.WhisperCppModel)
         model.executable, model.model_path, model.threads = "whisper-cli", Path("model.bin"), 1
@@ -115,12 +185,69 @@ class RuntimeDeviceTests(unittest.TestCase):
             details = {entry["id"]: entry for entry in runtime_devices.get_device_details()}
         self.assertFalse(details["cuda"]["available"])
         self.assertIn("CUDA libraries are missing", details["cuda"]["reason"])
-        self.assertIn("Use Vulkan or install CUDA 12 and cuDNN 9", details["cuda"]["reason"])
+        self.assertIn("project-local CUDA 12 and cuDNN 9 runtime", details["cuda"]["reason"])
         self.assertTrue(details["vulkan"]["available"])
 
     def test_cpp_model_rejects_distil(self):
         with self.assertRaisesRegex(ValueError, "not supported by the Vulkan backend"):
             whisper_cpp.model_filename("distil-large-v2")
+
+    def test_simple_gpu_prefers_nvidia_and_reports_missing_cuda_without_switching(self):
+        with patch.object(runtime_devices, "enumerate_vulkan_gpus", return_value=[
+                {"name": "NVIDIA RTX", "vendorId": 0x10DE, "deviceIndex": 0},
+                {"name": "AMD Radeon", "vendorId": 0x1002, "deviceIndex": 1}]), \
+                patch.object(runtime_devices, "_windows_gpu_inventory", return_value=[]), \
+                patch.object(runtime_devices, "cuda_device_count", return_value=0), \
+                patch.object(runtime_devices, "cuda_runtime_status", return_value=(False, "missing CUDA DLLs")):
+            details = runtime_devices.get_simple_gpu_details()
+        self.assertEqual(details["backend"], "cuda")
+        self.assertFalse(details["available"])
+        self.assertIn("NVIDIA", details["name"])
+        self.assertEqual(details["reason"], "missing CUDA DLLs")
+
+    def test_simple_gpu_selects_cuda_when_nvidia_runtime_is_ready(self):
+        with patch.object(runtime_devices, "enumerate_vulkan_gpus", return_value=[
+                {"name": "NVIDIA RTX", "vendorId": 0x10DE, "deviceIndex": 0}]), \
+                patch.object(runtime_devices, "_windows_gpu_inventory", return_value=[]), \
+                patch.object(runtime_devices, "cuda_device_count", return_value=1), \
+                patch.object(runtime_devices, "cuda_runtime_status", return_value=(True, None)):
+            details = runtime_devices.get_simple_gpu_details()
+        self.assertTrue(details["available"])
+        self.assertEqual(details["backend"], "cuda")
+
+    def test_simple_gpu_returns_amd_physical_index(self):
+        with patch.object(runtime_devices, "enumerate_vulkan_gpus", return_value=[
+                {"name": "Radeon 780M", "vendorId": 0x1002, "deviceIndex": 2}]), \
+                patch.object(runtime_devices, "_windows_gpu_inventory", return_value=[]), \
+                patch.object(runtime_devices, "find_whisper_cpp_executable", return_value="cli"):
+            details = runtime_devices.get_simple_gpu_details()
+        self.assertTrue(details["available"])
+        self.assertEqual(details["backend"], "vulkan")
+        self.assertEqual(details["deviceIndex"], 2)
+
+    def test_simple_gpu_finds_amd_when_integrated_vulkan_is_only_adapter(self):
+        with patch.object(runtime_devices, "enumerate_vulkan_gpus", return_value=[
+                {"name": "AMD Radeon 780M", "vendorId": 0x1002, "deviceIndex": 0}]), \
+                patch.object(runtime_devices, "_windows_gpu_inventory", return_value=[]), \
+                patch.object(runtime_devices, "find_whisper_cpp_executable", return_value="cli"):
+            details = runtime_devices.get_simple_gpu_details()
+        self.assertTrue(details["available"])
+        self.assertEqual(details["backend"], "vulkan")
+        self.assertEqual(details["deviceIndex"], 0)
+
+    def test_intel_only_does_not_get_reported_as_supported_gpu(self):
+        with patch.object(runtime_devices, "enumerate_vulkan_gpus", return_value=[
+                {"name": "Intel Arc", "vendorId": 0x8086, "deviceIndex": 0}]), \
+                patch.object(runtime_devices, "_windows_gpu_inventory", return_value=[{"name": "Intel Arc", "vendorId": 0x8086}]):
+            details = runtime_devices.get_simple_gpu_details()
+        self.assertFalse(details["available"])
+        self.assertIsNone(details["backend"])
+
+    def test_simple_gpu_details_exports_vulkan_index(self):
+        import services.simple_profiles as simple_profiles
+        expected = {"available": True, "name": "Radeon", "reason": None, "backend": "vulkan", "deviceIndex": 3}
+        with patch.object(simple_profiles, "get_simple_gpu_details", return_value=expected):
+            self.assertEqual(simple_profiles.gpu_details(), expected)
 
 
 class ModelStorageTests(unittest.TestCase):

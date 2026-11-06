@@ -1,4 +1,5 @@
 import math
+import io
 import struct
 import tempfile
 import unittest
@@ -100,6 +101,62 @@ class AudioExtractionTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "Unable to prepare FFmpeg audio extraction: bad ffmpeg input") as raised:
                     self.make_processor().extract_audio(str(source), output_filepath=str(target))
         self.assertIsInstance(raised.exception.__cause__, ValueError)
+
+    def test_progress_callback_streams_ffmpeg_times_and_caps_until_success(self):
+        with tempfile.TemporaryDirectory(dir=MODEL_TEMP_DIR) as temp_dir:
+            root = Path(temp_dir)
+            source, target = root / "source.webm", root / "output.mp3"
+            source.write_bytes(b"input")
+            fake_stream = Mock()
+            fake_stream.compile.return_value = ["ffmpeg", "-i", str(source), str(target)]
+            callbacks = []
+
+            class FakeProcess:
+                stdout = io.StringIO("out_time_us=5000000\nprogress=continue\nout_time=00:00:08.000000\nprogress=end\n")
+
+                def wait(self):
+                    return 0
+
+                def kill(self):
+                    pass
+
+            with patch.object(ffmpeg, "input", return_value=Mock()), \
+                    patch.object(ffmpeg, "output", return_value=fake_stream), \
+                    patch.object(ffmpeg, "probe", return_value={"format": {"duration": "10"}}), \
+                    patch("utils.get_audio.subprocess.Popen", return_value=FakeProcess()) as popen:
+                result = self.make_processor().extract_audio(
+                    str(source), output_filepath=str(target), overwrite=True, progress_callback=callbacks.append
+                )
+
+        self.assertEqual(result, (0, ""))
+        self.assertIn("-progress", popen.call_args.args[0])
+        self.assertIn("-nostats", popen.call_args.args[0])
+        self.assertEqual([item["processedSeconds"] for item in callbacks], [5.0, 8.0, 8.0])
+        self.assertEqual([item["percent"] for item in callbacks], [50.0, 80.0, 100.0])
+
+    def test_progress_callback_uses_indeterminate_percent_without_duration(self):
+        with tempfile.TemporaryDirectory(dir=MODEL_TEMP_DIR) as temp_dir:
+            source, target = Path(temp_dir) / "source.webm", Path(temp_dir) / "output.mp3"
+            source.write_bytes(b"input")
+            stream = Mock()
+            stream.compile.return_value = ["ffmpeg", "-i", str(source), str(target)]
+
+            class FakeProcess:
+                stdout = io.StringIO("out_time_us=2000000\nprogress=end\n")
+
+                def wait(self):
+                    return 0
+
+                def kill(self):
+                    pass
+
+            callbacks = []
+            with patch.object(ffmpeg, "input", return_value=Mock()), \
+                    patch.object(ffmpeg, "output", return_value=stream), \
+                    patch.object(ffmpeg, "probe", side_effect=Exception("unknown duration")), \
+                    patch("utils.get_audio.subprocess.Popen", return_value=FakeProcess()):
+                self.make_processor().extract_audio(str(source), str(target), progress_callback=callbacks.append)
+        self.assertTrue(all(item["percent"] is None and item["totalSeconds"] is None for item in callbacks))
 
 
 if __name__ == "__main__":
