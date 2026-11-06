@@ -16,6 +16,7 @@ from typing import Iterator
 from services.model_paths import HF_HUB_CACHE
 from services.download_progress import create_download_progress_tqdm
 from services.runtime_devices import VULKAN_MODELS, find_whisper_cpp_executable
+from services.task_errors import TaskFailure, is_invalid_source_error, is_out_of_memory_error
 
 MODEL_REPO = os.environ.get("VT_WHISPER_CPP_MODEL_REPO", "ggerganov/whisper.cpp")
 MODEL_CACHE = HF_HUB_CACHE
@@ -39,11 +40,15 @@ def model_filename(model_name: str) -> str:
 
 
 def resolve_model_path(model_name: str, *, progress=None, byte_progress=None) -> Path:
-    filename = model_filename(model_name)
+    try:
+        filename = model_filename(model_name)
+    except ValueError as exc:
+        raise TaskFailure(str(exc), "model_unavailable", stage="preparation") from exc
     try:
         from huggingface_hub import hf_hub_download, try_to_load_from_cache
     except ImportError as exc:
-        raise RuntimeError("Install huggingface_hub to download Vulkan Whisper models.") from exc
+        raise TaskFailure("Install huggingface_hub to download Vulkan Whisper models.",
+                          "dependency_missing", stage="preparation") from exc
     cached_path = try_to_load_from_cache(repo_id=MODEL_REPO, filename=filename, cache_dir=str(MODEL_CACHE))
     if isinstance(cached_path, str) and Path(cached_path).is_file():
         if byte_progress:
@@ -69,10 +74,12 @@ def resolve_model_path(model_name: str, *, progress=None, byte_progress=None) ->
             tqdm_class=progress_tqdm,
         )
     except Exception as exc:
-        raise RuntimeError(f"Could not download Vulkan model '{model_name}': {exc}") from exc
+        raise TaskFailure(f"Could not download Vulkan model '{model_name}': {exc}",
+                          "model_download_failed", stage="preparation") from exc
     path = Path(cached)
     if not path.is_file():
-        raise RuntimeError(f"Hugging Face did not return the Vulkan model file '{filename}'.")
+        raise TaskFailure(f"Hugging Face did not return the Vulkan model file '{filename}'.",
+                          "model_unavailable", stage="preparation")
     if progress:
         progress(f"Vulkan model {model_name} is ready.")
     return path
@@ -113,7 +120,8 @@ def parse_whisper_cpp_json(payload: dict) -> tuple[list[WhisperCppSegment], Simp
 def _find_ffmpeg() -> str:
     exe = shutil.which("ffmpeg.exe") or shutil.which("ffmpeg")
     if not exe:
-        raise RuntimeError("FFmpeg is required to prepare audio for Vulkan transcription. Install it and restart the app.")
+        raise TaskFailure("FFmpeg is required to prepare audio for Vulkan transcription. Install it and restart the app.",
+                          "dependency_missing", stage="source")
     return exe
 
 
@@ -132,7 +140,8 @@ class WhisperCppModel:
                  transcription_progress=None):
         self.executable = find_whisper_cpp_executable()
         if not self.executable:
-            raise RuntimeError("Vulkan Whisper runtime is not installed. Run the application's GPU setup and restart it.")
+            raise TaskFailure("Vulkan Whisper runtime is not installed. Run the application's GPU setup and restart it.",
+                              "device_unavailable", stage="recognition")
         self.model_path = resolve_model_path(model_name, progress=progress)
         self.threads = max(1, int(threads))
         self.model_name = model_name
@@ -151,7 +160,8 @@ class WhisperCppModel:
             )
             if converted.returncode:
                 detail = (converted.stderr or converted.stdout or "unknown FFmpeg error").strip()
-                raise RuntimeError(f"FFmpeg could not prepare audio: {detail[-1200:]}")
+                raise TaskFailure(f"FFmpeg could not prepare audio: {detail[-1200:]}",
+                                  "source_invalid", stage="source")
             command = [self.executable, "-m", str(self.model_path), "-f", str(wav_path), "-l", language or "auto",
                        "-t", str(self.threads), "-bs", str(max(1, int(beam_size))), "-oj", "-of", str(output_base)]
             selected_index = getattr(self, "gpu_index", None)
@@ -199,19 +209,37 @@ class WhisperCppModel:
                         process.stdout.close()
             if return_code:
                 detail = (runtime_log or "unknown whisper.cpp error").strip()
-                raise RuntimeError(f"Vulkan transcription failed (whisper.cpp exit {return_code}): {detail[-1600:]}")
+                if is_out_of_memory_error(detail):
+                    code = "out_of_memory"
+                    stage = "recognition"
+                elif is_invalid_source_error(detail):
+                    code = "source_invalid"
+                    stage = "source"
+                else:
+                    code = "device_error"
+                    stage = "recognition"
+                raise TaskFailure(f"Vulkan transcription failed (whisper.cpp exit {return_code}): {detail[-1600:]}",
+                                  code, stage=stage)
             if not saw_vulkan:
-                raise RuntimeError(
-                    "whisper.cpp did not confirm Vulkan GPU execution. Check that the installed runtime includes Vulkan support and restart the app."
+                raise TaskFailure(
+                    "whisper.cpp did not confirm Vulkan GPU execution. Check that the installed runtime includes Vulkan support and restart the app.",
+                    "device_error", stage="recognition",
                 )
             json_path = Path(str(output_base) + ".json")
             try:
                 payload = json.loads(json_path.read_text(encoding="utf-8"))
             except FileNotFoundError as exc:
-                raise RuntimeError("whisper.cpp completed without creating its JSON transcription output.") from exc
+                raise TaskFailure("whisper.cpp completed without creating its JSON transcription output.",
+                                  "transcription_failed", stage="recognition") from exc
             except json.JSONDecodeError as exc:
-                raise RuntimeError(f"whisper.cpp created malformed JSON output: {exc}") from exc
-            result = parse_whisper_cpp_json(payload)
+                raise TaskFailure(f"whisper.cpp created malformed JSON output: {exc}",
+                                  "transcription_failed", stage="recognition") from exc
+            try:
+                result = parse_whisper_cpp_json(payload)
+            except TaskFailure:
+                raise
+            except Exception as exc:
+                raise TaskFailure(str(exc), "transcription_failed", stage="recognition") from exc
             if callback is not None:
                 callback({"percent": 100.0, "processedSeconds": None, "totalSeconds": None})
             return result

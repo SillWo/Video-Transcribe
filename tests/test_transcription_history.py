@@ -41,8 +41,8 @@ class TranscriptionHistoryTests(unittest.TestCase):
         recovered = reopened.get("a" * 32)["checkpoints"]
         self.assertEqual(recovered[3]["status"], "failed")
         self.assertIsNotNone(recovered[3]["completedAt"])
-        self.assertIsNotNone(reopened.get("a" * 32)["finishedAt"])
-        self.assertGreaterEqual(reopened.get("a" * 32)["durationSeconds"], 0)
+        self.assertIsNone(reopened.get("a" * 32)["finishedAt"])
+        self.assertIsNone(reopened.get("a" * 32)["durationSeconds"])
 
     def test_jobs_start_with_stable_six_stage_checkpoint_contract(self):
         record = self.record()
@@ -78,6 +78,27 @@ class TranscriptionHistoryTests(unittest.TestCase):
             self.assertIsInstance(record["finishedAt"], str)
             self.assertGreaterEqual(record["durationSeconds"], 0)
 
+    def test_queue_wait_and_processing_durations_are_stable_after_terminal_edits(self):
+        self.record()
+        started = self.store.mark_started("a" * 32)
+        self.assertIsInstance(started["startedAt"], str)
+        self.assertGreaterEqual(started["queueWaitSeconds"], 0)
+        completed = self.store.update("a" * 32, status="completed")
+        self.assertGreaterEqual(completed["processingDurationSeconds"], 0)
+        timing = tuple(completed[key] for key in
+                       ("startedAt", "finishedAt", "queueWaitSeconds", "processingDurationSeconds", "durationSeconds"))
+        edited = self.store.update("a" * 32, revision=2)
+        self.assertEqual(tuple(edited[key] for key in
+                               ("startedAt", "finishedAt", "queueWaitSeconds", "processingDurationSeconds", "durationSeconds")),
+                         timing)
+
+    def test_cancel_while_still_queued_has_zero_processing_duration(self):
+        self.record()
+        cancelled = self.store.update("a" * 32, status="cancelled")
+        self.assertIsNone(cancelled["startedAt"])
+        self.assertGreaterEqual(cancelled["queueWaitSeconds"], 0)
+        self.assertEqual(cancelled["processingDurationSeconds"], 0)
+
     def test_invalid_creation_time_keeps_terminal_duration_null(self):
         self.record()
         record = self.store.get("a" * 32)
@@ -99,7 +120,7 @@ class TranscriptionHistoryTests(unittest.TestCase):
         reopened = TranscriptionHistory(self.root)
         recovered = reopened.get("a" * 32)
         self.assertEqual(recovered["status"], "interrupted")
-        self.assertIsInstance(recovered["finishedAt"], str)
+        self.assertIsNone(recovered["finishedAt"])
         self.assertIsNone(recovered["durationSeconds"])
 
     def test_legacy_terminal_timing_uses_checkpoint_not_updated_at(self):

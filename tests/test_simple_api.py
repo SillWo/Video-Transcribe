@@ -109,6 +109,7 @@ class _FakeController:
 
 class SimpleApiTests(unittest.TestCase):
     def setUp(self):
+        web_api.reset_simple_queue_for_tests()
         self.temp = tempfile.TemporaryDirectory()
         self.previous_store = web_api.history_store
         self.previous_cached_store = web_api._history_store
@@ -121,8 +122,10 @@ class SimpleApiTests(unittest.TestCase):
             web_api.job_process_controllers.clear()
             web_api.simple_worker_states.clear()
         self.client = TestClient(web_api.app)
+        web_api.get_simple_queue().set_state(True)
 
     def tearDown(self):
+        web_api.reset_simple_queue_for_tests()
         web_api.history_store = self.previous_store
         web_api._history_store = self.previous_cached_store
         if self.previous_runtime_dir is None:
@@ -159,9 +162,28 @@ class SimpleApiTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command, [native_file_picker.sys.executable, "-m", "services.native_file_picker", "--dialog"])
         self.assertEqual(run.call_args.kwargs["creationflags"], getattr(native_file_picker.subprocess, "CREATE_NO_WINDOW", 0))
+        self.assertIs(run.call_args.kwargs["stdin"], native_file_picker.subprocess.DEVNULL)
         self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
         self.assertEqual(run.call_args.kwargs["timeout"], 300)
         self.assertEqual(run.call_args.kwargs["cwd"], Path(native_file_picker.__file__).resolve().parents[1])
+
+    def test_native_picker_multiple_mode_uses_json_protocol(self):
+        selected = ["C:/первый.wav", "D:/второй.mp4"]
+        result = type("Result", (), {"returncode": 0, "stdout": json.dumps(selected, ensure_ascii=False)})()
+        with (patch.object(native_file_picker.os, "name", "nt"),
+              patch.object(native_file_picker.subprocess, "run", return_value=result) as run):
+            self.assertEqual(native_file_picker._show_windows_dialog(multiple=True), selected)
+        self.assertEqual(run.call_args.args[0], [native_file_picker.sys.executable, "-m",
+                                                 "services.native_file_picker", "--dialog-multiple"])
+        self.assertIs(run.call_args.kwargs["stdin"], native_file_picker.subprocess.DEVNULL)
+
+    def test_native_picker_multiple_rejects_malformed_json_and_non_string_items(self):
+        for output in ("not-json", "{}", '["valid.wav", 12]'):
+            result = type("Result", (), {"returncode": 0, "stdout": output})()
+            with (patch.object(native_file_picker.os, "name", "nt"),
+                  patch.object(native_file_picker.subprocess, "run", return_value=result)):
+                with self.assertRaisesRegex(RuntimeError, "список выбранных файлов"):
+                    native_file_picker._show_windows_dialog(multiple=True)
 
     def test_native_picker_timeout_becomes_readable_error(self):
         with (patch.object(native_file_picker.os, "name", "nt"),
@@ -205,6 +227,7 @@ class SimpleApiTests(unittest.TestCase):
 
     def test_concurrent_first_requests_construct_one_history_store(self):
         constructor = web_api.TranscriptionHistory
+        web_api._history_store = None
         count = 0
         count_lock = threading.Lock()
 
@@ -221,13 +244,13 @@ class SimpleApiTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertTrue(all(store is stores[0] for store in stores))
 
-    def test_submit_records_only_metadata_and_active_submit_conflicts(self):
+    def test_submit_records_only_metadata_and_adds_second_job_to_fifo(self):
         with patch.object(web_api.simple_profiles, "resolve", return_value=("large-v3-turbo", "cpu")), \
              patch.object(web_api, "run_job", return_value=None):
             response = self.client.post("/api/simple/jobs", json=self.payload())
             self.assertEqual(response.status_code, 202)
             second = self.client.post("/api/simple/jobs", json=self.payload())
-        self.assertEqual(second.status_code, 409)
+        self.assertEqual(second.status_code, 202)
         body = response.json()
         self.assertIsNone(body["text"])
         self.assertNotIn(b"transcript text", web_api.history_store.db_path.read_bytes())
@@ -335,7 +358,7 @@ class SimpleApiTests(unittest.TestCase):
         self.assertGreaterEqual(failed_shape["durationSeconds"], 0)
         self.assertEqual(failed["stage"], "recognition")
         self.assertIsNone(web_api.history_store.read_text(failed_id))
-        self.assertEqual(web_api.jobs[failed_id].error, "Не удалось завершить расшифровку. Проверьте ссылку или файл и попробуйте снова.")
+        self.assertEqual(failed_shape["error"], "Не удалось обработать эту запись. Проверьте источник и повторите попытку.")
         self.assertIn("[error] decode failed", web_api.jobs[failed_id].logs)
 
     def test_missing_simple_model_is_prepared_before_process_start(self):
@@ -368,6 +391,8 @@ class SimpleApiTests(unittest.TestCase):
                                            "--model", "large-v3", "--device", "cpu"])
         prepare_env = popen.call_args_list[0].kwargs["env"]
         asr_env = popen.call_args_list[1].kwargs["env"]
+        self.assertIs(popen.call_args_list[0].kwargs["stdin"], web_api.subprocess.DEVNULL)
+        self.assertIs(popen.call_args_list[1].kwargs["stdin"], web_api.subprocess.DEVNULL)
         self.assertNotIn("HF_HUB_OFFLINE", prepare_env)
         self.assertNotIn("TRANSFORMERS_OFFLINE", prepare_env)
         self.assertEqual(asr_env["HF_HUB_OFFLINE"], "1")
@@ -404,19 +429,18 @@ class SimpleApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         return response.json()
 
-    def test_cancel_before_worker_starts_is_idempotent_and_blocks_new_work_and_delete(self):
+    def test_cancel_before_worker_starts_is_idempotent_and_cancels_queued_job(self):
         body = self._create_controlled_job()
         first = self.client.post(f"/api/simple/jobs/{body['id']}/cancel")
         second = self.client.post(f"/api/simple/jobs/{body['id']}/cancel")
         self.assertEqual(first.status_code, 202)
         self.assertEqual(second.status_code, 202)
-        self.assertEqual(first.json()["status"], "cancelling")
-        self.assertEqual(second.json()["status"], "cancelling")
-        self.assertIsNone(first.json()["finishedAt"])
-        self.assertIsNone(first.json()["durationSeconds"])
-        self.assertEqual(self.client.delete(f"/api/simple/history/{body['id']}").status_code, 409)
+        self.assertEqual(first.json()["status"], "cancelled")
+        self.assertEqual(second.json()["status"], "cancelled")
+        self.assertIsInstance(first.json()["finishedAt"], str)
+        self.assertGreaterEqual(first.json()["durationSeconds"], 0)
         with patch.object(web_api.simple_profiles, "resolve", return_value=("small", "cpu")):
-            self.assertEqual(self.client.post("/api/simple/jobs", json=self.payload()).status_code, 409)
+            self.assertEqual(self.client.post("/api/simple/jobs", json=self.payload()).status_code, 202)
         web_api.run_job(body["id"], "https://example.org/watch/123")
         cancelled = self.client.get(f"/api/simple/jobs/{body['id']}").json()
         self.assertEqual(cancelled["status"], "cancelled")
@@ -426,6 +450,7 @@ class SimpleApiTests(unittest.TestCase):
         prep = next(item for item in cancelled["checkpoints"] if item["stage"] == "preparation")
         self.assertEqual(prep["status"], "cancelled")
         self.assertEqual(self.client.post(f"/api/simple/jobs/{body['id']}/cancel").json()["status"], "cancelled")
+        self.assertEqual(self.client.delete(f"/api/simple/history/{body['id']}").status_code, 204)
 
     def test_cancel_while_preparation_child_runs_stops_child_before_terminal_state(self):
         body = self._create_controlled_job()
@@ -446,6 +471,52 @@ class SimpleApiTests(unittest.TestCase):
         self.assertEqual(record["status"], "cancelled")
         self.assertIsNone(web_api.history_store.read_text(body["id"]))
         self.assertEqual(popen.call_count, 1)
+
+    def test_shutdown_keeps_claimed_job_queued_when_it_has_not_acquired_runtime_slot(self):
+        self.assertTrue(web_api.transcription_semaphore.acquire(blocking=False))
+        try:
+            body = self.client.post("/api/simple/jobs", json=self.payload()).json()
+            web_api.get_simple_queue().set_state(False)
+            dispatcher = web_api._get_simple_dispatcher()
+            dispatcher.start()
+            deadline = time.time() + 2
+            while (dispatcher.active_job_id != body["id"] or
+                   web_api.simple_worker_states.get(body["id"]) != "running") and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(dispatcher.active_job_id, body["id"])
+            record = web_api.history_store.get(body["id"])
+            self.assertEqual(record["status"], "queued")
+            self.assertIsNone(record["startedAt"])
+            snapshot = web_api.get_simple_queue_snapshot()
+            self.assertIsNone(snapshot["activeJob"])
+            self.assertEqual(snapshot["waitingCount"], 1)
+            self.assertEqual(snapshot["waitingJobs"][0]["id"], body["id"])
+            self.assertEqual(snapshot["waitingJobs"][0]["queuePosition"], 1)
+            web_api.prepare_simple_shutdown(timeout=2)
+            record = web_api.history_store.get(body["id"])
+            self.assertEqual(record["status"], "queued")
+            self.assertIn(body["id"], web_api.get_simple_queue().ids())
+            self.assertTrue(web_api.get_simple_queue().state()["paused"])
+        finally:
+            web_api.transcription_semaphore.release()
+
+    def test_shutdown_stops_active_owned_process_and_records_interrupted_not_cancelled(self):
+        body = self._create_controlled_job()
+        controller = web_api.job_process_controllers[body["id"]]
+        child = _BlockingProcess()
+        thread = threading.Thread(target=web_api.run_job,
+                                  args=(body["id"], "https://example.org/watch/123"))
+        with patch.object(web_api.subprocess, "Popen", return_value=child):
+            thread.start()
+            deadline = time.time() + 2
+            while controller.process is None and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertIs(controller.process, child)
+            web_api.prepare_simple_shutdown(timeout=2)
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(web_api.history_store.get(body["id"])["status"], "interrupted")
+        self.assertEqual(web_api.history_store.get(body["id"])["errorCode"], None)
 
     def test_cancel_while_asr_child_runs_does_not_publish_final_artifacts(self):
         body = self._create_controlled_job()
@@ -507,9 +578,12 @@ class SimpleApiTests(unittest.TestCase):
             "text": "temporary result", "output_path": str(output_dir / "captions.txt"), "output_format": "txt"}}
         processes = iter([_FakeProcess(), _FakeProcess([web_api.JSON_EVENT_PREFIX + json.dumps(result) + "\n"])] )
         with (patch.object(web_api.subprocess, "Popen", side_effect=lambda *_args, **_kwargs: next(processes)),
-              patch.object(web_api.history_store, "write_text", side_effect=OSError("disk full"))):
+              patch.object(web_api.history_store, "write_text", side_effect=OSError(28, "disk full"))):
+            web_api.get_simple_queue().set_state(False)
             web_api.run_job(job_id, "C:/source.wav")
         self.assertEqual(web_api.history_store.get(job_id)["status"], "failed")
+        self.assertEqual(web_api.history_store.get(job_id)["errorCode"], "storage_unavailable")
+        self.assertEqual(web_api.get_simple_queue().state()["pauseReason"]["code"], "storage_unavailable")
         self.assertFalse(web_api.history_store.artifact(job_id, "txt").exists())
         self.assertFalse(web_api.history_store.artifact(job_id, "md").exists())
 

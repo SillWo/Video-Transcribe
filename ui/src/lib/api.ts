@@ -1,6 +1,17 @@
 export const API_BASE =
   (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '') ?? ''
 
+export type FileSelection = { files: { path: string; name: string }[]; rejected: { path: string; message: string }[] }
+export type DesktopApi = {
+  isDesktop: true
+  version: 1
+  pickFiles(): Promise<FileSelection>
+  getDroppedFiles(files: File[]): Promise<FileSelection>
+  onBeforeQuit(handler: () => Promise<void>): () => void
+}
+
+declare global { interface Window { desktopApi?: DesktopApi } }
+
 async function getErrorMessage(response: Response): Promise<string> {
   const text = await response.text()
   if (!text) {

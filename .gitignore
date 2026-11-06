@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 web_runs/
 ui/node_modules/
+desktop/node_modules/
 ui/dist/
 .runtime/

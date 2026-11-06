@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from utils.download_best import Download
+from services.task_errors import TaskFailure
+import importlib.util
 
 
 def args_for(url="https://example.test/video", single=True):
@@ -103,6 +105,35 @@ class SingleSourceValidationTests(unittest.TestCase):
         self.assertTrue(files[0].endswith("clip.mp4"))
         self.assertEqual(callbacks[0], {"completedBytes": 123, "totalBytes": None, "percent": None})
         self.assertEqual(callbacks[1], {"completedBytes": 500, "totalBytes": 1000, "percent": 50.0})
+
+    def test_source_download_failure_is_typed_as_source_unavailable(self):
+        module_path = Path(__file__).resolve().parents[1] / "whisper-gpu.py"
+        spec = importlib.util.spec_from_file_location("whisper_gpu_source_error_test", module_path)
+        whisper_gpu = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(whisper_gpu)
+
+        class Args(argparse.Namespace):
+            def __contains__(self, key):
+                return hasattr(self, key)
+
+        args = Args(filename="https://example.test/video", output_name="clip.mp3", output_dir=".",
+                    audio_only=True, restrict_filenames=True, overwrite=True, verbose=False,
+                    audio_format="mp3", web_json=False, single_source=True)
+
+        class FakeDownload:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def run(self):
+                raise OSError("network unavailable")
+
+        with patch.object(whisper_gpu.validators, "url", return_value=True), \
+                patch.object(whisper_gpu, "Download", FakeDownload):
+            with self.assertRaises(TaskFailure) as raised:
+                whisper_gpu.add_media_files(args, [])
+
+        self.assertEqual(raised.exception.code, "source_unavailable")
+        self.assertEqual(raised.exception.stage, "source")
 
 
 if __name__ == "__main__":

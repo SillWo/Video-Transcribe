@@ -1,5 +1,6 @@
 import importlib.util
 import argparse
+import errno
 import json
 import io
 import contextlib
@@ -313,6 +314,7 @@ class WhisperGpuTranscribeTests(unittest.TestCase):
                 timeline.append(("transcribe",))
                 return {"text": "done"}
 
+            whisper_gpu.audio_file = "intermediate_audio_file.mp3"
             with patch.object(whisper_gpu.argparse.ArgumentParser, "parse_args", return_value=args), \
                     patch.object(whisper_gpu, "add_media_files", side_effect=add_source), \
                     patch.object(whisper_gpu, "AudioProcess", FakeAudioProcess), \
@@ -389,6 +391,113 @@ class WhisperGpuTranscribeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "VULKAN is unavailable: No non-CPU Vulkan GPU"):
                 whisper_gpu.initialize(args)
         cpu_factory.assert_not_called()
+
+    def test_explicit_gpu_initialization_failure_is_typed_device_unavailable(self):
+        args = SimpleNamespace(device="cuda", model_size="small", precision="auto", nproc=2)
+        devices = [
+            {"id": "auto", "available": True}, {"id": "cpu", "available": True},
+            {"id": "cuda", "available": False, "reason": "Missing CUDA runtime."},
+        ]
+        with patch.object(whisper_gpu, "get_device_details", return_value=devices), \
+                patch.object(whisper_gpu, "_faster_model") as factory:
+            with self.assertRaises(whisper_gpu.TaskFailure) as raised:
+                whisper_gpu.initialize(args)
+        self.assertEqual(raised.exception.code, "device_unavailable")
+        self.assertEqual(raised.exception.stage, "recognition")
+        factory.assert_not_called()
+
+    def test_lazy_gpu_oom_is_typed_systemic_oom(self):
+        class FailingModel:
+            effective_device = "cuda"
+
+            def transcribe(self, *_args, **_kwargs):
+                def segments():
+                    yield SimpleNamespace(start=0, end=1, text="partial")
+                    raise RuntimeError("input decode failed: CUDA_ERROR_OUT_OF_MEMORY during allocation")
+                return segments(), SimpleNamespace(language="ru", language_probability=0.9, duration=4)
+
+        args = self.build_args(language="ru", restore_punctuation=False)
+        args.device = "cuda"
+        with self.assertRaises(whisper_gpu.TaskFailure) as raised:
+            whisper_gpu.transcribe(args, FailingModel(), "input.wav")
+        self.assertEqual(raised.exception.code, "out_of_memory")
+        self.assertEqual(raised.exception.stage, "recognition")
+
+    def test_corrupt_local_media_failure_is_not_mistaken_for_gpu_error(self):
+        class FailingModel:
+            effective_device = "cuda"
+
+            def transcribe(self, *_args, **_kwargs):
+                raise RuntimeError("Invalid data found when processing input")
+
+        args = self.build_args(language="ru", restore_punctuation=False)
+        args.device = "cuda"
+        with self.assertRaises(whisper_gpu.TaskFailure) as raised:
+            whisper_gpu.transcribe(args, FailingModel(), "corrupt.wav")
+        self.assertEqual(raised.exception.code, "source_invalid")
+        self.assertEqual(raised.exception.stage, "source")
+
+    def test_unknown_cpu_recognition_failure_is_non_systemic_transcription_error(self):
+        class FailingModel:
+            effective_device = "cpu"
+
+            def transcribe(self, *_args, **_kwargs):
+                raise RuntimeError("unexpected inference failure")
+
+        args = self.build_args(language="ru", restore_punctuation=False)
+        args.device = "cpu"
+        with self.assertRaises(whisper_gpu.TaskFailure) as raised:
+            whisper_gpu.transcribe(args, FailingModel(), "input.wav")
+        self.assertEqual(raised.exception.code, "transcription_failed")
+        self.assertEqual(raised.exception.stage, "recognition")
+
+    def test_output_write_failures_are_typed_by_storage_errno(self):
+        segments = [SimpleNamespace(start=0.0, end=1.0, text="recognized")]
+        model, _stats = self.build_model(segments)
+        args = self.build_args(language="ru", restore_punctuation=False)
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.object(whisper_gpu, "write_output", side_effect=OSError(errno.ENOSPC, "disk full")):
+            args.output_dir = temp_dir
+            with self.assertRaises(whisper_gpu.TaskFailure) as raised:
+                whisper_gpu.transcribe(args, model, "input.wav")
+        self.assertEqual(raised.exception.code, "storage_unavailable")
+        self.assertEqual(raised.exception.stage, "result")
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.object(whisper_gpu, "write_output", side_effect=PermissionError("denied")):
+            args.output_dir = temp_dir
+            with self.assertRaises(whisper_gpu.TaskFailure) as raised:
+                whisper_gpu.transcribe(args, model, "input.wav")
+        self.assertEqual(raised.exception.code, "output_failed")
+
+    def test_json_error_event_contains_code_and_origin_stage(self):
+        class MainArgs(argparse.Namespace):
+            def __contains__(self, key):
+                return hasattr(self, key)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = MainArgs(
+                filename=None, input_dir=None, output_name=None, output_dir=temp_dir,
+                language="ru", beam_size=5, precision="auto", device="cpu", model_size="tiny",
+                start=None, end=None, nproc=1, keep=False, verbose=False, quiet=True,
+                playlist_start=None, playlist_end=None, codec=None, bitrate=None,
+                output_format="json", no_timestamps=False, restore_punctuation=False,
+                single_source=True, web_json=True,
+            )
+            output = io.StringIO()
+            whisper_gpu.audio_file = "intermediate_audio_file.mp3"
+            with patch.object(whisper_gpu.argparse.ArgumentParser, "parse_args", return_value=args), \
+                    patch.object(whisper_gpu, "add_media_files",
+                                 side_effect=whisper_gpu.TaskFailure("Bad source", "source_invalid", stage="source")), \
+                    contextlib.redirect_stdout(output):
+                with self.assertRaises(whisper_gpu.TaskFailure):
+                    whisper_gpu.main()
+        events = [json.loads(line[len(whisper_gpu.JSON_EVENT_PREFIX):])
+                  for line in output.getvalue().splitlines()
+                  if line.startswith(whisper_gpu.JSON_EVENT_PREFIX)]
+        failure = next(event for event in events if event["type"] == "error")
+        self.assertEqual(failure["code"], "source_invalid")
+        self.assertEqual(failure["stage"], "source")
 
 
 if __name__ == "__main__":

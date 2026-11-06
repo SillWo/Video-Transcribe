@@ -1,0 +1,9 @@
+{
+  "name": "video-transcribe-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local desktop shell for Video Transcribe",
+  "main": "main.cjs",
+  "scripts": { "start": "electron .", "check": "node --check main.cjs && node --check preload.cjs" },
+  "devDependencies": { "electron": "45.2.3" }
+}

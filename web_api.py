@@ -26,6 +26,8 @@ from services.transcription_history import TranscriptionHistory, normalize_termi
 from services import native_file_picker, simple_profiles
 from services.resource_preparation import PREPARATION_EVENT_PREFIX, ResourcePreparationError
 from services.job_processes import JobCancelled, JobProcessController
+from services.simple_queue import PersistentSimpleQueue, SimpleQueueDispatcher
+from services.task_errors import SYSTEMIC_ERROR_CODES, TaskFailure
 
 from services.model_management import (
     ModelCacheInspectionError,
@@ -63,6 +65,10 @@ def get_history_store() -> TranscriptionHistory:
     return _history_store
 
 
+def get_simple_queue() -> PersistentSimpleQueue:
+    return PersistentSimpleQueue(get_history_store())
+
+
 class _LazyHistoryStore:
     def __getattr__(self, name):
         return getattr(get_history_store(), name)
@@ -97,6 +103,14 @@ class SimpleJobRequest(BaseModel):
 class SimpleTextRequest(BaseModel):
     text: str
     baseRevision: int
+
+
+class SimpleBatchRequest(BaseModel):
+    paths: list[str]
+    profile: str
+    device: str
+    cpuThreads: int
+    restorePunctuation: bool
 
 
 @dataclass
@@ -186,12 +200,99 @@ class JobState:
 jobs: dict[str, JobState] = {}
 job_process_controllers: dict[str, JobProcessController] = {}
 simple_worker_states: dict[str, str] = {}
+simple_worker_threads: dict[str, threading.Thread] = {}
+simple_shutdown_jobs: dict[str, bool] = {}
+simple_dispatcher: SimpleQueueDispatcher | None = None
+simple_dispatcher_lock = threading.Lock()
 jobs_lock = threading.Lock()
 transcription_semaphore = threading.Semaphore(1)
 model_download_jobs: dict[str, ModelOperationJobState] = {}
 model_delete_jobs: dict[str, ModelOperationJobState] = {}
 model_operation_jobs_lock = threading.Lock()
 active_model_operation: ActiveModelOperationState | None = None
+
+
+def _simple_dispatch(job_id: str) -> None:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job is None:
+            record = history_store.get(job_id)
+            if record is None or record.get("status") != "queued":
+                return
+            job = _hydrate_simple_job(record)
+        source = job.source_name or job.settings.get("_source") or ""
+    run_job(job_id, source)
+
+
+def _hydrate_simple_job(record: dict[str, Any]) -> JobState:
+    job_id = record["id"]
+    settings = dict(record.get("settings") or {})
+    settings.update(_simple=True, _source=record.get("source"),
+                    _sourceType=record.get("sourceType"), _profile=record.get("profile"),
+                    _requestedDevice=record.get("device"),
+                    _outputDir=str(history_store.job_dir(job_id) / "output"))
+    job = JobState(id=job_id, settings=settings, status=record.get("status", "queued"),
+                   created_at=record.get("createdAt", utc_now()),
+                   updated_at=record.get("updatedAt", utc_now()),
+                   source_name=record.get("source"))
+    jobs[job_id] = job
+    job_process_controllers.setdefault(job_id, JobProcessController())
+    simple_worker_states.setdefault(job_id, "not_started")
+    return job
+
+
+def _mark_simple_job_started(job_id: str) -> bool:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job is None or job.status != "queued":
+            return False
+        record = get_simple_queue().mark_started(job_id)
+        if record is None:
+            return False
+        job.status = "running"
+        job.stage = "preparation"
+        job.updated_at = record["updatedAt"]
+        return True
+
+
+def _simple_dispatch_paused() -> bool:
+    if get_simple_queue().state()["paused"]:
+        return True
+    with jobs_lock:
+        return any(job.status == "cancelling" for job in jobs.values() if job.settings.get("_simple"))
+
+
+def _simple_jobs_cancelling() -> bool:
+    with jobs_lock:
+        return any(job.status == "cancelling" for job in jobs.values()
+                   if job.settings.get("_simple"))
+
+
+def _simple_dispatch_error(job_id: str, exc: Exception) -> None:
+    get_simple_queue().set_state(True, {"code": "internal_error",
+                                        "message": "Очередь приостановлена после внутренней ошибки. Нажмите «Продолжить» для повтора."})
+    try:
+        record = history_store.get(job_id)
+        if record and record.get("status") == "running":
+            _finalize_simple_job(job_id, "failed",
+                                 error="Не удалось завершить обработку. Повторите попытку.",
+                                 error_code="internal_error")
+    except Exception:
+        pass
+
+
+def _get_simple_dispatcher() -> SimpleQueueDispatcher:
+    global simple_dispatcher
+    if simple_dispatcher is None:
+        with simple_dispatcher_lock:
+            if simple_dispatcher is None:
+                simple_dispatcher = SimpleQueueDispatcher(
+                    get_simple_queue().dequeue,
+                    _simple_dispatch_paused,
+                    _simple_dispatch,
+                    _simple_dispatch_error,
+                )
+    return simple_dispatcher
 
 app = FastAPI(title="Video Transcribe Local API", version="1.1.0")
 app.add_middleware(
@@ -234,9 +335,11 @@ def update_job(job_id: str, **changes) -> None:
                 simple_changes["detectedLanguage"] = changes["detected_language"]
             if "error" in changes:
                 simple_changes["error"] = concise_simple_error(changes["error"])
+            if "errorCode" in changes:
+                simple_changes["errorCode"] = changes["errorCode"]
             if "notice" in changes:
                 simple_changes["notice"] = changes["notice"]
-            allowed = {"status", "stage", "detectedLanguage", "error", "notice"}
+            allowed = {"status", "stage", "detectedLanguage", "error", "errorCode", "notice"}
             history_store.update(job_id, **{k: v for k, v in simple_changes.items() if k in allowed})
 
 
@@ -457,6 +560,7 @@ def _simple_controller(job_id: str) -> JobProcessController:
 
 def _finalize_simple_job(job_id: str, status: str, *, error: str | None = None,
                          transcript: str | None = None,
+                         error_code: str | None = None,
                          require_worker_finished: bool = False) -> bool:
     """Commit a terminal simple-job state without racing a cancellation request."""
     with jobs_lock:
@@ -509,7 +613,7 @@ def _finalize_simple_job(job_id: str, status: str, *, error: str | None = None,
                 current.update(status="cancelled", startedAt=current.get("startedAt") or stamp,
                                completedAt=stamp)
                 final_stage = current.get("stage") or final_stage
-        elif status == "failed":
+        elif status in {"failed", "interrupted"}:
             for checkpoint in checkpoints:
                 if checkpoint.get("status") == "active":
                     checkpoint.update(status="failed", completedAt=utc_now())
@@ -520,7 +624,8 @@ def _finalize_simple_job(job_id: str, status: str, *, error: str | None = None,
                         "message": "Расшифровка завершена", "updatedAt": utc_now()}
         try:
             updated = history_store.update(job_id, status=status, stage=final_stage,
-                                           error=final_error, checkpoints=checkpoints, progress=progress)
+                                           error=final_error, errorCode=error_code if status == "failed" else None,
+                                           checkpoints=checkpoints, progress=progress)
             if updated is None:
                 raise LookupError(job_id)
         except Exception:
@@ -550,13 +655,39 @@ def _leave_simple_job_cancelling(job_id: str) -> None:
         history_store.update(job_id, status="cancelling", error=job.error)
 
 
+def _task_failure_message(code: str, fallback: str | None = None) -> str:
+    messages = {
+        "source_unavailable": "Исходный файл недоступен. Проверьте путь и повторите попытку.",
+        "source_invalid": "Не удалось прочитать исходный файл. Проверьте файл и повторите попытку.",
+        "transcription_failed": "Не удалось обработать эту запись. Проверьте источник и повторите попытку.",
+        "internal_error": "Не удалось завершить обработку. Повторите попытку.",
+        "model_download_failed": "Не удалось загрузить модель. Проверьте подключение к интернету и повторите попытку.",
+        "model_unavailable": "Выбранная модель сейчас недоступна. Проверьте подключение или выберите другую модель.",
+        "dependency_missing": "Не хватает компонента для выбранной настройки. Отключите пунктуацию или выберите другую настройку.",
+        "device_unavailable": "Выбранное устройство сейчас недоступно. Выберите CPU или проверьте драйвер видеокарты.",
+        "device_error": "Не удалось запустить выбранное устройство. Выберите CPU или проверьте драйвер видеокарты.",
+        "out_of_memory": "Не хватает памяти для этой модели. Выберите более лёгкий профиль или CPU.",
+        "storage_unavailable": "Не удалось сохранить результат. Проверьте свободное место на диске.",
+    }
+    return messages.get(code, "Не удалось завершить обработку. Повторите попытку.")
+
+
+def _pause_simple_queue_for_error(code: str) -> None:
+    if code in SYSTEMIC_ERROR_CODES:
+        get_simple_queue().set_state(True, {"code": code, "message": _task_failure_message(code)})
+        _get_simple_dispatcher().wake()
+
+
 def _cancel_job(job_id: str) -> dict[str, Any]:
+    worker_is_running = False
     with jobs_lock:
         job = jobs.get(job_id)
         record = history_store.get(job_id)
         if record is None:
             raise HTTPException(status_code=404, detail="Расшифровка не найдена.")
         status = record.get("status")
+        if job is None and status in {"queued", "running", "cancelling"}:
+            job = _hydrate_simple_job(record)
         if status in {"completed", "failed", "interrupted"}:
             raise HTTPException(status_code=409, detail="Эту расшифровку уже нельзя отменить.")
         if status == "cancelled":
@@ -575,6 +706,8 @@ def _cancel_job(job_id: str) -> dict[str, Any]:
                 job.error = None
                 job.updated_at = utc_now()
             record = history_store.update(job_id, status="cancelling", error=None) or record
+        get_simple_queue().remove(job_id)
+        worker_is_running = simple_worker_states.get(job_id) == "running"
     # Process-tree termination can take time; never hold the global job lock.
     try:
         controller.cancel()
@@ -592,7 +725,7 @@ def _cancel_job(job_id: str) -> dict[str, Any]:
                 job.updated_at = utc_now()
                 record = history_store.update(job_id, error=job.error) or record
         raise HTTPException(status_code=503, detail="Не удалось остановить обработку. Повторите отмену.")
-    if _finalize_simple_job(job_id, "cancelled", require_worker_finished=True):
+    if _finalize_simple_job(job_id, "cancelled", require_worker_finished=worker_is_running):
         with jobs_lock:
             job_process_controllers.pop(job_id, None)
     return history_store.get(job_id) or record
@@ -606,7 +739,7 @@ def _run_owned_process(controller: JobProcessController, command: list[str], *, 
                        env: dict[str, str] | None = None) -> int:
     controller.check_cancelled()
     process = subprocess.Popen(
-        command, cwd=APP_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        command, cwd=APP_ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace", env=env or {**os.environ,
         "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}, bufsize=1,
     )
@@ -654,14 +787,32 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
         acquired = True
         controller.check_cancelled()
         job = get_job(job_id)
-        update_job(job_id, status="running", stage="preparation")
+        if job.status in {"completed", "failed", "cancelled", "interrupted"}:
+            return
+        if not _mark_simple_job_started(job_id):
+            controller.check_cancelled()
+            return
+        update_job(job_id, stage="preparation")
+        if job.settings.get("_requestedDevice") == "gpu":
+            try:
+                resolved_model, backend_device = simple_profiles.resolve(job.settings["_profile"], "gpu")
+            except ValueError as exc:
+                raise TaskFailure(str(exc), "device_unavailable", stage="preparation") from exc
+            job.settings["model"] = resolved_model
+            job.settings["device"] = backend_device
+            selected_gpu = simple_profiles.gpu_details()
+            job.settings["_gpuIndex"] = selected_gpu.get("deviceIndex") if backend_device == "vulkan" else None
+        source_type = job.settings.get("_sourceType")
+        if source_type == "file" and not Path(source_path).is_file():
+            raise TaskFailure(_task_failure_message("source_unavailable"), "source_unavailable", stage="source")
         controller.check_cancelled()
         _checkpoint_update(job_id, "preparation", "active")
 
         preparation_error: str | None = None
+        preparation_error_code: str | None = None
 
         def on_preparation_line(line: str) -> None:
-            nonlocal preparation_error
+            nonlocal preparation_error, preparation_error_code
             if line.startswith(PREPARATION_EVENT_PREFIX):
                 payload = json.loads(line[len(PREPARATION_EVENT_PREFIX):])
                 if payload.get("type") == "progress":
@@ -669,6 +820,7 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
                     _simple_progress(job_id, "preparation", payload)
                 elif payload.get("type") == "error":
                     preparation_error = payload.get("message")
+                    preparation_error_code = payload.get("code")
             elif line:
                 append_log(job_id, line)
 
@@ -685,7 +837,10 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
                                         env=prepare_env)
         controller.check_cancelled()
         if prep_code != 0:
-            raise ResourcePreparationError(preparation_error or "Не удалось подготовить ресурсы. Повторите попытку.")
+            code = preparation_error_code or "model_unavailable"
+            if code not in SYSTEMIC_ERROR_CODES:
+                code = "model_unavailable"
+            raise ResourcePreparationError(_task_failure_message(code, preparation_error), code=code)
         _checkpoint_update(job_id, "preparation", "completed")
         _simple_progress(job_id, "preparation", {"percent": 100, "ready": True})
 
@@ -708,9 +863,10 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
         append_log(job_id, f"$ {' '.join(command)}")
 
         pipeline_error: str | None = None
+        pipeline_error_code: str | None = None
 
         def on_pipeline_line(line: str) -> None:
-            nonlocal pipeline_error
+            nonlocal pipeline_error, pipeline_error_code
             if not line:
                 return
             if not line.startswith(JSON_EVENT_PREFIX):
@@ -744,15 +900,19 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
                 _simple_stage_event(job_id, "result", "completed")
             elif payload["type"] == "error":
                 pipeline_error = payload.get("message")
+                pipeline_error_code = payload.get("code")
                 stage = payload.get("stage", "recognition")
-                update_job(job_id, stage=stage, error=pipeline_error)
+                update_job(job_id, stage=stage, error=pipeline_error, errorCode=pipeline_error_code)
                 _simple_stage_event(job_id, stage, "failed")
                 append_log(job_id, f"[error] {pipeline_error or 'Unknown error'}")
 
         return_code = _run_owned_process(controller, command, on_line=on_pipeline_line, env=env)
         controller.check_cancelled()
         if return_code != 0:
-            raise RuntimeError(pipeline_error or f"whisper-gpu.py exited with code {return_code}")
+            code = pipeline_error_code or "internal_error"
+            if code == "internal_error":
+                code = "transcription_failed"
+            raise TaskFailure(_task_failure_message(code, pipeline_error), code, stage=get_job(job_id).stage)
         current = get_job(job_id)
         if current.output_path is None:
             raise RuntimeError("Transcription finished without an output file")
@@ -768,7 +928,14 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
         except Exception:
             _leave_simple_job_cancelling(job_id)
         else:
-            _finalize_simple_job(job_id, "cancelled")
+            shutdown_requested = job_id in simple_shutdown_jobs
+            current = history_store.get(job_id)
+            if shutdown_requested and current and current.get("status") != "cancelling":
+                if current.get("startedAt"):
+                    _finalize_simple_job(job_id, "interrupted",
+                                         error="Обработка прервана при закрытии приложения.")
+            else:
+                _finalize_simple_job(job_id, "cancelled")
     except OwnedProcessStopError:
         _leave_simple_job_cancelling(job_id)
     except Exception as exc:
@@ -781,16 +948,37 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
             except Exception:
                 _leave_simple_job_cancelling(job_id)
             else:
-                _finalize_simple_job(job_id, "cancelled")
+                shutdown_requested = job_id in simple_shutdown_jobs
+                current = history_store.get(job_id)
+                if shutdown_requested and current and current.get("status") != "cancelling":
+                    if current.get("startedAt"):
+                        _finalize_simple_job(job_id, "interrupted",
+                                             error="Обработка прервана при закрытии приложения.")
+                else:
+                    _finalize_simple_job(job_id, "cancelled")
         else:
-            _finalize_simple_job(job_id, "failed", error=str(exc))
+            if isinstance(exc, TaskFailure):
+                code = exc.code
+                stage = exc.stage or get_job(job_id).stage
+                message = _task_failure_message(code, str(exc))
+                update_job(job_id, stage=stage, error=message, errorCode=code)
+            elif isinstance(exc, OSError) and getattr(exc, "errno", None) in {28, 122, 5}:
+                code = "storage_unavailable"
+                message = _task_failure_message(code)
+                update_job(job_id, error=message, errorCode=code)
+            else:
+                code = "internal_error"
+                message = str(exc)
+            _finalize_simple_job(job_id, "failed", error=message, error_code=code)
+            _pause_simple_queue_for_error(code)
     finally:
         if acquired:
             transcription_semaphore.release()
         with jobs_lock:
             simple_worker_states[job_id] = "finished"
+            simple_shutdown_jobs.pop(job_id, None)
             job = jobs.get(job_id)
-            if job is not None and job.status in {"completed", "failed", "cancelled"}:
+            if job is not None and job.status in {"completed", "failed", "cancelled", "interrupted"}:
                 job_process_controllers.pop(job_id, None)
 
 
@@ -1202,6 +1390,7 @@ def run_job(job_id: str, source_path: str) -> None:
         process = subprocess.Popen(
             command,
             cwd=APP_ROOT,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1354,6 +1543,9 @@ def _simple_shape(record: dict[str, Any], *, with_text: bool) -> dict[str, Any]:
         "restorePunctuation": record["restorePunctuation"], "status": record["status"],
         "stage": record["stage"], "createdAt": record["createdAt"], "updatedAt": record["updatedAt"],
         "finishedAt": record["finishedAt"], "durationSeconds": record["durationSeconds"],
+        "startedAt": record.get("startedAt"), "queueWaitSeconds": record.get("queueWaitSeconds"),
+        "processingDurationSeconds": record.get("processingDurationSeconds"),
+        "errorCode": record.get("errorCode"),
         "detectedLanguage": record.get("detectedLanguage"), "error": concise_simple_error(record.get("error")),
         "notice": record.get("notice"), "revision": record.get("revision", 0), "files": files,
         "progress": record.get("progress"), "checkpoints": record.get("checkpoints", []),
@@ -1401,6 +1593,207 @@ def simple_pick_file():
     return {"path": str(path), "name": path.name}
 
 
+@app.post("/api/simple/pick-files")
+def simple_pick_files():
+    try:
+        selected = native_file_picker.pick_files()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _picked_files_payload(selected)
+
+
+def _picked_files_payload(paths: list[str]) -> dict[str, list[dict[str, str]]]:
+    files, rejected = [], []
+    for raw in paths:
+        try:
+            path = Path(raw).expanduser().resolve()
+            if not path.is_file():
+                raise ValueError("Файл больше не существует или это папка.")
+            files.append({"path": str(path), "name": path.name})
+        except Exception as exc:
+            rejected.append({"path": str(raw), "message": str(exc)})
+    return {"files": files, "rejected": rejected}
+
+
+def _validate_simple_common(profile: str, device: str, cpu_threads: int) -> None:
+    maximum = logical_cpu_count()
+    if cpu_threads < 1 or cpu_threads > maximum:
+        raise HTTPException(status_code=400, detail=f"cpuThreads должен быть от 1 до {maximum}.")
+    if profile not in simple_profiles.PROFILES:
+        raise HTTPException(status_code=400, detail="Неизвестный профиль расшифровки.")
+    if device not in {"cpu", "gpu"}:
+        raise HTTPException(status_code=400, detail="Устройство должно быть cpu или gpu.")
+
+
+def _simple_metadata(job_id: str, source: str, source_type: str, profile: str,
+                     device: str, cpu_threads: int, restore_punctuation: bool) -> tuple[dict, dict]:
+    model = simple_profiles.PROFILES[profile][1]
+    backend_device = "cpu" if device == "cpu" else "cpu"  # GPU capability is resolved at dispatch time.
+    settings = {"_simple": True, "_outputDir": str(history_store.job_dir(job_id) / "output"),
+                "_source": source, "_sourceType": source_type, "_profile": profile,
+                "_requestedDevice": device, "sourceType": source_type, "language": "auto",
+                "model": model, "device": backend_device, "nproc": cpu_threads,
+                "outputFormat": "txt", "saveAudio": False, "useTimestamps": False,
+                "restorePunctuation": restore_punctuation}
+    metadata = {"id": job_id, "sourceType": source_type, "source": source,
+                "profile": profile, "device": device, "cpuThreads": cpu_threads,
+                "restorePunctuation": restore_punctuation,
+                "settings": {key: settings[key] for key in
+                             ("language", "model", "device", "nproc", "outputFormat", "saveAudio",
+                              "useTimestamps", "restorePunctuation")},
+                "artifactPaths": {ext: str(history_store.artifact(job_id, ext)) for ext in ("txt", "md")}}
+    return metadata, settings
+
+
+def _enqueue_simple_jobs(items: list[tuple[str, str]], profile: str, device: str,
+                         cpu_threads: int, restore_punctuation: bool) -> list[dict]:
+    _validate_simple_common(profile, device, cpu_threads)
+    with jobs_lock:
+        if any(job.status == "cancelling" for job in jobs.values() if job.settings.get("_simple")):
+            raise HTTPException(status_code=409, detail="Дождитесь остановки текущей обработки.")
+        queue = get_simple_queue()
+        records_metadata, prepared = [], []
+        for source, source_type in items:
+            job_id = uuid.uuid4().hex
+            metadata, settings = _simple_metadata(job_id, source, source_type, profile, device,
+                                                  cpu_threads, restore_punctuation)
+            records_metadata.append(metadata)
+            prepared.append((job_id, source, settings))
+        records = queue.enqueue_many(records_metadata)
+        for job_id, source, settings in prepared:
+            jobs[job_id] = JobState(id=job_id, settings=settings, source_name=source)
+            job_process_controllers[job_id] = JobProcessController()
+            simple_worker_states[job_id] = "not_started"
+    dispatcher = _get_simple_dispatcher()
+    dispatcher.start()
+    return records
+
+
+def _queue_summary(record: dict[str, Any], position: int | None) -> dict[str, Any]:
+    result = _simple_shape(record, with_text=False)
+    result["queuePosition"] = position
+    return result
+
+
+def get_simple_queue_snapshot() -> dict[str, Any]:
+    queue = get_simple_queue()
+    state = queue.state()
+    dispatcher = simple_dispatcher
+    active_id = dispatcher.active_job_id if dispatcher is not None else None
+    if active_id is None:
+        with jobs_lock:
+            active = next((job_id for job_id, job in jobs.items()
+                           if job.settings.get("_simple") and job.status in {"running", "cancelling"}), None)
+        active_id = active
+    active_record = history_store.get(active_id) if active_id else None
+    if active_record and active_record.get("status") not in {"running", "cancelling"}:
+        active_record = None
+        active_id = None
+    waiting_records = queue.records()
+    waiting_records = [record for record in waiting_records if record["id"] != active_id]
+    waiting = [_queue_summary(record, index) for index, record in enumerate(waiting_records, 1)]
+    cancelling = _simple_jobs_cancelling()
+    return {"paused": state["paused"], "pauseReason": state["pauseReason"],
+            "cancelling": cancelling,
+            "activeJob": _queue_summary(active_record, None) if active_record else None,
+            "waitingJobs": waiting, "waitingCount": len(waiting)}
+
+
+@app.get("/api/simple/queue")
+def simple_queue_snapshot():
+    return get_simple_queue_snapshot()
+
+
+@app.post("/api/simple/queue/resume")
+def resume_simple_queue():
+    if _simple_jobs_cancelling():
+        raise HTTPException(status_code=409, detail="Сначала дождитесь остановки текущей обработки.")
+    get_simple_queue().set_state(False)
+    _get_simple_dispatcher().clear_failure()
+    _get_simple_dispatcher().start()
+    _get_simple_dispatcher().wake()
+    return get_simple_queue_snapshot()
+
+
+@app.post("/api/simple/queue/cancel", status_code=202)
+def cancel_simple_queue():
+    queue = get_simple_queue()
+    old_state = queue.state()
+    queue.set_state(True, old_state["pauseReason"])
+    waiting_ids = queue.ids()
+    dispatcher = simple_dispatcher
+    active_id = dispatcher.active_job_id if dispatcher is not None else None
+    for job_id in waiting_ids:
+        record = history_store.get(job_id)
+        if record and record.get("status") == "queued":
+            _cancel_job(job_id)
+    if active_id:
+        try:
+            _cancel_job(active_id)
+        except HTTPException as exc:
+            if exc.status_code == 503:
+                _get_simple_dispatcher().wake()
+                raise
+            if exc.status_code != 409:
+                raise
+    if old_state["paused"]:
+        queue.set_state(True, old_state["pauseReason"])
+    else:
+        queue.set_state(False)
+    _get_simple_dispatcher().wake()
+    return get_simple_queue_snapshot()
+
+
+def prepare_simple_shutdown(timeout: float = 15.0) -> None:
+    """Pause new dispatch, stop the active owned process, and retain waiting FIFO entries."""
+    queue = get_simple_queue()
+    prior_queue_state = queue.state()
+    queue.set_state(True, prior_queue_state["pauseReason"])
+    dispatcher = simple_dispatcher
+    active_id = dispatcher.active_job_id if dispatcher is not None else None
+    if active_id is None:
+        with jobs_lock:
+            active_id = next((job.id for job in jobs.values()
+                              if job.settings.get("_simple") and job.status == "running"), None)
+    if active_id:
+        with jobs_lock:
+            controller = job_process_controllers.get(active_id)
+        if controller is not None:
+            with jobs_lock:
+                record = history_store.get(active_id)
+                if record and record.get("status") != "cancelling":
+                    simple_shutdown_jobs[active_id] = bool(record.get("startedAt"))
+            try:
+                controller.cancel()
+            except Exception as exc:
+                raise RuntimeError("Не удалось остановить активную обработку перед закрытием.") from exc
+    if dispatcher is not None and not dispatcher.stop(timeout):
+        raise RuntimeError("Диспетчер очереди не остановился вовремя.")
+    if active_id:
+        current = history_store.get(active_id)
+        if current and current.get("status") == "running":
+            if not _finalize_simple_job(active_id, "interrupted",
+                                        error="Обработка прервана при закрытии приложения."):
+                current = history_store.get(active_id)
+                if current and current.get("status") not in {"interrupted", "cancelled", "completed", "failed"}:
+                    raise RuntimeError("Не удалось сохранить состояние остановленной обработки.")
+        elif current and current.get("status") == "cancelling":
+            raise RuntimeError("Обработка ещё не остановлена. Повторите закрытие.")
+
+
+def reset_simple_queue_for_tests(timeout: float = 15.0) -> None:
+    """Stop any test dispatcher and clear only in-memory worker/controller state."""
+    global simple_dispatcher
+    if simple_dispatcher is not None:
+        simple_dispatcher.reset_for_tests(timeout)
+    with jobs_lock:
+        simple_worker_threads.clear()
+        simple_worker_states.clear()
+        simple_shutdown_jobs.clear()
+        job_process_controllers.clear()
+    simple_dispatcher = None
+
+
 @app.post("/api/simple/jobs", status_code=202)
 def create_simple_job(payload: SimpleJobRequest):
     if payload.sourceType not in {"url", "file"}:
@@ -1417,39 +1810,35 @@ def create_simple_job(payload: SimpleJobRequest):
         if not path.is_file():
             raise HTTPException(status_code=400, detail="Выбранный файл не найден.")
         source = str(path)
-    maximum = logical_cpu_count()
-    if payload.cpuThreads < 1 or payload.cpuThreads > maximum:
-        raise HTTPException(status_code=400, detail=f"cpuThreads должен быть от 1 до {maximum}.")
-    try:
-        model, backend_device = simple_profiles.resolve(payload.profile, payload.device)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    job_id = uuid.uuid4().hex
-    settings = {"_simple": True, "_outputDir": str(history_store.job_dir(job_id) / "output"),
-                "sourceType": payload.sourceType, "language": "auto", "model": model,
-                "device": backend_device, "nproc": payload.cpuThreads, "outputFormat": "txt",
-                "saveAudio": False, "useTimestamps": False,
-                "restorePunctuation": payload.restorePunctuation}
-    if backend_device == "vulkan":
-        selected_gpu = simple_profiles.gpu_details()
-        settings["_gpuIndex"] = selected_gpu["deviceIndex"]
-    metadata = {"id": job_id, "sourceType": payload.sourceType, "source": source,
-                "profile": payload.profile, "device": payload.device, "cpuThreads": payload.cpuThreads,
-                "restorePunctuation": payload.restorePunctuation,
-                "settings": {k: settings[k] for k in ("language", "model", "device", "nproc", "outputFormat", "saveAudio", "useTimestamps", "restorePunctuation")},
-                "artifactPaths": {ext: str(history_store.artifact(job_id, ext)) for ext in ("txt", "md")}}
-    with jobs_lock:
-        if any(item.status in {"queued", "running", "cancelling"} for item in jobs.values()):
-            raise HTTPException(status_code=409, detail="Другая расшифровка уже выполняется.")
-        record = history_store.create(metadata)
-        job = JobState(id=job_id, settings=settings, source_name=source)
-        jobs[job_id] = job
-        job_process_controllers[job_id] = JobProcessController()
-        simple_worker_states[job_id] = "not_started"
-    worker = threading.Thread(target=run_job, args=(job_id, source), daemon=True)
-    worker.start()
+    record = _enqueue_simple_jobs([(source, payload.sourceType)], payload.profile, payload.device,
+                                  payload.cpuThreads, payload.restorePunctuation)[0]
     return _simple_shape(record, with_text=True)
+
+
+@app.post("/api/simple/jobs/batch", status_code=202)
+def create_simple_batch(payload: SimpleBatchRequest):
+    if not payload.paths:
+        raise HTTPException(status_code=400, detail="Добавьте хотя бы один файл.")
+    _validate_simple_common(payload.profile, payload.device, payload.cpuThreads)
+    accepted = []
+    rejected = []
+    for raw in payload.paths:
+        try:
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError("Укажите путь к файлу.")
+            candidate = Path(raw).expanduser()
+            if not candidate.is_absolute():
+                raise ValueError("Путь к файлу должен быть абсолютным.")
+            canonical = candidate.resolve()
+            if canonical.exists() and canonical.is_dir():
+                raise ValueError("Выберите файл, а не папку.")
+            accepted.append((str(canonical), "file"))
+        except Exception as exc:
+            rejected.append({"path": str(raw), "message": str(exc)})
+    records = _enqueue_simple_jobs(accepted, payload.profile, payload.device,
+                                   payload.cpuThreads, payload.restorePunctuation) if accepted else []
+    return {"jobs": [_simple_shape(record, with_text=False) for record in records],
+            "queue": get_simple_queue_snapshot(), "rejected": rejected}
 
 
 @app.post("/api/simple/jobs/{job_id}/cancel", status_code=202)

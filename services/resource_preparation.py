@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import Callable
 
 from services.download_progress import create_download_progress_tqdm
-from services.model_management import download_registered_model, get_model_status
+from services.model_management import ModelDownloadValidationError, download_registered_model, get_model_status
 from services.model_paths import HF_HUB_CACHE
+from services.task_errors import TaskFailure
 from huggingface_hub import snapshot_download
 
 PUNCTUATION_REPO = "kontur-ai/sbert_punc_case_ru"
@@ -24,8 +25,11 @@ PUNCTUATION_ALLOW_PATTERNS = [
 Progress = Callable[[dict], None]
 
 
-class ResourcePreparationError(RuntimeError):
+class ResourcePreparationError(TaskFailure):
     """A selected resource could not be prepared for this job."""
+
+    def __init__(self, message: str, code: str = "model_download_failed"):
+        super().__init__(message, code, stage="preparation")
 
 
 def _emit(progress: Progress | None, *, completed: int | None = None,
@@ -45,7 +49,7 @@ def _punctuation_dependencies_ready() -> bool:
 
 def _download_punctuation(progress: Progress | None) -> None:
     if not _punctuation_dependencies_ready():
-        raise ResourcePreparationError("Отключите пунктуацию и повторите попытку.")
+        raise ResourcePreparationError("Отключите пунктуацию и повторите попытку.", code="dependency_missing")
 
     from services.prepare_models import _punctuation_cached
 
@@ -85,7 +89,10 @@ def _download_punctuation(progress: Progress | None) -> None:
             "Не удалось загрузить модель. Проверьте подключение к интернету и повторите попытку."
         ) from exc
     if not _punctuation_cached():
-        raise ResourcePreparationError("Не удалось подготовить пунктуацию. Отключите пунктуацию и повторите попытку.")
+        raise ResourcePreparationError(
+            "Не удалось подготовить пунктуацию. Отключите пунктуацию и повторите попытку.",
+            code="model_unavailable",
+        )
 
 
 def ensure_selected_resources(settings: dict, on_progress: Progress | None = None) -> None:
@@ -107,9 +114,10 @@ def ensure_selected_resources(settings: dict, on_progress: Progress | None = Non
                 resolve_model_path(model_id, byte_progress=byte_progress)
                 if not _vulkan_cached(model_id):
                     raise ResourcePreparationError(
-                        "Не удалось загрузить модель. Проверьте подключение к интернету и повторите попытку."
+                        "Не удалось загрузить модель. Проверьте подключение к интернету и повторите попытку.",
+                        code="model_unavailable",
                     )
-            except ResourcePreparationError:
+            except TaskFailure:
                 raise
             except Exception as exc:
                 raise ResourcePreparationError(
@@ -129,6 +137,13 @@ def ensure_selected_resources(settings: dict, on_progress: Progress | None = Non
 
             try:
                 download_registered_model(model_id, byte_progress_callback=byte_progress)
+            except TaskFailure:
+                raise
+            except ModelDownloadValidationError as exc:
+                raise ResourcePreparationError(
+                    "Не удалось проверить подготовленную модель. Выберите другую модель или повторите попытку.",
+                    code="model_unavailable",
+                ) from exc
             except Exception as exc:
                 raise ResourcePreparationError(
                     "Не удалось загрузить модель. Проверьте подключение к интернету и повторите попытку."
@@ -175,13 +190,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         ensure_selected_resources({"model": args.model, "device": args.device,
                                    "restorePunctuation": args.restore_punctuation}, progress)
-    except ResourcePreparationError as exc:
+    except TaskFailure as exc:
         _emit_preparation_event({"type": "error", "stage": "preparation", "status": "failed",
-                                 "message": str(exc)})
+                                 "message": str(exc), "code": exc.code})
         return 1
     except Exception:
         _emit_preparation_event({"type": "error", "stage": "preparation", "status": "failed",
-                                 "message": "Не удалось подготовить ресурсы. Повторите попытку."})
+                                 "message": "Не удалось подготовить ресурсы. Повторите попытку.",
+                                 "code": "internal_error"})
         return 1
     _emit_preparation_event({"type": "progress", "stage": "preparation", "status": "completed",
                              "percent": 100, "completedBytes": None, "totalBytes": None,

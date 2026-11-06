@@ -1,5 +1,6 @@
 import unittest
 import io
+import json
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
@@ -45,16 +46,35 @@ class ResourcePreparationTests(unittest.TestCase):
     def test_vulkan_model_validation_failure_is_retryable_preparation_error(self):
         with (patch("services.prepare_models._vulkan_cached", return_value=False),
               patch("services.whisper_cpp.resolve_model_path", return_value="/model.bin")):
-            with self.assertRaisesRegex(resources.ResourcePreparationError, "Не удалось загрузить модель"):
+            with self.assertRaisesRegex(resources.ResourcePreparationError, "Не удалось загрузить модель") as raised:
                 resources.ensure_selected_resources({"model": "small", "device": "vulkan",
                                                       "restorePunctuation": False})
+        self.assertEqual(raised.exception.code, "model_unavailable")
 
     def test_missing_punctuation_dependencies_give_retry_action_without_install_attempt(self):
         with (patch.object(resources, "_punctuation_dependencies_ready", return_value=False),
               patch.object(resources, "snapshot_download") as snapshot):
-            with self.assertRaisesRegex(resources.ResourcePreparationError, "Отключите пунктуацию"):
+            with self.assertRaisesRegex(resources.ResourcePreparationError, "Отключите пунктуацию") as raised:
                 resources._download_punctuation(None)
+        self.assertEqual(raised.exception.code, "dependency_missing")
         snapshot.assert_not_called()
+
+    def test_model_network_failure_has_systemic_download_code(self):
+        with (patch.object(resources, "get_model_status", return_value={"status": "not_downloaded"}),
+              patch.object(resources, "download_registered_model", side_effect=OSError("offline"))):
+            with self.assertRaises(resources.ResourcePreparationError) as raised:
+                resources.ensure_selected_resources({"model": "small", "device": "cpu",
+                                                      "restorePunctuation": False})
+        self.assertEqual(raised.exception.code, "model_download_failed")
+
+    def test_cached_model_validation_failure_has_model_unavailable_code(self):
+        with (patch.object(resources, "get_model_status", return_value={"status": "not_downloaded"}),
+              patch.object(resources, "download_registered_model",
+                           side_effect=resources.ModelDownloadValidationError("bad cache"))):
+            with self.assertRaises(resources.ResourcePreparationError) as raised:
+                resources.ensure_selected_resources({"model": "small", "device": "cpu",
+                                                      "restorePunctuation": False})
+        self.assertEqual(raised.exception.code, "model_unavailable")
 
     def test_punctuation_download_is_filtered_and_validated(self):
         files = [type("Dry", (), {"file_size": 100, "is_cached": False, "will_download": True})()]
@@ -81,9 +101,22 @@ class ResourcePreparationTests(unittest.TestCase):
         lines = output.getvalue().splitlines()
         self.assertEqual(len(lines), 2)
         self.assertTrue(all(line.startswith(resources.PREPARATION_EVENT_PREFIX) for line in lines))
-        progress = __import__("json").loads(lines[0][len(resources.PREPARATION_EVENT_PREFIX):])
+        progress = json.loads(lines[0][len(resources.PREPARATION_EVENT_PREFIX):])
         self.assertEqual(progress["percent"], 25)
         self.assertEqual(progress["message"], "Загрузка модели распознавания")
+
+    def test_cli_error_event_contains_stable_error_code(self):
+        output = io.StringIO()
+        with (patch.object(resources, "ensure_selected_resources",
+                           side_effect=resources.ResourcePreparationError("Нет зависимости.", "dependency_missing")),
+              redirect_stdout(output)):
+            result = resources.main(["--model", "small", "--device", "cpu"])
+        self.assertEqual(result, 1)
+        event = json.loads(output.getvalue().strip()[len(resources.PREPARATION_EVENT_PREFIX):])
+        self.assertEqual(event["type"], "error")
+        self.assertEqual(event["stage"], "preparation")
+        self.assertEqual(event["code"], "dependency_missing")
+        self.assertEqual(event["message"], "Нет зависимости.")
 
 
 if __name__ == "__main__":

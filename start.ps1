@@ -188,6 +188,13 @@ function Test-NodeVersion([string]$NodePath) {
     return ($major -ge 22 -and ($major -gt 22 -or $minor -ge 12)) -or ($major -eq 20 -and $patch -ge 19)
 }
 
+function Test-NodeElectronVersion([string]$NodePath) {
+    $versionText = Get-ExecutableVersion $NodePath '--version'
+    if ($versionText -notmatch '^v(\d+)\.(\d+)\.(\d+)') { return $false }
+    $major = [int]$Matches[1]; $minor = [int]$Matches[2]
+    return ($major -ge 22 -and ($major -gt 22 -or $minor -ge 12))
+}
+
 function Install-LocalNode {
     $manifestUrl = 'https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt'
     $manifest = Join-Path $Runtime 'node-SHASUMS256.txt'
@@ -218,25 +225,28 @@ function Install-LocalNode {
     Remove-Item -LiteralPath $manifest -Force
 }
 
-function Ensure-Node {
+function Ensure-Node([switch]$ElectronRuntime) {
     $node = Find-CommandPath 'node.exe'
     $npm = Find-CommandPath 'npm.cmd'
-    if ($node -and $npm -and (Test-NodeVersion $node)) { return @($node, $npm) }
+    if ($node -and $npm -and (Test-NodeVersion $node) -and (-not $ElectronRuntime -or (Test-NodeElectronVersion $node))) { return @($node, $npm) }
     if (Test-Path -LiteralPath $NodeHome) {
         $nodeLocal = Get-ChildItem -LiteralPath $NodeHome -Filter node.exe -File -Recurse | Select-Object -First 1
         if ($nodeLocal) {
             $npmLocal = Join-Path $nodeLocal.DirectoryName 'npm.cmd'
-            if ((Test-Path -LiteralPath $npmLocal) -and (Test-NodeVersion $nodeLocal.FullName)) {
+            if ((Test-Path -LiteralPath $npmLocal) -and (Test-NodeVersion $nodeLocal.FullName) -and (-not $ElectronRuntime -or (Test-NodeElectronVersion $nodeLocal.FullName))) {
                 $env:Path = $nodeLocal.DirectoryName + ';' + $env:Path
                 return @($nodeLocal.FullName, $npmLocal)
             }
         }
     }
-    if ($CheckOnly) { Fail 'Нужен Node.js 20.19+ или 22.12+ с npm для сборки Vite. Запустите start.ps1 для локальной установки Node.js LTS.' }
+    if ($CheckOnly) {
+        if ($ElectronRuntime) { Fail 'Для Electron 45 нужен Node.js 22.12+ с npm. Запустите start.ps1, чтобы установить локальный Node.js 22 LTS.' }
+        Fail 'Нужен Node.js 20.19+ или 22.12+ с npm для сборки Vite. Запустите start.ps1 для локальной установки Node.js LTS.'
+    }
     Install-LocalNode
     $nodeLocal = Get-ChildItem -LiteralPath $NodeHome -Filter node.exe -File -Recurse | Select-Object -First 1
     $npmLocal = Join-Path $nodeLocal.DirectoryName 'npm.cmd'
-    if (-not $nodeLocal -or -not (Test-Path -LiteralPath $npmLocal) -or -not (Test-NodeVersion $nodeLocal.FullName)) { Fail 'Локальный Node.js был загружен, но не прошёл проверку версии или npm. Проверьте .runtime\node.' }
+    if (-not $nodeLocal -or -not (Test-Path -LiteralPath $npmLocal) -or -not (Test-NodeVersion $nodeLocal.FullName) -or ($ElectronRuntime -and -not (Test-NodeElectronVersion $nodeLocal.FullName))) { Fail 'Локальный Node.js был загружен, но не прошёл проверку версии или npm. Для Electron нужен Node.js 22.12+.' }
     $env:Path = $nodeLocal.DirectoryName + ';' + $env:Path
     return @($nodeLocal.FullName, $npmLocal)
 }
@@ -404,7 +414,8 @@ function Ensure-Environment {
         if ($LASTEXITCODE -ne 0) { Fail 'Не удалось создать .venv. Убедитесь, что установлен полноценный Python, а не только псевдоним Microsoft Store.' }
         $script:PythonSpec = Join-Path $Root '.venv\Scripts\python.exe'
     }
-    $nodeTools = Ensure-Node
+    if (-not $NoBrowser -or $SetupOnly) { $nodeTools = Ensure-Node -ElectronRuntime }
+    else { $nodeTools = Ensure-Node }
     $mediaTools = Ensure-Ffmpeg
     $script:WhisperExe = Get-WhisperExecutable
     $runtimeBinDirs = @((Split-Path $script:WhisperExe -Parent))
@@ -425,6 +436,23 @@ function Ensure-Environment {
             else { Write-Host 'Русская постобработка не установлена; запустите start.ps1 или start.ps1 -InstallPostprocess для установки.' }
         } else { Write-Host 'Проверка русской постобработки пропущена по -SkipPostprocess.' }
         if (-not (Test-Path (Join-Path $Root 'ui\dist\index.html'))) { Fail 'Production UI ещё не собран. Запустите start.ps1.' }
+        if (-not $NoBrowser) {
+            $electronCli = Join-Path $Root 'desktop\node_modules\electron\cli.js'
+            $electronExe = Join-Path $Root 'desktop\node_modules\electron\dist\electron.exe'
+            $desktopLockHash = Get-FileHashText (Join-Path $Root 'desktop\package-lock.json')
+            $desktopMarker = Join-Path $Runtime 'desktop-lock.sha256'
+            if (-not (Test-Path $electronExe) -or -not (Test-Path $desktopMarker) -or (Get-Content -Raw $desktopMarker).Trim() -ne $desktopLockHash) { Fail 'Electron desktop зависимости ещё не установлены для текущего lock-файла. Запустите start.ps1.' }
+            $savedElectronCache = $env:ELECTRON_CACHE
+            $env:ELECTRON_CACHE = Join-Path $Runtime 'cache\electron'
+            Push-Location (Join-Path $Root 'desktop')
+            try {
+                $electronVersionOutput = @(& $nodeTools[0] $electronCli '--version' 2>&1)
+                $electronExitCode = $LASTEXITCODE
+                $electronVersion = ($electronVersionOutput | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' } | Select-Object -First 1)
+                if ($electronExitCode -ne 0 -or $electronVersion -ne 'v45.2.3') { Fail 'Electron desktop зависимости повреждены или имеют неверную версию. Запустите start.ps1 для восстановления.' }
+            }
+            finally { Pop-Location; $env:ELECTRON_CACHE = $savedElectronCache }
+        }
         Invoke-CudaRuntimePreparation -NoDownload
         if ($SetupOnly) {
             Invoke-RequiredModelPreparation -NoDownload
@@ -494,6 +522,22 @@ function Ensure-Environment {
         finally { Pop-Location }
         Set-Content -LiteralPath $npmMarker -Value $lockHash -NoNewline -Encoding ascii
     }
+    $desktopDir = Join-Path $Root 'desktop'
+    $desktopLockHash = Get-FileHashText (Join-Path $desktopDir 'package-lock.json')
+    $desktopMarker = Join-Path $Runtime 'desktop-lock.sha256'
+    $installedDesktopHash = if (Test-Path $desktopMarker) { (Get-Content -Raw $desktopMarker).Trim() } else { '' }
+    if (-not (Test-Path (Join-Path $desktopDir 'node_modules\electron\dist\electron.exe')) -or $installedDesktopHash -ne $desktopLockHash) {
+        Write-Host 'Устанавливаю закреплённые Electron-зависимости в папку проекта...'
+        $savedElectronCache = $env:ELECTRON_CACHE
+        $env:ELECTRON_CACHE = Join-Path $Runtime 'cache\electron'
+        Push-Location $desktopDir
+        try {
+            & $nodeTools[1] ci --no-audit
+            if ($LASTEXITCODE -ne 0) { Fail 'Установка Electron через npm ci завершилась с ошибкой. Проверьте доступность npm registry и повторите запуск.' }
+            Set-Content -LiteralPath $desktopMarker -Value $desktopLockHash -NoNewline -Encoding ascii
+        }
+        finally { Pop-Location; $env:ELECTRON_CACHE = $savedElectronCache }
+    }
     $uiFingerprint = Get-UiFingerprint
     $buildMarker = Join-Path $Runtime 'ui-build.sha256'
     $distIndex = Join-Path $ui 'dist\index.html'
@@ -513,6 +557,14 @@ function Get-HealthyApp {
     try {
         $response = Invoke-RestMethod -Uri ($BackendUrl + '/api/health') -TimeoutSec 2
         if ($response.status -eq 'ok' -and $response.appId -eq $AppId) { return $response }
+    } catch { }
+    return $null
+}
+
+function Get-DesktopHostInfo {
+    try {
+        $response = Invoke-RestMethod -Uri ($BackendUrl + '/api/desktop/host') -TimeoutSec 2
+        if ($response.appId -eq $AppId -and $response.projectRoot -eq $Root) { return $response }
     } catch { }
     return $null
 }
@@ -614,60 +666,42 @@ function Stop-LaunchedBackend {
 }
 
 function Start-Backend {
-    $healthy = Get-HealthyApp
-    if ($healthy) {
-        Write-Host 'Video Transcribe уже запущен. Повторно открываю его интерфейс.'
-        if (-not $NoBrowser) { Start-Process $BackendUrl }
-        return
-    }
-    $listenerPid = Get-ListenerProcessId
-    if ($listenerPid) { Fail "Порт 8000 занят процессом PID $listenerPid, и это не Video Transcribe. Закройте приложение, использующее порт 8000, затем повторите запуск." }
     $pythonExe = Join-Path $Root '.venv\Scripts\python.exe'
-    $stdout = Join-Path $Logs 'backend.out.log'
-    $stderr = Join-Path $Logs 'backend.err.log'
-    $process = Start-Process -FilePath $pythonExe -ArgumentList @('-m', 'uvicorn', 'web_api:app', '--host', '127.0.0.1', '--port', '8000') -WorkingDirectory $Root -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
-    Write-LauncherPid $process.Id 0
-    $deadline = (Get-Date).AddSeconds(45)
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Milliseconds 500
-        $healthy = Get-HealthyApp
-        if ($healthy) {
-            $listenerPid = Get-ListenerProcessId
-            $listener = Get-ProcessInfo $listenerPid
-            if (-not $listener -or -not (Test-BackendCommand $listener) -or -not (Test-ProcessDescendsFrom $listenerPid $process.Id)) {
-                [void](Stop-VerifiedProcessTree $process.Id)
-                Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
-                Fail 'На порту 8000 ответил другой процесс; его PID или запуск не подтверждён, поэтому он не был остановлен.'
+    if ($NoBrowser) {
+        if (Get-DesktopHostInfo) { Write-Host 'Backend уже запущен.'; return }
+        $stdout = Join-Path $Logs 'backend.out.log'
+        $stderr = Join-Path $Logs 'backend.err.log'
+        $process = Start-Process -FilePath $pythonExe -ArgumentList @('-m', 'services.app_host') -WorkingDirectory $Root -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+        $deadline = (Get-Date).AddSeconds(45)
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+            if (Get-DesktopHostInfo) { Write-Host 'Backend готов: http://127.0.0.1:8000'; return }
+            $process.Refresh()
+            if ($process.HasExited) {
+                $tail = if (Test-Path $stderr) { (Get-Content -LiteralPath $stderr -Tail 12) -join "`n" } else { '' }
+                Fail "Backend не запустился. Проверьте порт 8000 и принадлежность существующего сервера Video Transcribe.`n$tail"
             }
-            Write-LauncherPid $process.Id $listenerPid
-            Write-Host 'Video Transcribe готов: http://127.0.0.1:8000'
-            if (-not $NoBrowser) { Start-Process $BackendUrl }
-            return
         }
-        $process.Refresh()
-        if ($process.HasExited) {
-            Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
-            $tail = if (Test-Path $stderr) { (Get-Content -LiteralPath $stderr -Tail 20) -join "`n" } else { '' }
-            Fail "Backend завершился при старте (код $($process.ExitCode)). Лог: $stderr`n$tail"
-        }
-        $listenerPid = Get-ListenerProcessId
-        if ($listenerPid -and -not (Test-ProcessDescendsFrom $listenerPid $process.Id)) {
-            [void](Stop-VerifiedProcessTree $process.Id)
-            Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
-            Fail 'Порт 8000 занял другой процесс во время запуска; браузер не открывался.'
-        }
-        if ($listenerPid) { Write-LauncherPid $process.Id $listenerPid }
+        Fail "Backend не подтвердил готовность за 45 секунд. Проверьте $stderr."
     }
-    $process.Refresh()
-    if (-not $process.HasExited) {
-        [void](Stop-VerifiedProcessTree $process.Id)
-        Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
-    }
-    Fail "Backend не подтвердил готовность за 45 секунд. Проверьте логи $stdout и $stderr."
+    $node = Ensure-Node -ElectronRuntime
+    $env:ELECTRON_CACHE = Join-Path $Runtime 'cache\electron'
+    $env:npm_config_cache = Join-Path $Runtime 'cache\npm'
+    $electron = Join-Path $Root 'desktop\node_modules\electron\cli.js'
+    & $node[0] $electron (Join-Path $Root 'desktop')
+    if ($LASTEXITCODE -ne 0) { Fail 'Desktop-приложение завершилось с ошибкой.' }
 }
 
 try {
-    if ($Stop) { Stop-LaunchedBackend; return }
+    if ($Stop) {
+        $pythonExe = Join-Path $Root '.venv\Scripts\python.exe'
+        if (Test-Path $pythonExe) {
+            & $pythonExe -m services.app_host --stop
+            if ($LASTEXITCODE -eq 0) { Write-Host 'Video Transcribe остановлен.'; return }
+        }
+        Stop-LaunchedBackend
+        return
+    }
     Ensure-Environment
     if ($CheckOnly -or $SetupOnly) { return }
     Start-Backend

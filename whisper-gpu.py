@@ -1,4 +1,5 @@
 import argparse
+import errno
 import json
 import os
 import shutil
@@ -19,6 +20,7 @@ from utils.download_best import Download
 from utils.get_audio import AudioProcess
 from utils.text_postprocess import build_polished_russian_text_from_segments, restore_russian_segment_text
 from services.runtime_devices import VULKAN_MODELS, get_device_details
+from services.task_errors import TaskFailure, failure_stage, is_invalid_source_error, is_out_of_memory_error
 from services.whisper_cpp import WhisperCppModel
 
 audio_file = "intermediate_audio_file.mp3"
@@ -173,6 +175,31 @@ def build_output_payload(segments: list[dict], stats, combined_text: str, use_ti
     return payload
 
 
+def _recognition_failure(exc: Exception, args, model) -> TaskFailure:
+    if isinstance(exc, TaskFailure):
+        return exc
+    if is_out_of_memory_error(exc):
+        return TaskFailure(str(exc), "out_of_memory", stage="recognition")
+    if is_invalid_source_error(exc):
+        return TaskFailure(str(exc), "source_invalid", stage="source")
+    effective_device = getattr(model, "effective_device", getattr(args, "device", "cpu"))
+    if effective_device in {"cuda", "vulkan"}:
+        return TaskFailure(str(exc), "device_error", stage="recognition")
+    return TaskFailure(str(exc), "transcription_failed", stage="recognition")
+
+
+def _initialization_failure(exc: Exception, device: str) -> TaskFailure:
+    if isinstance(exc, TaskFailure):
+        return exc
+    if is_out_of_memory_error(exc):
+        code = "out_of_memory"
+    elif device in {"cuda", "vulkan"}:
+        code = "device_unavailable"
+    else:
+        code = "model_unavailable"
+    return TaskFailure(str(exc), code, stage="recognition")
+
+
 def write_output(args, segments: list[dict], combined_text: str, stats, filename: str) -> tuple[Path, str]:
     output_suffix = args.output_format
     output_language = stats.language if args.language == "auto" else args.language
@@ -239,16 +266,22 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
         percent = min(99.0, processed * 100.0 / total) if total else None
         native_progress({"percent": percent, "processedSeconds": processed, "totalSeconds": total})
 
-    segments_iter, stats = model.transcribe(full_filepath, beam_size=args.beam_size, language=language)
-    if native_progress is not None and not uses_native_whisper_cpp:
-        # Consume the real lazy generator so progress follows completed segments.
-        segment_list = []
-        for index, segment in enumerate(segments_iter, start=1):
-            segment_list.append(segment)
-            report_segment_progress(segment, index)
-        segments = serialize_segments(segment_list)
-    else:
-        segments = serialize_segments(list(segments_iter))
+    try:
+        segments_iter, stats = model.transcribe(full_filepath, beam_size=args.beam_size, language=language)
+        if native_progress is not None and not uses_native_whisper_cpp:
+            # Consume the real lazy generator so progress follows completed segments.
+            segment_list = []
+            for index, segment in enumerate(segments_iter, start=1):
+                segment_list.append(segment)
+                report_segment_progress(segment, index)
+            segments = serialize_segments(segment_list)
+        else:
+            segments = serialize_segments(list(segments_iter))
+    except Exception as exc:
+        failure = _recognition_failure(exc, args, model)
+        if failure is exc:
+            raise
+        raise failure from exc
     if native_progress is not None and not uses_native_whisper_cpp:
         native_progress({"percent": 100.0 if total_seconds else None,
                          "processedSeconds": total_seconds, "totalSeconds": total_seconds})
@@ -287,7 +320,14 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
             postprocess_notice = "Пунктуация не восстановлена: обнаружен не русский язык."
             print(postprocess_notice)
 
-    output_path, rendered_result = write_output(args, segments, combined_text, stats, filename)
+    try:
+        output_path, rendered_result = write_output(args, segments, combined_text, stats, filename)
+    except TaskFailure:
+        raise
+    except Exception as exc:
+        storage_errors = {getattr(errno, "ENOSPC", -1), getattr(errno, "EDQUOT", -1)}
+        code = "storage_unavailable" if isinstance(exc, OSError) and exc.errno in storage_errors else "output_failed"
+        raise TaskFailure(str(exc), code, stage="result") from exc
     elapsed_seconds = timeit.default_timer() - start_time
 
     print(filename, " took ", "{:.1f}".format(elapsed_seconds), " seconds")
@@ -377,10 +417,14 @@ def initialize(args):
         if not detail:
             all_details = get_device_details()
             detail = next((item.get("reason") for item in all_details if item["id"] == requested), None)
-        raise RuntimeError(f"{requested.upper()} is unavailable: {detail or 'no usable device was detected.'}")
+        raise TaskFailure(f"{requested.upper()} is unavailable: {detail or 'no usable device was detected.'}",
+                          "device_unavailable", stage="recognition")
     if backend == "vulkan":
         if args.model_size not in VULKAN_MODELS:
-            raise RuntimeError(f"Model '{args.model_size}' cannot run on Vulkan. Supported models: {', '.join(VULKAN_MODELS)}")
+            raise TaskFailure(
+                f"Model '{args.model_size}' cannot run on Vulkan. Supported models: {', '.join(VULKAN_MODELS)}",
+                "model_unavailable", stage="recognition",
+            )
         try:
             model = WhisperCppModel(args.model_size, threads=args.nproc or logical_cpu_count(),
                                     progress=lambda message: print(message, flush=True))
@@ -391,7 +435,7 @@ def initialize(args):
             return AutoFallbackModel(model, args, "whisper.cpp Vulkan") if requested == "auto" else model
         except Exception as exc:
             if requested != "auto":
-                raise
+                raise _initialization_failure(exc, requested) from exc
             print(f"Vulkan initialization failed ({exc}); trying the next available backend.", flush=True)
             if "cuda" in available:
                 backend = "cuda"
@@ -405,10 +449,13 @@ def initialize(args):
             return AutoFallbackModel(model, args, "faster-whisper CUDA") if requested == "auto" else model
         except Exception as exc:
             if requested != "auto":
-                raise
+                raise _initialization_failure(exc, requested) from exc
             print(f"CUDA initialization failed ({exc}); retrying on CPU.", flush=True)
             backend = "cpu"
-    model = _faster_model(args, "cpu")
+    try:
+        model = _faster_model(args, "cpu")
+    except Exception as exc:
+        raise _initialization_failure(exc, "cpu") from exc
     model.effective_device = "cpu"
     model.effective_backend = "faster-whisper CPU (int8)"
     return model
@@ -433,8 +480,14 @@ def add_media_files(args, media_files, debug=False, verbose=False):
             emit_event(args, "stage", stage="source", status="in_progress", message=f"Downloading source from {args.filename}")
 
             download_progress = progress_callback(args, "source", "Загружаем исходный файл.") if getattr(args, "single_source", False) else None
-            download = Download(args, debug, progress_callback=download_progress)
-            audio_file_list, retcode = download.run()
+            try:
+                download = Download(args, debug, progress_callback=download_progress)
+            except Exception as exc:
+                raise TaskFailure(str(exc), "source_invalid", stage="source") from exc
+            try:
+                audio_file_list, retcode = download.run()
+            except Exception as exc:
+                raise TaskFailure(str(exc), "source_unavailable", stage="source") from exc
 
             if retcode == 0:
                 media_files += audio_file_list
@@ -442,12 +495,15 @@ def add_media_files(args, media_files, debug=False, verbose=False):
             else:
                 print(f"Could not process the URL, code {retcode} and audio file {audio_file_list} and args.output_name {args.output_name}")
                 close(args)
-                raise RuntimeError(f"URL download failed with code {retcode}")
+                raise TaskFailure(f"URL download failed with code {retcode}",
+                                  "source_unavailable", stage="source")
 
         elif Path(args.filename).exists():
             args.filename = Path(args.filename).resolve()
             media_files.append(str(args.filename))
             emit_event(args, "stage", stage="source", status="completed", message=f"Loaded local source {Path(args.filename).name}")
+        else:
+            raise TaskFailure("The selected source file does not exist.", "source_invalid", stage="source")
 
     elif findarg(args, "input_dir"):
         if Path(args.input_dir).exists():
@@ -456,7 +512,8 @@ def add_media_files(args, media_files, debug=False, verbose=False):
                 if filename.is_file():
                     media_files.append(str(filename))
         else:
-            raise FileNotFoundError(f"--input_dir argument does not specify a valid dir: {args.input_dir}")
+            raise TaskFailure(f"--input_dir argument does not specify a valid dir: {args.input_dir}",
+                              "source_invalid", stage="source")
 
         emit_event(args, "stage", stage="source", status="completed", message=f"Discovered {len(media_files)} local file(s)")
 
@@ -464,11 +521,11 @@ def add_media_files(args, media_files, debug=False, verbose=False):
         if args.filename:
             print("URL is not valid")
             close(args)
-            raise RuntimeError("URL is not valid")
+            raise TaskFailure("URL is not valid", "source_invalid", stage="source")
         else:
             print("There were no media to process")
             close(args)
-            raise RuntimeError("There were no media to process")
+            raise TaskFailure("There were no media to process", "source_invalid", stage="source")
 
     print(f"Media files found {len(media_files)}")
 
@@ -533,7 +590,6 @@ def main():
 
     if findarg(args, "output_name"):
         args.output_name, args.output_dir = get_fullpath(args.output_dir, args.output_name)
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     if args.quiet is False:
         print("-----------------------SETTINGS------------------------")
@@ -545,6 +601,10 @@ def main():
     print(f"audio_file={audio_file}")
 
     try:
+        try:
+            Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise TaskFailure(str(exc), "output_failed", stage="result") from exc
         add_media_files(args, media_files, debug=not args.quiet, verbose=args.verbose)
         model = None if getattr(args, "single_source", False) else initialize(args)
         results = []
@@ -581,8 +641,13 @@ def main():
                 print("Extracting audio")
                 emit_event(args, "stage", stage="audio", status="in_progress", message=f"Extracting audio from {Path(media_file).name}")
                 audio_progress = progress_callback(args, "audio", "Подготавливаем аудио.") if getattr(args, "single_source", False) else None
-                audio_processor.extract_audio(input_filepath=media_file, output_filepath=audio_file, overwrite=True,
-                                              progress_callback=audio_progress)
+                try:
+                    audio_processor.extract_audio(input_filepath=media_file, output_filepath=audio_file, overwrite=True,
+                                                  progress_callback=audio_progress)
+                except TaskFailure:
+                    raise
+                except Exception as exc:
+                    raise TaskFailure(str(exc), "source_invalid", stage="source") from exc
                 transcription_input = audio_file
                 extracted_audio = True
                 emit_event(args, "stage", stage="audio", status="completed", message=f"Audio ready for {Path(media_file).name}")
@@ -610,7 +675,9 @@ def main():
         return 0
 
     except Exception as exc:
-        emit_event(args, "error", stage="result", status="failed", message=str(exc))
+        failure = exc if isinstance(exc, TaskFailure) else TaskFailure(str(exc), "internal_error", stage="result")
+        emit_event(args, "error", stage=failure_stage(failure), status="failed",
+                   code=failure.code, message=str(exc))
         close(args)
         raise
 

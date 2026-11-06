@@ -62,7 +62,9 @@ def normalize_terminal_timing(record: dict[str, Any]) -> dict[str, Any]:
     if finished_time is not None and created_time is not None and finished_time < created_time:
         finished_at = None
         finished_time = None
-    if finished_time is None:
+    interrupted_unknown = (normalized.get("status") == "interrupted"
+                           and "finishedAt" in normalized and "durationSeconds" in normalized)
+    if finished_time is None and not interrupted_unknown:
         candidates = []
         for checkpoint in normalized.get("checkpoints", []):
             if not isinstance(checkpoint, dict):
@@ -93,6 +95,15 @@ class TranscriptionHistory:
                 id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                 status TEXT NOT NULL, stage TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
                 metadata TEXT NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS queue_entries (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id) ON DELETE CASCADE)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS queue_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                paused INTEGER NOT NULL DEFAULT 0,
+                reason_code TEXT,
+                reason_message TEXT)""")
+            db.execute("INSERT OR IGNORE INTO queue_state(singleton, paused) VALUES (1, 0)")
         self.recover_interrupted()
 
     @contextmanager
@@ -111,6 +122,7 @@ class TranscriptionHistory:
                       status="queued", stage="source", revision=0, detectedLanguage=None,
                       error=None, notice=None, progress=None,
                       finishedAt=None, durationSeconds=None,
+                      startedAt=None, queueWaitSeconds=None, processingDurationSeconds=None,
                       checkpoints=record.get("checkpoints") or initial_checkpoints())
         with self._lock, self._connect() as db:
             db.execute("INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?)", (
@@ -118,6 +130,102 @@ class TranscriptionHistory:
                 record["stage"], record["revision"], json.dumps(record, ensure_ascii=False)))
         self.job_dir(record["id"]).mkdir(parents=True, exist_ok=True)
         return record
+
+    def create_queued(self, metadata_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Create history rows and FIFO entries in one SQLite transaction."""
+        records = []
+        for metadata in metadata_items:
+            record = dict(metadata)
+            timestamp = now()
+            record.update(id=record.get("id") or uuid.uuid4().hex,
+                          createdAt=timestamp, updatedAt=timestamp, status="queued",
+                          stage="source", revision=0, detectedLanguage=None, error=None,
+                          notice=None, progress=None, finishedAt=None, durationSeconds=None,
+                          startedAt=None, queueWaitSeconds=None, processingDurationSeconds=None,
+                          checkpoints=record.get("checkpoints") or initial_checkpoints())
+            records.append(record)
+        with self._lock, self._connect() as db:
+            for record in records:
+                db.execute("INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?)", (
+                    record["id"], record["createdAt"], record["updatedAt"], record["status"],
+                    record["stage"], record["revision"], json.dumps(record, ensure_ascii=False)))
+                db.execute("INSERT INTO queue_entries(job_id) VALUES (?)", (record["id"],))
+        return records
+
+    def queue_ids(self) -> list[str]:
+        with self._lock, self._connect() as db:
+            rows = db.execute("""SELECT queue_entries.job_id FROM queue_entries
+                JOIN jobs ON jobs.id=queue_entries.job_id WHERE jobs.status='queued'
+                ORDER BY queue_entries.sequence""").fetchall()
+        return [row[0] for row in rows]
+
+    def queued_records(self) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as db:
+            rows = db.execute("""SELECT jobs.metadata FROM queue_entries
+                JOIN jobs ON jobs.id=queue_entries.job_id WHERE jobs.status='queued'
+                ORDER BY queue_entries.sequence""").fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def queued_records(self) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as db:
+            rows = db.execute("""SELECT jobs.metadata FROM queue_entries
+                JOIN jobs ON jobs.id=queue_entries.job_id ORDER BY queue_entries.sequence""").fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def dequeue_next(self) -> str | None:
+        with self._lock, self._connect() as db:
+            while True:
+                row = db.execute("""SELECT queue_entries.sequence, queue_entries.job_id, jobs.status
+                    FROM queue_entries LEFT JOIN jobs ON jobs.id=queue_entries.job_id
+                    ORDER BY queue_entries.sequence LIMIT 1""").fetchone()
+                if row is None:
+                    return None
+                if row["status"] == "queued":
+                    return row["job_id"]
+                db.execute("DELETE FROM queue_entries WHERE sequence=?", (row["sequence"],))
+
+    def mark_started(self, job_id: str) -> dict[str, Any] | None:
+        """Atomically claim the FIFO head after the worker owns the runtime slot."""
+        with self._lock, self._connect() as db:
+            row = db.execute("SELECT metadata, status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["status"] != "queued":
+                return None
+            record = json.loads(row["metadata"])
+            started_at = now()
+            record.update(status="running", startedAt=started_at,
+                          queueWaitSeconds=_duration_seconds(record.get("createdAt"), started_at),
+                          stage="preparation", updatedAt=started_at)
+            db.execute("DELETE FROM queue_entries WHERE job_id=?", (job_id,))
+            db.execute("UPDATE jobs SET updated_at=?, status='running', stage='preparation', metadata=? WHERE id=?",
+                       (started_at, json.dumps(record, ensure_ascii=False), job_id))
+            return record
+
+    def remove_queued(self, job_id: str) -> bool:
+        with self._lock, self._connect() as db:
+            cursor = db.execute("DELETE FROM queue_entries WHERE job_id=?", (job_id,))
+            return cursor.rowcount > 0
+
+    def queue_position(self, job_id: str) -> int | None:
+        with self._lock, self._connect() as db:
+            row = db.execute("""SELECT sequence FROM queue_entries JOIN jobs ON jobs.id=queue_entries.job_id
+                WHERE job_id=? AND jobs.status='queued'""", (job_id,)).fetchone()
+            if row is None:
+                return None
+            rank = db.execute("""SELECT COUNT(*) FROM queue_entries JOIN jobs ON jobs.id=queue_entries.job_id
+                WHERE sequence<=? AND jobs.status='queued'""", (row[0],)).fetchone()[0]
+        return int(rank)
+
+    def queue_state(self) -> dict[str, Any]:
+        with self._lock, self._connect() as db:
+            row = db.execute("SELECT paused, reason_code, reason_message FROM queue_state WHERE singleton=1").fetchone()
+        return {"paused": bool(row[0]),
+                "pauseReason": ({"code": row[1], "message": row[2]} if row[1] else None)}
+
+    def set_queue_state(self, paused: bool, reason: dict[str, str] | None = None) -> dict[str, Any]:
+        with self._lock, self._connect() as db:
+            db.execute("UPDATE queue_state SET paused=?, reason_code=?, reason_message=? WHERE singleton=1",
+                       (int(paused), (reason or {}).get("code"), (reason or {}).get("message")))
+        return self.queue_state()
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         with self._lock, self._connect() as db:
@@ -132,20 +240,48 @@ class TranscriptionHistory:
             record = json.loads(row[0])
             previous_status = record.get("status")
             prior_timing = normalize_terminal_timing(record) if previous_status in TERMINAL_STATUSES else None
+            prior_elapsed_fields = {key: record.get(key) for key in
+                                    ("startedAt", "queueWaitSeconds", "processingDurationSeconds")}
             record.update(changes)
+            if previous_status == "queued" and record.get("status") == "running":
+                started_at = now()
+                record["startedAt"] = started_at
+                record["queueWaitSeconds"] = _duration_seconds(record.get("createdAt"), started_at)
             if previous_status in TERMINAL_STATUSES:
                 record["finishedAt"] = prior_timing["finishedAt"]
                 record["durationSeconds"] = prior_timing["durationSeconds"]
+                record.update(prior_elapsed_fields)
             elif record.get("status") in TERMINAL_STATUSES:
                 record["finishedAt"] = now()
                 record["durationSeconds"] = _duration_seconds(record.get("createdAt"), record["finishedAt"])
+                started_at = _parse_time(record.get("startedAt"))
+                finished_at = _parse_time(record.get("finishedAt"))
+                created_at = _parse_time(record.get("createdAt"))
+                if started_at:
+                    record["queueWaitSeconds"] = _duration_seconds(record.get("createdAt"), started_at.isoformat())
+                elif record.get("startedAt") is None and previous_status in {"queued", "cancelling"}:
+                    record["queueWaitSeconds"] = _duration_seconds(record.get("createdAt"), record["finishedAt"])
+                else:
+                    record["queueWaitSeconds"] = None
+                record["processingDurationSeconds"] = (
+                    max(0.0, (finished_at - started_at).total_seconds())
+                    if started_at and finished_at and finished_at >= started_at
+                    else (0.0 if (started_at is None and record.get("startedAt") is None
+                                  and previous_status in {"queued", "cancelling"} and created_at and finished_at)
+                          else None))
             else:
                 record["finishedAt"] = None
                 record["durationSeconds"] = None
+                if record.get("status") == "queued":
+                    record["startedAt"] = None
+                    record["queueWaitSeconds"] = None
+                    record["processingDurationSeconds"] = None
             record["updatedAt"] = now()
             db.execute("UPDATE jobs SET updated_at=?, status=?, stage=?, revision=?, metadata=? WHERE id=?",
                        (record["updatedAt"], record["status"], record["stage"], record["revision"],
                         json.dumps(record, ensure_ascii=False), job_id))
+            if record.get("status") in TERMINAL_STATUSES:
+                db.execute("DELETE FROM queue_entries WHERE job_id=?", (job_id,))
             return record
 
     def list(self) -> list[dict[str, Any]]:
@@ -229,18 +365,36 @@ class TranscriptionHistory:
 
     def recover_interrupted(self) -> None:
         with self._lock, self._connect() as db:
-            rows = db.execute("SELECT id, metadata FROM jobs WHERE status IN ('queued','running','cancelling')").fetchall()
+            rows = db.execute("""SELECT id, metadata, status FROM jobs
+                WHERE status IN ('queued','running','cancelling')""").fetchall()
             for row in rows:
                 record = json.loads(row["metadata"])
+                if row["status"] == "queued":
+                    if db.execute("SELECT 1 FROM queue_entries WHERE job_id=?", (row["id"],)).fetchone():
+                        continue
                 timestamp = now()
                 for checkpoint in record.get("checkpoints", []):
                     if checkpoint.get("status") == "active":
                         checkpoint.update(status="failed", completedAt=timestamp)
                 record.update(status="interrupted", error="Приложение было закрыто до завершения расшифровки.",
-                              updatedAt=timestamp, finishedAt=timestamp,
-                              durationSeconds=_duration_seconds(record.get("createdAt"), timestamp))
+                              updatedAt=timestamp, finishedAt=None, durationSeconds=None,
+                              queueWaitSeconds=(record.get("queueWaitSeconds")
+                                                if record.get("startedAt") else None),
+                              processingDurationSeconds=None)
                 db.execute("UPDATE jobs SET status=?, updated_at=?, metadata=? WHERE id=?",
                            (record["status"], record["updatedAt"], json.dumps(record, ensure_ascii=False), row["id"]))
+                db.execute("DELETE FROM queue_entries WHERE job_id=?", (row["id"],))
+            pending = db.execute("SELECT 1 FROM queue_entries LIMIT 1").fetchone() is not None
+            if pending:
+                db.execute("UPDATE queue_state SET paused=1, "
+                           "reason_code=COALESCE(reason_code, 'recovered_pending'), "
+                           "reason_message=COALESCE(reason_message, 'После перезапуска очередь приостановлена.') "
+                           "WHERE singleton=1")
+            else:
+                state = db.execute("SELECT reason_code FROM queue_state WHERE singleton=1").fetchone()
+                if state is not None and state[0] in {None, "recovered_pending"}:
+                    db.execute("UPDATE queue_state SET paused=0, reason_code=NULL, reason_message=NULL "
+                               "WHERE singleton=1")
 
     def delete(self, job_id: str) -> bool:
         with self._lock:
@@ -253,5 +407,6 @@ class TranscriptionHistory:
             if path.exists():
                 shutil.rmtree(path)
             with self._connect() as db:
+                db.execute("DELETE FROM queue_entries WHERE job_id=?", (job_id,))
                 db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
             return True
