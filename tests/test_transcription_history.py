@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -40,6 +41,8 @@ class TranscriptionHistoryTests(unittest.TestCase):
         recovered = reopened.get("a" * 32)["checkpoints"]
         self.assertEqual(recovered[3]["status"], "failed")
         self.assertIsNotNone(recovered[3]["completedAt"])
+        self.assertIsNotNone(reopened.get("a" * 32)["finishedAt"])
+        self.assertGreaterEqual(reopened.get("a" * 32)["durationSeconds"], 0)
 
     def test_jobs_start_with_stable_six_stage_checkpoint_contract(self):
         record = self.record()
@@ -47,6 +50,97 @@ class TranscriptionHistoryTests(unittest.TestCase):
                          ["preparation", "source", "audio", "recognition", "postprocess", "result"])
         self.assertTrue(all(item["status"] == "pending" for item in record["checkpoints"]))
         self.assertIsNone(record["progress"])
+        self.assertIsNone(record["finishedAt"])
+        self.assertIsNone(record["durationSeconds"])
+
+    def test_first_terminal_transition_freezes_timing_across_edits_and_updates(self):
+        self.record()
+        self.store.update("a" * 32, status="completed")
+        first = self.store.get("a" * 32)
+        self.assertIsInstance(first["finishedAt"], str)
+        self.assertGreaterEqual(first["durationSeconds"], 0)
+        self.store.write_text("a" * 32, "initial", 0)
+        edited = self.store.replace_text("a" * 32, "updated", 0)
+        self.store.update("a" * 32, notice="edited after completion")
+        after = self.store.get("a" * 32)
+        self.assertEqual(edited["finishedAt"], first["finishedAt"])
+        self.assertEqual(edited["durationSeconds"], first["durationSeconds"])
+        self.assertEqual(after["finishedAt"], first["finishedAt"])
+        self.assertEqual(after["durationSeconds"], first["durationSeconds"])
+
+    def test_failed_and_cancelled_first_terminal_transitions_get_timing(self):
+        for job_id, status in (("b" * 32, "failed"), ("c" * 32, "cancelled")):
+            self.store.create({"id": job_id, "sourceType": "file", "source": str(self.input),
+                               "profile": "quality", "device": "cpu", "cpuThreads": 2,
+                               "restorePunctuation": False})
+            self.store.update(job_id, status=status)
+            record = self.store.get(job_id)
+            self.assertIsInstance(record["finishedAt"], str)
+            self.assertGreaterEqual(record["durationSeconds"], 0)
+
+    def test_invalid_creation_time_keeps_terminal_duration_null(self):
+        self.record()
+        record = self.store.get("a" * 32)
+        record["createdAt"] = "invalid timestamp"
+        with self.store._connect() as db:
+            db.execute("UPDATE jobs SET metadata=? WHERE id=?", (json.dumps(record), "a" * 32))
+        self.store.update("a" * 32, status="failed")
+        terminal = self.store.get("a" * 32)
+        self.assertIsInstance(terminal["finishedAt"], str)
+        self.assertIsNone(terminal["durationSeconds"])
+
+    def test_interrupted_recovery_preserves_null_duration_for_invalid_creation_time(self):
+        self.record()
+        record = self.store.get("a" * 32)
+        record.update(createdAt="invalid timestamp", status="running")
+        with self.store._connect() as db:
+            db.execute("UPDATE jobs SET status='running', metadata=? WHERE id=?",
+                       (json.dumps(record), "a" * 32))
+        reopened = TranscriptionHistory(self.root)
+        recovered = reopened.get("a" * 32)
+        self.assertEqual(recovered["status"], "interrupted")
+        self.assertIsInstance(recovered["finishedAt"], str)
+        self.assertIsNone(recovered["durationSeconds"])
+
+    def test_legacy_terminal_timing_uses_checkpoint_not_updated_at(self):
+        created = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        finished = created + timedelta(seconds=41.5)
+        later_updated = finished + timedelta(hours=8)
+        self.record()
+        record = self.store.get("a" * 32)
+        record["createdAt"] = created.isoformat()
+        record["status"] = "completed"
+        record["updatedAt"] = later_updated.isoformat()
+        record.pop("finishedAt", None)
+        record.pop("durationSeconds", None)
+        record["checkpoints"][-1].update(status="completed", completedAt=finished.isoformat())
+        with self.store._connect() as db:
+            db.execute("UPDATE jobs SET status='completed', metadata=? WHERE id=?",
+                       (json.dumps(record), "a" * 32))
+        raw = self.store.get("a" * 32)
+        from services.transcription_history import normalize_terminal_timing
+        normalized = normalize_terminal_timing(raw)
+        self.assertEqual(normalized["finishedAt"], finished.isoformat())
+        self.assertAlmostEqual(normalized["durationSeconds"], 41.5)
+        self.assertNotEqual(normalized["durationSeconds"], (later_updated - created).total_seconds())
+
+    def test_legacy_terminal_without_valid_checkpoint_does_not_use_updated_at(self):
+        created = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        self.record()
+        record = self.store.get("a" * 32)
+        record.update(createdAt=created.isoformat(), status="failed",
+                      updatedAt=(created + timedelta(days=3)).isoformat())
+        record.pop("finishedAt", None)
+        record.pop("durationSeconds", None)
+        for checkpoint in record["checkpoints"]:
+            checkpoint["completedAt"] = "not-a-date"
+        with self.store._connect() as db:
+            db.execute("UPDATE jobs SET status='failed', metadata=? WHERE id=?",
+                       (json.dumps(record), "a" * 32))
+        from services.transcription_history import normalize_terminal_timing
+        normalized = normalize_terminal_timing(self.store.get("a" * 32))
+        self.assertIsNone(normalized["finishedAt"])
+        self.assertIsNone(normalized["durationSeconds"])
 
     def test_latest_matches_newest_history_item(self):
         self.record()

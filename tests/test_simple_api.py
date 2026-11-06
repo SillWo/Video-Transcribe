@@ -246,6 +246,8 @@ class SimpleApiTests(unittest.TestCase):
         self.assertEqual([item["stage"] for item in created["checkpoints"]],
                          ["preparation", "source", "audio", "recognition", "postprocess", "result"])
         self.assertIsNone(created["progress"])
+        self.assertIsNone(created["finishedAt"])
+        self.assertIsNone(created["durationSeconds"])
         self.assertEqual(self.client.get(f"/api/simple/jobs/{created['id']}").json()["id"], created["id"])
 
     def test_progress_is_bounded_persisted_and_does_not_expose_pipeline_messages(self):
@@ -314,6 +316,9 @@ class SimpleApiTests(unittest.TestCase):
             web_api.run_job(success_id, "C:/source.wav")
         completed = web_api.history_store.get(success_id)
         self.assertEqual(completed["status"], "completed")
+        completed_shape = self.client.get(f"/api/simple/jobs/{success_id}").json()
+        self.assertIsInstance(completed_shape["finishedAt"], str)
+        self.assertGreaterEqual(completed_shape["durationSeconds"], 0)
         self.assertEqual(web_api.history_store.read_text(success_id), "recognized words")
         self.assertEqual(web_api.history_store.artifact(success_id, "md").read_text(encoding="utf-8"), "recognized words")
 
@@ -325,6 +330,9 @@ class SimpleApiTests(unittest.TestCase):
             web_api.run_job(failed_id, "C:/source.wav")
         failed = web_api.history_store.get(failed_id)
         self.assertEqual(failed["status"], "failed")
+        failed_shape = self.client.get(f"/api/simple/jobs/{failed_id}").json()
+        self.assertIsInstance(failed_shape["finishedAt"], str)
+        self.assertGreaterEqual(failed_shape["durationSeconds"], 0)
         self.assertEqual(failed["stage"], "recognition")
         self.assertIsNone(web_api.history_store.read_text(failed_id))
         self.assertEqual(web_api.jobs[failed_id].error, "Не удалось завершить расшифровку. Проверьте ссылку или файл и попробуйте снова.")
@@ -404,6 +412,8 @@ class SimpleApiTests(unittest.TestCase):
         self.assertEqual(second.status_code, 202)
         self.assertEqual(first.json()["status"], "cancelling")
         self.assertEqual(second.json()["status"], "cancelling")
+        self.assertIsNone(first.json()["finishedAt"])
+        self.assertIsNone(first.json()["durationSeconds"])
         self.assertEqual(self.client.delete(f"/api/simple/history/{body['id']}").status_code, 409)
         with patch.object(web_api.simple_profiles, "resolve", return_value=("small", "cpu")):
             self.assertEqual(self.client.post("/api/simple/jobs", json=self.payload()).status_code, 409)
@@ -411,6 +421,8 @@ class SimpleApiTests(unittest.TestCase):
         cancelled = self.client.get(f"/api/simple/jobs/{body['id']}").json()
         self.assertEqual(cancelled["status"], "cancelled")
         self.assertIsNone(cancelled["error"])
+        self.assertIsInstance(cancelled["finishedAt"], str)
+        self.assertGreaterEqual(cancelled["durationSeconds"], 0)
         prep = next(item for item in cancelled["checkpoints"] if item["stage"] == "preparation")
         self.assertEqual(prep["status"], "cancelled")
         self.assertEqual(self.client.post(f"/api/simple/jobs/{body['id']}/cancel").json()["status"], "cancelled")
@@ -558,6 +570,8 @@ class SimpleApiTests(unittest.TestCase):
         response = self.client.post(f"/api/simple/jobs/{body['id']}/cancel")
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json()["status"], "cancelled")
+        self.assertIsInstance(response.json()["finishedAt"], str)
+        self.assertGreaterEqual(response.json()["durationSeconds"], 0)
 
     def test_simple_public_payload_hides_old_script_directions(self):
         job_id = "9" * 32

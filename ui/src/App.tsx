@@ -13,6 +13,7 @@ type SimpleJob = {
   id: string; sourceType: 'url' | 'file'; source: string; profile: Profile; device: Device
   cpuThreads: number; restorePunctuation: boolean; status: JobStatus
   stage: Stage; progress?: JobProgress | null; checkpoints?: Checkpoint[]; createdAt: string
+  finishedAt?: string | null; durationSeconds?: number | null
   updatedAt: string; detectedLanguage: string | null; error: string | null; notice: string | null
   revision: number; text: string | null; files: { format: 'txt' | 'md'; name: string; downloadUrl: string }[]
 }
@@ -86,7 +87,23 @@ function elapsedSince(value: string | null | undefined, now: number) {
   const start = Date.parse(value)
   return Number.isFinite(start) ? Math.max(0, Math.floor((now - start) / 1000)) : null
 }
-function clockText(seconds: number) { return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}` }
+function clockText(seconds: number) {
+  const safe = Math.max(0, Math.floor(seconds))
+  const hours = Math.floor(safe / 3600)
+  const minutes = Math.floor((safe % 3600) / 60)
+  const remainder = safe % 60
+  return hours > 0
+    ? `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`
+    : `${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`
+}
+function terminalDurationSeconds(item: Pick<SimpleJob, 'status' | 'durationSeconds' | 'finishedAt' | 'createdAt'>) {
+  if (isActiveStatus(item.status)) return null
+  if (typeof item.durationSeconds === 'number' && Number.isFinite(item.durationSeconds) && item.durationSeconds >= 0) return Math.floor(item.durationSeconds)
+  if (!item.finishedAt) return null
+  const created = Date.parse(item.createdAt)
+  const finished = Date.parse(item.finishedAt)
+  return Number.isFinite(created) && Number.isFinite(finished) && finished >= created ? Math.floor((finished - created) / 1000) : null
+}
 function sourceHeading(item: SimpleJob) {
   if (item.sourceType === 'file') return item.source.split(/[\\/]/).filter(Boolean).pop() || 'Локальный файл'
   try { return new URL(item.source).hostname || 'Источник видео' } catch { return 'Источник видео' }
@@ -180,6 +197,7 @@ function Workspace() {
         clearedLatestJob = null
         if (cleared) { try { localStorage.removeItem('video-transcribe-cleared-latest') } catch { /* optional marker */ } }
         if (!deletedLatest) {
+          setClockNow(Date.now())
           jobRef.current = restored; setJob(restored)
           setSourceType(restored.sourceType); setSource(restored.sourceType === 'url' ? restored.source : ''); setSelectedPath(restored.sourceType === 'file' ? restored.source : '')
           nextPrefs = { ...nextPrefs, profile: restored.profile, device: restored.device, cpuThreads: restored.cpuThreads, restorePunctuation: restored.restorePunctuation }
@@ -337,6 +355,7 @@ function Workspace() {
       await flushDraft()
       const payload = { sourceType, ...(sourceType === 'url' ? { url: source.trim() } : { path: selectedPath }), profile: prefs.profile, device: prefs.device, cpuThreads: prefs.cpuThreads, restorePunctuation: prefs.restorePunctuation }
       const created = await fetchJson<SimpleJob>('/api/simple/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+      setClockNow(Date.now())
       jobRef.current = created; setJob(created); setNotice(created.notice ?? ''); putDraft('', created.revision)
     } catch (error) {
       const code = errorStatus(error)
@@ -344,7 +363,7 @@ function Workspace() {
       if (code === 409) {
         try {
           const { job: existing } = await api.session()
-          if (existing) { jobRef.current = existing; setJob(existing); setSourceType(existing.sourceType); setSource(existing.sourceType === 'url' ? existing.source : ''); setSelectedPath(existing.sourceType === 'file' ? existing.source : ''); if (existing.status === 'completed') putDraft(existing.text ?? '', existing.revision) }
+          if (existing) { setClockNow(Date.now()); jobRef.current = existing; setJob(existing); setSourceType(existing.sourceType); setSource(existing.sourceType === 'url' ? existing.source : ''); setSelectedPath(existing.sourceType === 'file' ? existing.source : ''); if (existing.status === 'completed') putDraft(existing.text ?? '', existing.revision) }
         } catch { /* keep the actionable conflict message */ }
       }
     } finally { setSubmitBusy(false) }
@@ -456,14 +475,15 @@ function Workspace() {
           const percent = typeof progress?.percent === 'number' && Number.isFinite(progress.percent) ? Math.max(0, Math.min(100, progress.percent)) : null
           const quiet = Boolean(active && progress?.updatedAt && ['preparation', 'source'].includes(currentStage) && elapsedSince(progress.updatedAt, clockNow) !== null && elapsedSince(progress.updatedAt, clockNow)! > 20)
           const stageAge = elapsedSince(currentCheckpoint?.startedAt ?? null, clockNow)
-          const totalAge = elapsedSince(job.createdAt, clockNow)
           const detail = stageProgressText(progress)
           const heading = progress?.message?.trim() || stageName(currentStage)
+          const overallSeconds = active ? elapsedSince(job.createdAt, clockNow) : terminalDurationSeconds(job)
           const retryableCancellation = retryableCancel || isRetryableCancellation(job)
           const cancellationPending = job.status === 'cancelling' && !retryableCancellation
           return <section className={`work-panel ${job.status}`} aria-label="Этапы расшифровки">
-            {active && <div className="work-current"><div className="work-current-icon"><LoaderCircle size={19} className="spin" /></div><div className="work-current-copy"><strong>{heading}</strong><p>{quiet ? 'Ожидаем данные…' : stageName(currentStage)}{stageAge !== null ? <span className="elapsed"> · {clockText(stageAge)}</span> : totalAge !== null ? <span className="elapsed"> · С начала задачи {clockText(totalAge)}</span> : null}</p></div><span className={`status-badge ${job.status}`}>{statusLabels[job.status]}</span><button type="button" className="cancel-button" onClick={() => void cancelJob()} disabled={cancelBusy || cancellationPending} aria-label={cancelBusy || cancellationPending ? 'Отменяем задачу' : 'Отмена'}>{cancelBusy || cancellationPending ? <LoaderCircle size={16} className="spin" /> : <X size={16} />}<span>{cancelBusy || cancellationPending ? 'Отменяем…' : 'Отмена'}</span></button></div>}
+            {active && <div className="work-current"><div className="work-current-icon"><LoaderCircle size={19} className="spin" /></div><div className="work-current-copy"><strong>{heading}</strong><p>{quiet ? 'Ожидаем данные…' : stageName(currentStage)}{stageAge !== null && <span className="elapsed"> · этап {clockText(stageAge)}</span>}</p></div><span className={`status-badge ${job.status}`}>{statusLabels[job.status]}</span><button type="button" className="cancel-button" onClick={() => void cancelJob()} disabled={cancelBusy || cancellationPending} aria-label={cancelBusy || cancellationPending ? 'Отменяем задачу' : 'Отмена'}>{cancelBusy || cancellationPending ? <LoaderCircle size={16} className="spin" /> : <X size={16} />}<span>{cancelBusy || cancellationPending ? 'Отменяем…' : 'Отмена'}</span></button></div>}
             {!active && <div className={`work-terminal-heading ${job.status}`}><span>{job.status === 'completed' ? <Check size={18} /> : job.status === 'cancelled' ? <Minus size={18} /> : <AlertCircle size={18} />}</span><div><strong>{job.status === 'completed' ? 'Расшифровка готова' : job.status === 'cancelled' ? 'Отменена' : job.status === 'failed' ? 'Не удалось расшифровать видео' : 'Задача была прервана'}</strong><p>{job.status === 'completed' ? 'Все этапы завершены.' : job.status === 'cancelled' ? 'Обработка остановлена. Можно запустить новую задачу.' : safeError(job.error) || 'Можно запустить новую попытку с текущими настройками.'}</p></div></div>}
+            <div className="overall-time"><span>Общее время</span><strong>{overallSeconds !== null ? clockText(overallSeconds) : active ? '—' : 'Время не сохранено'}</strong></div>
             {checkpoints.length > 0 && <ol className="checkpoint-list" aria-label="Этапы обработки">
               {checkpoints.map((checkpoint) => <li key={checkpoint.stage} className={`checkpoint ${checkpoint.status}${checkpoint.stage === currentStage && active ? ' current' : ''}`} aria-current={checkpoint.stage === currentStage && active ? 'step' : undefined}>
                 <span className="checkpoint-icon" aria-hidden="true">{checkpoint.status === 'completed' ? <Check size={14} /> : checkpoint.status === 'active' && active ? <LoaderCircle size={14} className="spin" /> : checkpoint.status === 'failed' ? <AlertCircle size={14} /> : checkpoint.status === 'skipped' ? <span className="skip-mark">–</span> : checkpoint.status === 'cancelled' ? <Minus size={14} /> : <Circle size={12} />}</span>
@@ -539,7 +559,7 @@ function HistoryPage() {
   return <main className="history-page">
     <div className="history-title"><div><p className="eyebrow">Ваши задачи</p><h1>История расшифровок</h1><p>Готовые тексты и файлы можно скачать в любое время.</p></div><button className="primary-button" onClick={() => navigate('/')}><Plus size={17} />Новая расшифровка</button></div>
     {error && <div className="inline-error" role="alert">{error}<button className="text-button" onClick={() => { setLoading(true); void refresh() }}>Повторить</button></div>}
-    {loading ? <div className="history-empty">Загружаем историю…</div> : items.length === 0 ? <div className="history-empty"><div className="welcome-icon"><FileText size={22} /></div><h2>Пока нет расшифровок</h2><p>Созданные задачи появятся здесь.</p></div> : <div className="history-table-wrap"><table className="history-table"><thead><tr><th>Источник</th><th>Дата</th><th>Статус</th><th>Файлы</th><th><span className="sr-only">Действия</span></th></tr></thead><tbody>{items.map((item) => { const activeItem = isActiveStatus(item.status); const downloadable = item.status !== 'cancelled'; return <tr key={item.id}><td className="history-source" title={sourceLabel(item)}>{sourceLabel(item)}</td><td className="history-date">{formatDate(item.createdAt)}</td><td><span className={`status-badge ${item.status}`}>{statusLabels[item.status]}</span></td><td><div className="file-links">{downloadable && item.files.some((file) => file.format === 'txt') && <button className="file-link" onClick={() => void downloadHistory(item, 'txt')}>TXT</button>}{downloadable && item.files.some((file) => file.format === 'md') && <button className="file-link" onClick={() => void downloadHistory(item, 'md')}>MD</button>}</div></td><td><button className="icon-button" aria-label={`Удалить ${sourceLabel(item)}`} title={activeItem || item.id === activeId ? 'Нельзя удалить выполняющуюся задачу' : 'Удалить из истории'} disabled={activeItem || item.id === activeId} onClick={() => setDeleteTarget(item)}><Trash2 size={17} /></button></td></tr> })}</tbody></table></div>}
+    {loading ? <div className="history-empty">Загружаем историю…</div> : items.length === 0 ? <div className="history-empty"><div className="welcome-icon"><FileText size={22} /></div><h2>Пока нет расшифровок</h2><p>Созданные задачи появятся здесь.</p></div> : <div className="history-table-wrap"><table className="history-table"><thead><tr><th>Источник</th><th>Дата</th><th>Статус</th><th>Файлы</th><th><span className="sr-only">Действия</span></th></tr></thead><tbody>{items.map((item) => { const activeItem = isActiveStatus(item.status); const downloadable = item.status !== 'cancelled'; const duration = terminalDurationSeconds(item); return <tr key={item.id}><td className="history-source" title={sourceLabel(item)}>{sourceLabel(item)}</td><td className="history-date"><span>{formatDate(item.createdAt)}</span>{duration !== null && <small>Длительность · {clockText(duration)}</small>}</td><td><span className={`status-badge ${item.status}`}>{statusLabels[item.status]}</span></td><td><div className="file-links">{downloadable && item.files.some((file) => file.format === 'txt') && <button className="file-link" onClick={() => void downloadHistory(item, 'txt')}>TXT</button>}{downloadable && item.files.some((file) => file.format === 'md') && <button className="file-link" onClick={() => void downloadHistory(item, 'md')}>MD</button>}</div></td><td><button className="icon-button" aria-label={`Удалить ${sourceLabel(item)}`} title={activeItem || item.id === activeId ? 'Нельзя удалить выполняющуюся задачу' : 'Удалить из истории'} disabled={activeItem || item.id === activeId} onClick={() => setDeleteTarget(item)}><Trash2 size={17} /></button></td></tr> })}</tbody></table></div>}
     {deleteTarget && <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setDeleteTarget(null) }}><section className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-title"><h2 id="delete-title">Удалить расшифровку?</h2><p>{sourceLabel(deleteTarget)}</p><p>Это удалит задачу из истории и файлы результата.</p><div className="dialog-actions"><button className="secondary-button" onClick={() => setDeleteTarget(null)} disabled={busy}>Отмена</button><button className="danger-button" onClick={() => void remove()} disabled={busy}>{busy ? 'Удаляем…' : 'Удалить'}</button></div></section></div>}
   </main>
 }

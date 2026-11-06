@@ -19,11 +19,65 @@ def now() -> str:
 
 
 STAGES = ("preparation", "source", "audio", "recognition", "postprocess", "result")
+TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 
 
 def initial_checkpoints() -> list[dict[str, Any]]:
     return [{"stage": stage, "status": "pending", "startedAt": None, "completedAt": None}
             for stage in STAGES]
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _duration_seconds(created_at: Any, finished_at: Any) -> float | None:
+    created = _parse_time(created_at)
+    finished = _parse_time(finished_at)
+    if created is None or finished is None or finished < created:
+        return None
+    return max(0.0, (finished - created).total_seconds())
+
+
+def normalize_terminal_timing(record: dict[str, Any]) -> dict[str, Any]:
+    """Return stable timing fields, recovering legacy terminal rows from checkpoints only."""
+    normalized = dict(record)
+    if normalized.get("status") not in TERMINAL_STATUSES:
+        normalized["finishedAt"] = None
+        normalized["durationSeconds"] = None
+        return normalized
+
+    created_at = normalized.get("createdAt")
+    finished_at = normalized.get("finishedAt")
+    created_time = _parse_time(created_at)
+    finished_time = _parse_time(finished_at)
+    if finished_time is not None and created_time is not None and finished_time < created_time:
+        finished_at = None
+        finished_time = None
+    if finished_time is None:
+        candidates = []
+        for checkpoint in normalized.get("checkpoints", []):
+            if not isinstance(checkpoint, dict):
+                continue
+            value = checkpoint.get("completedAt")
+            parsed = _parse_time(value)
+            elapsed = _duration_seconds(created_at, value)
+            if parsed is not None and elapsed is not None:
+                candidates.append((parsed, value))
+        finished_at = max(candidates, default=(None, None), key=lambda pair: pair[0])[1]
+
+    elapsed = _duration_seconds(created_at, finished_at)
+    normalized["finishedAt"] = finished_at if finished_time is not None or elapsed is not None else None
+    normalized["durationSeconds"] = elapsed
+    return normalized
 
 
 class TranscriptionHistory:
@@ -56,6 +110,7 @@ class TranscriptionHistory:
         record.update(id=record.get("id") or uuid.uuid4().hex, createdAt=now(), updatedAt=now(),
                       status="queued", stage="source", revision=0, detectedLanguage=None,
                       error=None, notice=None, progress=None,
+                      finishedAt=None, durationSeconds=None,
                       checkpoints=record.get("checkpoints") or initial_checkpoints())
         with self._lock, self._connect() as db:
             db.execute("INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?)", (
@@ -75,7 +130,18 @@ class TranscriptionHistory:
             if not row:
                 return None
             record = json.loads(row[0])
+            previous_status = record.get("status")
+            prior_timing = normalize_terminal_timing(record) if previous_status in TERMINAL_STATUSES else None
             record.update(changes)
+            if previous_status in TERMINAL_STATUSES:
+                record["finishedAt"] = prior_timing["finishedAt"]
+                record["durationSeconds"] = prior_timing["durationSeconds"]
+            elif record.get("status") in TERMINAL_STATUSES:
+                record["finishedAt"] = now()
+                record["durationSeconds"] = _duration_seconds(record.get("createdAt"), record["finishedAt"])
+            else:
+                record["finishedAt"] = None
+                record["durationSeconds"] = None
             record["updatedAt"] = now()
             db.execute("UPDATE jobs SET updated_at=?, status=?, stage=?, revision=?, metadata=? WHERE id=?",
                        (record["updatedAt"], record["status"], record["stage"], record["revision"],
@@ -170,7 +236,9 @@ class TranscriptionHistory:
                 for checkpoint in record.get("checkpoints", []):
                     if checkpoint.get("status") == "active":
                         checkpoint.update(status="failed", completedAt=timestamp)
-                record.update(status="interrupted", error="Приложение было закрыто до завершения расшифровки.", updatedAt=timestamp)
+                record.update(status="interrupted", error="Приложение было закрыто до завершения расшифровки.",
+                              updatedAt=timestamp, finishedAt=timestamp,
+                              durationSeconds=_duration_seconds(record.get("createdAt"), timestamp))
                 db.execute("UPDATE jobs SET status=?, updated_at=?, metadata=? WHERE id=?",
                            (record["status"], record["updatedAt"], json.dumps(record, ensure_ascii=False), row["id"]))
 

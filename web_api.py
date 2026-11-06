@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from services.transcription_history import TranscriptionHistory
+from services.transcription_history import TranscriptionHistory, normalize_terminal_timing
 from services import native_file_picker, simple_profiles
 from services.resource_preparation import PREPARATION_EVENT_PREFIX, ResourcePreparationError
 from services.job_processes import JobCancelled, JobProcessController
@@ -1340,6 +1340,7 @@ def _simple_public_url(raw: str) -> str:
 
 
 def _simple_shape(record: dict[str, Any], *, with_text: bool) -> dict[str, Any]:
+    record = normalize_terminal_timing(record)
     files = []
     for ext in ("txt", "md"):
         path = history_store.artifact(record["id"], ext)
@@ -1352,6 +1353,7 @@ def _simple_shape(record: dict[str, Any], *, with_text: bool) -> dict[str, Any]:
         "profile": record["profile"], "device": record["device"], "cpuThreads": record["cpuThreads"],
         "restorePunctuation": record["restorePunctuation"], "status": record["status"],
         "stage": record["stage"], "createdAt": record["createdAt"], "updatedAt": record["updatedAt"],
+        "finishedAt": record["finishedAt"], "durationSeconds": record["durationSeconds"],
         "detectedLanguage": record.get("detectedLanguage"), "error": concise_simple_error(record.get("error")),
         "notice": record.get("notice"), "revision": record.get("revision", 0), "files": files,
         "progress": record.get("progress"), "checkpoints": record.get("checkpoints", []),
