@@ -187,5 +187,3 @@ class TranscriptionHistory:
             with self._connect() as db:
                 db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
             return True
-
-\n
