@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Iterator
 
 from services.model_paths import HF_HUB_CACHE
+from services.model_paths import MODEL_TEMP_DIR
 from services.download_progress import create_download_progress_tqdm
 from services.runtime_devices import VULKAN_MODELS, find_whisper_cpp_executable
 from services.task_errors import TaskFailure, is_invalid_source_error, is_out_of_memory_error
@@ -28,6 +29,7 @@ class WhisperCppSegment:
     start: float
     end: float
     text: str
+    words: list[dict] | None = None
 
 
 def model_filename(model_name: str) -> str:
@@ -97,7 +99,45 @@ def _timestamp_ms(value) -> int:
     return int(float(value))
 
 
-def parse_whisper_cpp_json(payload: dict) -> tuple[list[WhisperCppSegment], SimpleNamespace]:
+def _token_words(tokens, segment_start, segment_end, expected_text):
+    """Reassemble real -ojf token text and millisecond offsets into lexical words."""
+    groups = []
+    current = None
+    special = re.compile(r"^\[.*\]$")
+    for token in tokens:
+        value = str(token.get("text", ""))
+        if not value or special.match(value.strip()):
+            continue
+        try:
+            offsets = token.get("offsets") or {}
+            start, end = float(offsets["from"]) / 1000, float(offsets["to"]) / 1000
+        except (KeyError, TypeError, ValueError):
+            start = end = 0.0
+        # Whisper text tokens use a leading space to mark word boundaries;
+        # punctuation tokens have no leading space and stay with the word.
+        begins_word = bool(value[:1].isspace())
+        if begins_word and current is not None:
+            groups.append(current)
+            current = None
+        if current is None:
+            current = {"text": value, "start": start, "end": end}
+        else:
+            current["text"] += value
+            if end > start:
+                if current["end"] <= current["start"]:
+                    current["start"] = start
+                current["end"] = max(current["end"], end)
+    if current is not None:
+        groups.append(current)
+    words = groups
+    reconstructed = "".join(str(token.get("text", "")) for token in tokens
+                            if token.get("text") and not special.match(str(token.get("text", "")).strip())).strip()
+    if reconstructed != expected_text.strip():
+        return None
+    return words
+
+
+def parse_whisper_cpp_json(payload: dict, *, word_timestamps: bool = False) -> tuple[list[WhisperCppSegment], SimpleNamespace]:
     rows = payload.get("transcription")
     if not isinstance(rows, list):
         raise RuntimeError("whisper.cpp returned malformed JSON: missing transcription array.")
@@ -112,7 +152,10 @@ def parse_whisper_cpp_json(payload: dict) -> tuple[list[WhisperCppSegment], Simp
             text = str(row["text"]).strip()
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError(f"whisper.cpp returned malformed segment {index}.") from exc
-        segments.append(WhisperCppSegment(start, end, text))
+        words = None
+        if word_timestamps and isinstance(row.get("tokens"), list):
+            words = _token_words(row["tokens"], start, end, text)
+        segments.append(WhisperCppSegment(start, end, text, words))
     language = payload.get("result", {}).get("language") or "unknown"
     return segments, SimpleNamespace(language=language, language_probability=None)
 
@@ -149,9 +192,10 @@ class WhisperCppModel:
         self.transcription_progress = transcription_progress
         _add_runtime_dll_path(self.executable)
 
-    def transcribe(self, media_path: str, beam_size: int = 5, language: str | None = None):
+    def transcribe(self, media_path: str, beam_size: int = 5, language: str | None = None,
+                   word_timestamps: bool = False):
         ffmpeg = _find_ffmpeg()
-        with tempfile.TemporaryDirectory(prefix="vt-whisper-") as temp_dir:
+        with tempfile.TemporaryDirectory(prefix="vt-whisper-", dir=MODEL_TEMP_DIR) as temp_dir:
             wav_path = Path(temp_dir) / "audio.wav"
             output_base = Path(temp_dir) / "transcript"
             converted = subprocess.run(
@@ -163,7 +207,12 @@ class WhisperCppModel:
                 raise TaskFailure(f"FFmpeg could not prepare audio: {detail[-1200:]}",
                                   "source_invalid", stage="source")
             command = [self.executable, "-m", str(self.model_path), "-f", str(wav_path), "-l", language or "auto",
-                       "-t", str(self.threads), "-bs", str(max(1, int(beam_size))), "-oj", "-of", str(output_base)]
+                       "-t", str(self.threads), "-bs", str(max(1, int(beam_size))),
+                       "-ojf" if word_timestamps else "-oj", "-of", str(output_base)]
+            if word_timestamps:
+                profile = str(getattr(self, "model_name", "small")).lower().replace("-", ".")
+                dtw = "large.v3.turbo" if "turbo" in profile else ("large.v3" if "large" in profile else "small")
+                command += ["-dtw", dtw]
             selected_index = getattr(self, "gpu_index", None)
             if selected_index is None and os.environ.get("VT_VULKAN_DEVICE_INDEX"):
                 try:
@@ -235,7 +284,7 @@ class WhisperCppModel:
                 raise TaskFailure(f"whisper.cpp created malformed JSON output: {exc}",
                                   "transcription_failed", stage="recognition") from exc
             try:
-                result = parse_whisper_cpp_json(payload)
+                result = parse_whisper_cpp_json(payload, word_timestamps=word_timestamps)
             except TaskFailure:
                 raise
             except Exception as exc:

@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
+const { buildUiNavigationUrl } = require('./ui_entry.cjs');
 
 const PROJECT = path.resolve(__dirname, '..');
 const configuredRuntime = process.env.VT_SIMPLE_RUNTIME_DIR || path.join(PROJECT, '.runtime');
@@ -127,7 +128,9 @@ function createWindow() {
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.on('close', event => { if (!quitting) { event.preventDefault(); mainWindow.hide(); } });
   mainWindow.on('closed', () => { mainWindow = null; });
-  mainWindow.loadURL(host.backendUrl);
+  mainWindow.loadURL(buildUiNavigationUrl(host.backendUrl, path.join(PROJECT, 'ui', 'dist', 'index.html')), {
+    extraHeaders: 'Cache-Control: no-cache\r\nPragma: no-cache\r\n',
+  });
   mainWindow.once('ready-to-show', () => mainWindow?.show());
 }
 function createTray() {

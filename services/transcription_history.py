@@ -18,7 +18,7 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-STAGES = ("preparation", "source", "audio", "recognition", "postprocess", "result")
+STAGES = ("preparation", "source", "audio", "recognition", "diarization", "postprocess", "result")
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 
 
@@ -306,6 +306,32 @@ class TranscriptionHistory:
         if extension not in {"txt", "md"}:
             raise ValueError("Unsupported artifact format")
         return self.job_dir(job_id) / f"transcript.{extension}"
+
+    def write_diarization(self, job_id: str, value: dict[str, Any]) -> Path:
+        """Atomically persist structured diarization separately from editable transcripts."""
+        directory = self.job_dir(job_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / "diarization.json"
+        temp = target.with_name(target.name + f".{uuid.uuid4().hex}.tmp")
+        try:
+            with temp.open("w", encoding="utf-8", newline="") as stream:
+                json.dump(value, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp, target)
+        finally:
+            temp.unlink(missing_ok=True)
+        return target
+
+    def read_diarization(self, job_id: str) -> dict[str, Any] | None:
+        path = self.job_dir(job_id) / "diarization.json"
+        if not path.is_file():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
 
     def write_text(self, job_id: str, text: str, revision: int) -> None:
         directory = self.job_dir(job_id)

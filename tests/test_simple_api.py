@@ -267,7 +267,7 @@ class SimpleApiTests(unittest.TestCase):
         self.assertNotIn("text", history)
         self.assertEqual(history["source"], "https://example.org/watch/123")
         self.assertEqual([item["stage"] for item in created["checkpoints"]],
-                         ["preparation", "source", "audio", "recognition", "postprocess", "result"])
+                         ["preparation", "source", "audio", "recognition", "diarization", "postprocess", "result"])
         self.assertIsNone(created["progress"])
         self.assertIsNone(created["finishedAt"])
         self.assertIsNone(created["durationSeconds"])

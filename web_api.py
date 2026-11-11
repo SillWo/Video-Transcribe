@@ -9,11 +9,12 @@ import threading
 import uuid
 import ipaddress
 import socket
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from services.model_paths import MODEL_STORAGE_ROOT
 import psutil
@@ -22,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from services.transcription_history import TranscriptionHistory, normalize_terminal_timing
+from services.transcription_history import TranscriptionHistory, STAGES, initial_checkpoints, normalize_terminal_timing
 from services import native_file_picker, simple_profiles
 from services.resource_preparation import PREPARATION_EVENT_PREFIX, ResourcePreparationError
 from services.job_processes import JobCancelled, JobProcessController
@@ -98,6 +99,8 @@ class SimpleJobRequest(BaseModel):
     device: str
     cpuThreads: int
     restorePunctuation: bool
+    diarizationEnabled: bool = False
+    diarizationDevice: str = "auto"
 
 
 class SimpleTextRequest(BaseModel):
@@ -111,6 +114,8 @@ class SimpleBatchRequest(BaseModel):
     device: str
     cpuThreads: int
     restorePunctuation: bool
+    diarizationEnabled: bool = False
+    diarizationDevice: str = "auto"
 
 
 @dataclass
@@ -231,6 +236,8 @@ def _hydrate_simple_job(record: dict[str, Any]) -> JobState:
                     _sourceType=record.get("sourceType"), _profile=record.get("profile"),
                     _requestedDevice=record.get("device"),
                     _outputDir=str(history_store.job_dir(job_id) / "output"))
+    settings["diarizationEnabled"] = bool(record.get("diarizationEnabled", False))
+    settings["diarizationDevice"] = record.get("diarizationDevice", "auto")
     job = JobState(id=job_id, settings=settings, status=record.get("status", "queued"),
                    created_at=record.get("createdAt", utc_now()),
                    updated_at=record.get("updatedAt", utc_now()),
@@ -339,7 +346,7 @@ def update_job(job_id: str, **changes) -> None:
                 simple_changes["errorCode"] = changes["errorCode"]
             if "notice" in changes:
                 simple_changes["notice"] = changes["notice"]
-            allowed = {"status", "stage", "detectedLanguage", "error", "errorCode", "notice"}
+            allowed = {"status", "stage", "detectedLanguage", "error", "errorCode", "notice", "diarization"}
             history_store.update(job_id, **{k: v for k, v in simple_changes.items() if k in allowed})
 
 
@@ -426,7 +433,7 @@ def append_log(job_id: str, line: str) -> None:
 
 
 def _checkpoint_update(job_id: str, stage: str, status: str) -> None:
-    if stage not in {"preparation", "source", "audio", "recognition", "postprocess", "result"}:
+    if stage not in STAGES:
         return
     record = history_store.get(job_id)
     if not record:
@@ -479,7 +486,7 @@ def _simple_progress(job_id: str, stage: str, payload: dict[str, Any]) -> None:
     safe_messages = {
         "source": "Загрузка источника", "audio": "Подготовка аудио",
         "recognition": "Распознавание речи", "postprocess": "Обработка текста",
-        "result": "Подготовка результата",
+        "diarization": "Определение говорящих", "result": "Подготовка результата",
     }
     if stage == "preparation":
         allowed_prep = {"Загрузка модели распознавания", "Загрузка модели пунктуации",
@@ -524,7 +531,7 @@ def _simple_stage_event(job_id: str, stage: str, status: str | None) -> None:
         status = "active"
     if status == "in_progress":
         status = "active"
-    order = ["preparation", "source", "audio", "recognition", "postprocess", "result"]
+    order = list(STAGES)
     record = history_store.get(job_id)
     if record and stage in order:
         target_index = order.index(stage)
@@ -532,6 +539,9 @@ def _simple_stage_event(job_id: str, stage: str, status: str | None) -> None:
             old_stage = checkpoint.get("stage")
             if checkpoint.get("status") == "active" and old_stage in order and order.index(old_stage) < target_index:
                 _checkpoint_update(job_id, old_stage, "completed")
+    if stage == "diarization" and record and not record.get("diarizationEnabled", False):
+        _checkpoint_update(job_id, stage, "skipped")
+        return
     if status == "active":
         _checkpoint_update(job_id, stage, "active")
     else:
@@ -582,7 +592,10 @@ def _finalize_simple_job(job_id: str, status: str, *, error: str | None = None,
         if record is None:
             return False
         checkpoints = [dict(item) for item in record.get("checkpoints", [])]
+        diarization = _diarization_record(record)
         prior_artifacts = None
+        prior_sidecar: bytes | None = None
+        sidecar_path = history_store.job_dir(job_id) / "diarization.json"
         if status == "completed":
             for checkpoint in checkpoints:
                 if checkpoint.get("status") == "active":
@@ -598,7 +611,16 @@ def _finalize_simple_job(job_id: str, status: str, *, error: str | None = None,
             for extension in ("txt", "md"):
                 artifact = history_store.artifact(job_id, extension)
                 prior_artifacts[extension] = artifact.read_bytes() if artifact.exists() else None
-            history_store.write_text(job_id, transcript or "", revision=0)
+            prior_sidecar = sidecar_path.read_bytes() if sidecar_path.exists() else None
+            diarization = _diarization_record(record, terminal_status="completed")
+            if record.get("diarizationEnabled"):
+                full_diarization = history_store.read_diarization(job_id) or dict(diarization)
+                full_diarization.update({key: value for key, value in diarization.items()
+                                         if key != "turns"})
+                turns = full_diarization.get("turns")
+                full_diarization["turns"] = turns if isinstance(turns, list) else []
+            else:
+                full_diarization = None
         elif status == "cancelled":
             current = next((item for item in checkpoints if item.get("status") == "active"), None)
             if current is None:
@@ -613,19 +635,28 @@ def _finalize_simple_job(job_id: str, status: str, *, error: str | None = None,
                 current.update(status="cancelled", startedAt=current.get("startedAt") or stamp,
                                completedAt=stamp)
                 final_stage = current.get("stage") or final_stage
+            if record.get("diarizationEnabled"):
+                diarization = _diarization_record(record, terminal_status="cancelled")
         elif status in {"failed", "interrupted"}:
             for checkpoint in checkpoints:
                 if checkpoint.get("status") == "active":
                     checkpoint.update(status="failed", completedAt=utc_now())
+            if record.get("diarizationEnabled"):
+                diarization = _diarization_record(record, terminal_status=status)
         progress = record.get("progress")
         if status == "completed":
             progress = {"stage": "result", "percent": 100, "completedBytes": None,
                         "totalBytes": None, "processedSeconds": None, "totalSeconds": None,
                         "message": "Расшифровка завершена", "updatedAt": utc_now()}
         try:
+            if status == "completed":
+                history_store.write_text(job_id, transcript or "", revision=0)
+                if full_diarization is not None:
+                    history_store.write_diarization(job_id, full_diarization)
             updated = history_store.update(job_id, status=status, stage=final_stage,
                                            error=final_error, errorCode=error_code if status == "failed" else None,
-                                           checkpoints=checkpoints, progress=progress)
+                                           checkpoints=checkpoints, progress=progress,
+                                           diarization=diarization)
             if updated is None:
                 raise LookupError(job_id)
         except Exception:
@@ -636,6 +667,11 @@ def _finalize_simple_job(job_id: str, status: str, *, error: str | None = None,
                         artifact.unlink(missing_ok=True)
                     else:
                         artifact.write_bytes(content)
+                sidecar_path = history_store.job_dir(job_id) / "diarization.json"
+                if prior_sidecar is None:
+                    sidecar_path.unlink(missing_ok=True)
+                else:
+                    sidecar_path.write_bytes(prior_sidecar)
             raise
         job.status = status
         job.stage = final_stage
@@ -668,8 +704,55 @@ def _task_failure_message(code: str, fallback: str | None = None) -> str:
         "device_error": "Не удалось запустить выбранное устройство. Выберите CPU или проверьте драйвер видеокарты.",
         "out_of_memory": "Не хватает памяти для этой модели. Выберите более лёгкий профиль или CPU.",
         "storage_unavailable": "Не удалось сохранить результат. Проверьте свободное место на диске.",
+        "diarization_failed": "Не удалось определить говорящих. Повторите обработку или отключите диаризацию.",
     }
     return messages.get(code, "Не удалось завершить обработку. Повторите попытку.")
+
+
+def _diarization_failure_message(code: str) -> str:
+    return {
+        "device_unavailable": "Устройство диаризации недоступно. Выберите другое устройство или проверьте его готовность.",
+        "device_error": "Не удалось запустить устройство диаризации. Проверьте установленную среду.",
+        "model_unavailable": "Модель диаризации недоступна локально. Подготовьте её и повторите попытку.",
+        "diarization_failed": "Не удалось определить говорящих. Повторите обработку или отключите диаризацию.",
+    }.get(code, "Не удалось определить говорящих. Повторите обработку или отключите диаризацию.")
+
+
+def _validate_diarization_device(value: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 512:
+        raise HTTPException(status_code=400, detail="diarizationDevice должен быть непустой строкой длиной не более 512 символов.")
+    if any(unicodedata.category(char) == "Cc" for char in value):
+        raise HTTPException(status_code=400, detail="diarizationDevice не должен содержать управляющие символы.")
+    return value
+
+
+def _diarization_record(record: dict[str, Any], *, terminal_status: str | None = None) -> dict[str, Any]:
+    enabled = bool(record.get("diarizationEnabled", False))
+    requested = record.get("diarizationDevice", "auto")
+    current = record.get("diarization") if isinstance(record.get("diarization"), dict) else {}
+    if not enabled:
+        return {"status": "disabled", "requestedDevice": requested,
+                "effectiveDevice": None}
+    if terminal_status is None and record.get("status") in {"completed", "failed", "cancelled", "interrupted"}:
+        terminal_status = record["status"]
+    status = current.get("status")
+    if terminal_status in {"cancelled", "interrupted", "failed"} and status != "completed":
+        status = terminal_status
+    elif terminal_status == "completed" and status not in {"completed", "failed"}:
+        status = "completed"
+    elif not status:
+        status = "pending" if record.get("status") == "queued" else "active"
+    return {"status": status, "requestedDevice": current.get("requestedDevice", requested),
+            "effectiveDevice": current.get("effectiveDevice")}
+
+
+def _set_diarization_state(job_id: str, status: str, **values) -> None:
+    record = history_store.get(job_id)
+    if not record:
+        return
+    current = _diarization_record(record)
+    current.update(status=status, **values)
+    history_store.update(job_id, diarization=current)
 
 
 def _pause_simple_queue_for_error(code: str) -> None:
@@ -793,6 +876,16 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
             controller.check_cancelled()
             return
         update_job(job_id, stage="preparation")
+        if job.settings.get("diarizationEnabled"):
+            _set_diarization_state(job_id, "pending")
+            # Resolve before resource preparation/ASR so a missing diarization
+            # runtime or device fails without starting Whisper downloads.
+            from services.diarization_runtime import resolve_diarization_device
+
+            controller.check_cancelled()
+            resolved = resolve_diarization_device(job.settings.get("diarizationDevice", "auto"))
+            _set_diarization_state(job_id, "pending", requestedDevice=job.settings.get("diarizationDevice", "auto"),
+                                   effectiveDevice={key: resolved.get(key) for key in ("id", "name", "backend")})
         if job.settings.get("_requestedDevice") == "gpu":
             try:
                 resolved_model, backend_device = simple_profiles.resolve(job.settings["_profile"], "gpu")
@@ -877,6 +970,9 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
             if payload["type"] == "stage":
                 stage = payload.get("stage", "recognition")
                 update_job(job_id, stage=stage)
+                if stage == "diarization":
+                    diar_status = "active" if payload.get("status") in {"active", "in_progress"} else payload.get("status", "active")
+                    _set_diarization_state(job_id, diar_status)
                 _simple_stage_event(job_id, stage, payload.get("status"))
                 _simple_progress(job_id, stage, {
                     "percent": 100 if payload.get("status") == "completed" else None,
@@ -885,6 +981,8 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
             elif payload["type"] == "progress":
                 stage = payload.get("stage", "recognition")
                 update_job(job_id, stage=stage)
+                if stage == "diarization":
+                    _set_diarization_state(job_id, "active")
                 _simple_stage_event(job_id, stage, payload.get("status", "active"))
                 _simple_progress(job_id, stage, payload)
             elif payload["type"] == "result":
@@ -903,6 +1001,8 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
                 pipeline_error_code = payload.get("code")
                 stage = payload.get("stage", "recognition")
                 update_job(job_id, stage=stage, error=pipeline_error, errorCode=pipeline_error_code)
+                if stage == "diarization":
+                    _set_diarization_state(job_id, "failed")
                 _simple_stage_event(job_id, stage, "failed")
                 append_log(job_id, f"[error] {pipeline_error or 'Unknown error'}")
 
@@ -960,8 +1060,12 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
             if isinstance(exc, TaskFailure):
                 code = exc.code
                 stage = exc.stage or get_job(job_id).stage
-                message = _task_failure_message(code, str(exc))
+                message = (_diarization_failure_message(code) if stage == "diarization"
+                           else _task_failure_message(code, str(exc)))
+                if stage == "diarization":
+                    _set_diarization_state(job_id, "failed")
                 update_job(job_id, stage=stage, error=message, errorCode=code)
+                _simple_stage_event(job_id, stage, "failed")
             elif isinstance(exc, OSError) and getattr(exc, "errno", None) in {28, 122, 5}:
                 code = "storage_unavailable"
                 message = _task_failure_message(code)
@@ -1263,6 +1367,32 @@ def read_output_text(output_path: str | None) -> str | None:
 
 def apply_result(job_id: str, result: dict[str, Any]) -> None:
     rendered_result = read_output_text(result.get("output_path")) or result.get("rendered_result")
+    with jobs_lock:
+        job = jobs.get(job_id)
+        is_simple = bool(job and job.settings.get("_simple"))
+    simple_record = history_store.get(job_id) if is_simple else None
+    diarization_summary = None
+    if is_simple and simple_record is not None:
+        full_diarization = result.get("diarization")
+        if not isinstance(full_diarization, dict):
+            diarization_summary = _diarization_record(simple_record)
+            full_diarization = {**diarization_summary, "turns": []}
+        else:
+            full_diarization = {"status": full_diarization.get("status", "completed"),
+                                "requestedDevice": full_diarization.get(
+                                    "requestedDevice", simple_record.get("diarizationDevice", "auto")),
+                                "effectiveDevice": full_diarization.get("effectiveDevice"),
+                                "turns": full_diarization.get("turns")
+                                if isinstance(full_diarization.get("turns"), list) else []}
+            diarization_summary = {key: full_diarization[key]
+                                   for key in ("status", "requestedDevice", "effectiveDevice")}
+        if simple_record.get("diarizationEnabled"):
+            history_store.write_diarization(job_id, full_diarization)
+        history_store.update(job_id, diarization=diarization_summary)
+        source_input = result.get("input")
+        if simple_record.get("sourceType") == "url" and isinstance(source_input, str) and source_input.strip():
+            source_filename = _safe_source_filename(source_input)
+            history_store.update(job_id, sourceFilename=source_filename)
     update_job(
         job_id,
         output_path=result.get("output_path"),
@@ -1274,6 +1404,7 @@ def apply_result(job_id: str, result: dict[str, Any]) -> None:
         saved_audio=result.get("saved_audio"),
         effective_device=result.get("effective_device"),
         effective_backend=result.get("effective_backend"),
+        **({"diarization": diarization_summary} if is_simple else {}),
     )
 
 
@@ -1337,6 +1468,9 @@ def build_command(job: JobState, source_path: str) -> list[str]:
         command.append("--restore_punctuation")
     if settings.get("_simple"):
         command.append("--single-source")
+        if settings.get("diarizationEnabled"):
+            command.extend(["--diarization", "--diarization-device",
+                            settings.get("diarizationDevice", "auto")])
 
     return command
 
@@ -1528,19 +1662,71 @@ def _simple_public_url(raw: str) -> str:
     return value
 
 
+def _safe_source_filename(value: str | None) -> str:
+    """Return a basename safe for Windows downloads while preserving Unicode."""
+    raw = str(value or "").replace("\\", "/").rsplit("/", 1)[-1]
+    raw = unquote(raw)
+    cleaned = "".join("_" if char in '<>:"/\\|?*' or unicodedata.category(char) == "Cc" else char
+                      for char in raw).rstrip(" .")
+    if cleaned in {"", ".", ".."}:
+        return "Расшифровка"
+    if re.match(r"(?i)^(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\..*)?$", cleaned):
+        cleaned = "_" + cleaned
+    return cleaned or "Расшифровка"
+
+
+def _simple_download_stem(record: dict[str, Any]) -> str:
+    if record.get("sourceType") == "file":
+        source_name = _safe_source_filename(str(record.get("source") or ""))
+    else:
+        source_name = record.get("sourceFilename")
+        if not source_name:
+            try:
+                url_path = urlsplit(str(record.get("source") or "")).path
+            except ValueError:
+                url_path = ""
+            source_name = _safe_source_filename(url_path)
+        else:
+            source_name = _safe_source_filename(source_name)
+    stem = Path(source_name).stem.rstrip(" .")
+    if not stem or stem in {".", ".."}:
+        return "Расшифровка"
+    if re.match(r"(?i)^(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])$", stem):
+        stem = "_" + stem
+    return stem or "Расшифровка"
+
+
 def _simple_shape(record: dict[str, Any], *, with_text: bool) -> dict[str, Any]:
     record = normalize_terminal_timing(record)
     files = []
+    download_stem = _simple_download_stem(record)
     for ext in ("txt", "md"):
         path = history_store.artifact(record["id"], ext)
         if record["status"] == "completed" and path.is_file():
-            files.append({"format": ext, "name": path.name,
+            files.append({"format": ext, "name": f"{download_stem}.{ext}",
                           "downloadUrl": f"/api/simple/jobs/{record['id']}/download?format={ext}"})
     text = history_store.read_text(record["id"]) if with_text and record["status"] == "completed" else None
+    enabled = bool(record.get("diarizationEnabled", False))
+    diarization = _diarization_record(record)
+    diarization["turns"] = []
+    if with_text and enabled:
+        sidecar = history_store.read_diarization(record["id"])
+        if sidecar is not None:
+            diarization["turns"] = sidecar.get("turns", []) if isinstance(sidecar.get("turns"), list) else []
+    checkpoints = [dict(item) for item in record.get("checkpoints", [])]
+    if not any(item.get("stage") == "diarization" for item in checkpoints):
+        # Legacy records have no checkpoint for this newly introduced stage.
+        # Expose it as skipped when off and pending only for an opted-in legacy job.
+        checkpoints.insert(next((index + 1 for index, item in enumerate(checkpoints)
+                                 if item.get("stage") == "recognition"), len(checkpoints)),
+                           {"stage": "diarization", "status": "pending" if enabled and record.get("status") == "queued" else "skipped",
+                            "startedAt": None, "completedAt": None})
     result = {
         "id": record["id"], "sourceType": record["sourceType"], "source": record["source"],
         "profile": record["profile"], "device": record["device"], "cpuThreads": record["cpuThreads"],
-        "restorePunctuation": record["restorePunctuation"], "status": record["status"],
+        "restorePunctuation": record["restorePunctuation"],
+        "diarizationEnabled": enabled, "diarizationDevice": record.get("diarizationDevice", "auto"),
+        "diarization": diarization, "status": record["status"],
         "stage": record["stage"], "createdAt": record["createdAt"], "updatedAt": record["updatedAt"],
         "finishedAt": record["finishedAt"], "durationSeconds": record["durationSeconds"],
         "startedAt": record.get("startedAt"), "queueWaitSeconds": record.get("queueWaitSeconds"),
@@ -1548,7 +1734,7 @@ def _simple_shape(record: dict[str, Any], *, with_text: bool) -> dict[str, Any]:
         "errorCode": record.get("errorCode"),
         "detectedLanguage": record.get("detectedLanguage"), "error": concise_simple_error(record.get("error")),
         "notice": record.get("notice"), "revision": record.get("revision", 0), "files": files,
-        "progress": record.get("progress"), "checkpoints": record.get("checkpoints", []),
+        "progress": record.get("progress"), "checkpoints": checkpoints,
     }
     if with_text:
         result["text"] = text
@@ -1557,7 +1743,10 @@ def _simple_shape(record: dict[str, Any], *, with_text: bool) -> dict[str, Any]:
 
 @app.get("/api/simple/options")
 def simple_options():
-    return simple_profiles.options(logical_cpu_count())
+    options = simple_profiles.options(logical_cpu_count())
+    from services.diarization_runtime import diarization_options
+    options["diarization"] = diarization_options()
+    return options
 
 
 @app.get("/api/simple/session")
@@ -1626,7 +1815,8 @@ def _validate_simple_common(profile: str, device: str, cpu_threads: int) -> None
 
 
 def _simple_metadata(job_id: str, source: str, source_type: str, profile: str,
-                     device: str, cpu_threads: int, restore_punctuation: bool) -> tuple[dict, dict]:
+                     device: str, cpu_threads: int, restore_punctuation: bool,
+                     diarization_enabled: bool = False, diarization_device: str = "auto") -> tuple[dict, dict]:
     model = simple_profiles.PROFILES[profile][1]
     backend_device = "cpu" if device == "cpu" else "cpu"  # GPU capability is resolved at dispatch time.
     settings = {"_simple": True, "_outputDir": str(history_store.job_dir(job_id) / "output"),
@@ -1634,20 +1824,31 @@ def _simple_metadata(job_id: str, source: str, source_type: str, profile: str,
                 "_requestedDevice": device, "sourceType": source_type, "language": "auto",
                 "model": model, "device": backend_device, "nproc": cpu_threads,
                 "outputFormat": "txt", "saveAudio": False, "useTimestamps": False,
-                "restorePunctuation": restore_punctuation}
+                "restorePunctuation": restore_punctuation,
+                "diarizationEnabled": diarization_enabled, "diarizationDevice": diarization_device}
     metadata = {"id": job_id, "sourceType": source_type, "source": source,
                 "profile": profile, "device": device, "cpuThreads": cpu_threads,
                 "restorePunctuation": restore_punctuation,
+                "diarizationEnabled": diarization_enabled, "diarizationDevice": diarization_device,
+                "diarization": {"status": "pending" if diarization_enabled else "disabled",
+                                "requestedDevice": diarization_device,
+                                "effectiveDevice": None},
+                "checkpoints": initial_checkpoints(),
                 "settings": {key: settings[key] for key in
                              ("language", "model", "device", "nproc", "outputFormat", "saveAudio",
-                              "useTimestamps", "restorePunctuation")},
+                              "useTimestamps", "restorePunctuation", "diarizationEnabled", "diarizationDevice")},
                 "artifactPaths": {ext: str(history_store.artifact(job_id, ext)) for ext in ("txt", "md")}}
+    if not diarization_enabled:
+        checkpoint = next(item for item in metadata["checkpoints"] if item["stage"] == "diarization")
+        checkpoint.update(status="skipped", completedAt=utc_now())
     return metadata, settings
 
 
 def _enqueue_simple_jobs(items: list[tuple[str, str]], profile: str, device: str,
-                         cpu_threads: int, restore_punctuation: bool) -> list[dict]:
+                         cpu_threads: int, restore_punctuation: bool,
+                         diarization_enabled: bool = False, diarization_device: str = "auto") -> list[dict]:
     _validate_simple_common(profile, device, cpu_threads)
+    diarization_device = _validate_diarization_device(diarization_device)
     with jobs_lock:
         if any(job.status == "cancelling" for job in jobs.values() if job.settings.get("_simple")):
             raise HTTPException(status_code=409, detail="Дождитесь остановки текущей обработки.")
@@ -1656,7 +1857,8 @@ def _enqueue_simple_jobs(items: list[tuple[str, str]], profile: str, device: str
         for source, source_type in items:
             job_id = uuid.uuid4().hex
             metadata, settings = _simple_metadata(job_id, source, source_type, profile, device,
-                                                  cpu_threads, restore_punctuation)
+                                                  cpu_threads, restore_punctuation,
+                                                  diarization_enabled, diarization_device)
             records_metadata.append(metadata)
             prepared.append((job_id, source, settings))
         records = queue.enqueue_many(records_metadata)
@@ -1811,7 +2013,8 @@ def create_simple_job(payload: SimpleJobRequest):
             raise HTTPException(status_code=400, detail="Выбранный файл не найден.")
         source = str(path)
     record = _enqueue_simple_jobs([(source, payload.sourceType)], payload.profile, payload.device,
-                                  payload.cpuThreads, payload.restorePunctuation)[0]
+                                  payload.cpuThreads, payload.restorePunctuation,
+                                  payload.diarizationEnabled, payload.diarizationDevice)[0]
     return _simple_shape(record, with_text=True)
 
 
@@ -1820,6 +2023,7 @@ def create_simple_batch(payload: SimpleBatchRequest):
     if not payload.paths:
         raise HTTPException(status_code=400, detail="Добавьте хотя бы один файл.")
     _validate_simple_common(payload.profile, payload.device, payload.cpuThreads)
+    _validate_diarization_device(payload.diarizationDevice)
     accepted = []
     rejected = []
     for raw in payload.paths:
@@ -1836,7 +2040,8 @@ def create_simple_batch(payload: SimpleBatchRequest):
         except Exception as exc:
             rejected.append({"path": str(raw), "message": str(exc)})
     records = _enqueue_simple_jobs(accepted, payload.profile, payload.device,
-                                   payload.cpuThreads, payload.restorePunctuation) if accepted else []
+                                   payload.cpuThreads, payload.restorePunctuation,
+                                   payload.diarizationEnabled, payload.diarizationDevice) if accepted else []
     return {"jobs": [_simple_shape(record, with_text=False) for record in records],
             "queue": get_simple_queue_snapshot(), "rejected": rejected}
 
@@ -1867,7 +2072,8 @@ def download_simple_text(job_id: str, format: str = "txt"):
     record = history_store.get(job_id)
     if not record or record["status"] != "completed" or not path.is_file():
         raise HTTPException(status_code=404, detail="Файл расшифровки не найден.")
-    return FileResponse(path=path, filename=f"transcript.{format}", media_type="text/plain; charset=utf-8")
+    return FileResponse(path=path, filename=f"{_simple_download_stem(record)}.{format}",
+                        media_type="text/plain; charset=utf-8")
 
 
 @app.delete("/api/simple/history/{job_id}", status_code=204)
@@ -2170,7 +2376,7 @@ def serve_ui():
     index = UI_DIST / "index.html"
     if not index.is_file():
         raise HTTPException(status_code=404, detail="UI build is unavailable")
-    return FileResponse(index)
+    return FileResponse(index, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
 
 @app.get("/{asset_path:path}")
@@ -2188,5 +2394,5 @@ def serve_ui_asset(asset_path: str):
     # Browser-side routes use the built SPA entry point.
     index = UI_DIST / "index.html"
     if index.is_file():
-        return FileResponse(index)
+        return FileResponse(index, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
     raise HTTPException(status_code=404, detail="UI build is unavailable")

@@ -4,6 +4,6 @@
   "private": true,
   "description": "Local desktop shell for Video Transcribe",
   "main": "main.cjs",
-  "scripts": { "start": "electron .", "check": "node --check main.cjs && node --check preload.cjs" },
+  "scripts": { "start": "electron .", "check": "node --check main.cjs && node --check preload.cjs && node --check ui_entry.cjs", "test": "node --test tests/*.test.cjs" },
   "devDependencies": { "electron": "45.2.3" }
 }

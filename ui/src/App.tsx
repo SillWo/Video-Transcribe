@@ -3,16 +3,19 @@ import { Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-r
 import { AlertCircle, Check, Circle, Clipboard, FileText, LoaderCircle, Minus, Plus, Trash2, X } from 'lucide-react'
 import { API_BASE, fetchJson, type FileSelection } from './lib/api'
 import { DraftManager, SelectionGate, flushAndRead } from './lib/draftManager'
+import { defaultDiarizationPrefs, diarizationRequestFields, sanitizeDiarizationPrefs, sanitizeStoredPrefs, stageOrderFor } from './lib/diarization'
 
 type Profile = 'quality' | 'balanced' | 'economy'
 type Device = 'cpu' | 'gpu'
 type JobStatus = 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'interrupted' | 'cancelled'
-type Stage = 'preparation' | 'source' | 'audio' | 'recognition' | 'postprocess' | 'result'
+type Stage = 'preparation' | 'source' | 'audio' | 'recognition' | 'diarization' | 'postprocess' | 'result'
 type Checkpoint = { stage: Stage; status: 'pending' | 'active' | 'completed' | 'skipped' | 'failed' | 'cancelled'; startedAt: string | null; completedAt: string | null }
 type JobProgress = { stage: Stage; percent: number | null; completedBytes: number | null; totalBytes: number | null; processedSeconds: number | null; totalSeconds: number | null; message: string | null; updatedAt: string }
 type SimpleJob = {
   id: string; sourceType: 'url' | 'file'; source: string; profile: Profile; device: Device
-  cpuThreads: number; restorePunctuation: boolean; status: JobStatus
+  cpuThreads: number; restorePunctuation: boolean; diarizationEnabled?: boolean; diarizationDevice?: string
+  diarization?: { status: string; requestedDevice: string; effectiveDevice: { id: string; name: string; backend: string } | null; turns?: { start: number; end: number; text: string; speakerIds: number[]; label: string }[] }
+  status: JobStatus
   stage: Stage; progress?: JobProgress | null; checkpoints?: Checkpoint[]; createdAt: string
   finishedAt?: string | null; durationSeconds?: number | null
   updatedAt: string; detectedLanguage: string | null; error: string | null; notice: string | null
@@ -26,9 +29,10 @@ type Options = {
   profiles: { id: Profile; label: string; model: string }[]
   devices: { cpu: { available: boolean; name: string }; gpu: { available: boolean; name: string; reason: string | null } }
   defaultDevice: Device; maxCpuThreads: number
+  diarization?: { enabledByDefault: boolean; defaultDevice: string; devices: { id: string; name: string; backend: string; available: boolean; reason: string | null }[]; ready: boolean }
 }
 type ApiError = Error & { status?: number }
-type Prefs = { profile: Profile; device: Device; cpuThreads: number; restorePunctuation: boolean }
+type Prefs = { profile: Profile; device: Device; cpuThreads: number; restorePunctuation: boolean; diarizationEnabled: boolean; diarizationDevice: string }
 
 const preferenceKey = 'video-transcribe-simple-preferences'
 const tabsKey = 'video-transcribe-open-tabs'
@@ -39,11 +43,10 @@ let flushAllWorkspaceDrafts: (() => Promise<void>) | null = null
 let clearWorkspaceJob: ((jobId: string) => void) | null = null
 let openWorkspaceTask: ((jobId: string) => void) | null = null
 let clearedLatestJob: { id: string; createdAt: string } | null = null
-const defaults: Prefs = { profile: 'balanced', device: 'cpu', cpuThreads: 1, restorePunctuation: true }
-const stageOrder: Stage[] = ['preparation', 'source', 'audio', 'recognition', 'postprocess', 'result']
+const defaults: Prefs = { profile: 'balanced', device: 'cpu', cpuThreads: 1, restorePunctuation: true, ...defaultDiarizationPrefs }
 const stages: Record<Stage, string> = {
   preparation: 'Подготовка модели', source: 'Получение записи', audio: 'Подготовка аудио',
-  recognition: 'Распознавание речи', postprocess: 'Пунктуация', result: 'Готово',
+  recognition: 'Распознавание речи', diarization: 'Разделение по говорящим', postprocess: 'Пунктуация', result: 'Готово',
 }
 const statusLabels: Record<JobStatus, string> = {
   queued: 'Ожидает', running: 'Обрабатывается', cancelling: 'Отменяется', completed: 'Готово', failed: 'Ошибка', interrupted: 'Прервана', cancelled: 'Отменена',
@@ -67,7 +70,9 @@ const api = {
 function errorText(error: unknown) { return error instanceof Error ? error.message : 'Не удалось выполнить запрос. Проверьте соединение и повторите попытку.' }
 function errorStatus(error: unknown) { return typeof error === 'object' && error !== null && 'status' in error ? (error as ApiError).status : undefined }
 function readPrefs(): Partial<Prefs> {
-  try { return JSON.parse(localStorage.getItem(preferenceKey) ?? '{}') as Partial<Prefs> } catch { return {} }
+  try {
+    return sanitizeStoredPrefs(JSON.parse(localStorage.getItem(preferenceKey) ?? '{}'))
+  } catch { return sanitizeStoredPrefs(null) }
 }
 function readClearedLatest() {
   try { return JSON.parse(localStorage.getItem('video-transcribe-cleared-latest') ?? 'null') as { id: string; createdAt: string } | null } catch { return null }
@@ -87,11 +92,30 @@ function safeError(value: string | null) {
     : 'Не удалось подготовить модель автоматически. Проверьте подключение, при проблеме с видеокартой выберите CPU и повторите попытку.'
 }
 function stageName(stage: Stage) { return stages[stage] }
+function diarizationReason(reason: string | null | undefined) {
+  if (!reason) return ''
+  if (/model.*not ready|model is missing|model_unavailable/i.test(reason)) return 'Модель разделения говорящих не установлена или повреждена. Запустите подготовку приложения и повторите попытку.'
+  if (/runtime is not installed|runtime is missing|not installed/i.test(reason)) return 'Компонент для этого устройства не установлен. Запустите подготовку приложения и повторите попытку.'
+  if (/driver|runtime.*unavailable|incompatible/i.test(reason)) return 'Драйвер или компонент GPU недоступен либо несовместим.'
+  if (/backend is unavailable|not exposed/i.test(reason)) return 'Этот GPU не поддерживается установленным компонентом разделения говорящих.'
+  if (/no usable.*device/i.test(reason)) return 'Нет готового устройства для разделения говорящих. Проверьте доступность CPU или GPU.'
+  if (/cpu.*not ready/i.test(reason)) return 'Разделение говорящих на процессоре пока не готово.'
+  return 'Устройство для разделения говорящих сейчас недоступно.'
+}
+function diarizationDeviceLabel(id: string | null | undefined, devices: { id: string; name: string; backend: string }[] = []) {
+  if (!id || id === 'auto') return 'Авто'
+  if (id === 'cpu') return 'Процессор'
+  const device = devices.find((item) => item.id === id)
+  if (!device) return id
+  const backend = device.backend === 'cuda' ? ' (CUDA)' : device.backend === 'vulkan' ? ' (Vulkan)' : ''
+  return `${device.name}${backend}`
+}
 function checkpointsFor(job: SimpleJob): Checkpoint[] {
   if (job.status === 'queued') return []
   const known = Array.isArray(job.checkpoints) ? job.checkpoints : []
   if (known.length === 0 && job.status === 'completed') return []
-  return stageOrder.map((stage) => {
+  const order = stageOrderFor(job.diarizationEnabled === true) as readonly Stage[]
+  return order.map((stage) => {
     const checkpoint = known.find((item) => item?.stage === stage)
     if (checkpoint) return checkpoint
     return { stage, status: stage === job.stage && isActive(job) ? 'active' as const : 'pending' as const, startedAt: null, completedAt: null }
@@ -231,7 +255,7 @@ function Workspace() {
       if (optionsResult.status === 'fulfilled') {
         const value = optionsResult.value
         setOptions(value)
-        nextPrefs = { ...nextPrefs, device: stored.device ?? value.defaultDevice, cpuThreads: clamp(stored.cpuThreads ?? value.maxCpuThreads, 1, value.maxCpuThreads) }
+          nextPrefs = { ...nextPrefs, device: stored.device ?? value.defaultDevice, cpuThreads: clamp(stored.cpuThreads ?? value.maxCpuThreads, 1, value.maxCpuThreads) }
       } else setOptionsError(errorText(optionsResult.reason))
 
       if (sessionResult.status === 'rejected') setFormError(`Не удалось восстановить последнюю задачу. ${errorText(sessionResult.reason)}`)
@@ -593,7 +617,7 @@ function Workspace() {
     if (!sourceJob || !['failed', 'interrupted', 'cancelled'].includes(sourceJob.status)) return
     setFormError(''); setPollError(''); setEnqueueBusy(true)
     try {
-      const payload = { sourceType: sourceJob.sourceType, ...(sourceJob.sourceType === 'url' ? { url: sourceJob.source } : { path: sourceJob.source }), profile: sourceJob.profile, device: sourceJob.device, cpuThreads: sourceJob.cpuThreads, restorePunctuation: sourceJob.restorePunctuation }
+      const payload = { sourceType: sourceJob.sourceType, ...(sourceJob.sourceType === 'url' ? { url: sourceJob.source } : { path: sourceJob.source }), profile: sourceJob.profile, device: sourceJob.device, cpuThreads: sourceJob.cpuThreads, restorePunctuation: sourceJob.restorePunctuation, ...diarizationRequestFields({ diarizationEnabled: sourceJob.diarizationEnabled === true, diarizationDevice: sanitizeDiarizationPrefs(sourceJob).diarizationDevice }) }
       const created = await fetchJson<SimpleJob>('/api/simple/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
       setTaskSummaries((current) => ({ ...current, [created.id]: created }))
       setOpenIds((ids) => [...new Set([...ids, created.id])])
@@ -730,6 +754,49 @@ function Workspace() {
         <fieldset className="punctuation-field" disabled={formLocked}>
           <label className="check-row"><input type="checkbox" checked={prefs.restorePunctuation} onChange={(event) => setPrefs((value) => ({ ...value, restorePunctuation: event.target.checked }))} /><span><strong>Восстанавливать пунктуацию</strong><small>Для русской речи</small></span></label>
         </fieldset>
+        <fieldset className="diarization-field" disabled={formLocked}>
+          <label className="check-row"><input type="checkbox" checked={prefs.diarizationEnabled} onChange={(event) => setPrefs((value) => ({ ...value, diarizationEnabled: event.target.checked }))} /><span><strong>Разделять по говорящим</strong><small>До 8 говорящих</small></span></label>
+          {prefs.diarizationEnabled && <>
+            <label className="diarization-device-label" htmlFor="diarization-device">Устройство для разделения говорящих</label>
+            <select id="diarization-device" className="diarization-device-select" value={prefs.diarizationDevice} onChange={(event) => setPrefs((value) => ({ ...value, diarizationDevice: event.target.value }))}>
+              {(() => {
+                const devices = options?.diarization?.devices ?? []
+                const withBaseOptions = [
+                  ...devices,
+                  ...(!devices.some((device) => device.id === 'auto') ? [{ id: 'auto', name: 'Automatic', backend: 'auto', available: false, reason: null }] : []),
+                  ...(!devices.some((device) => device.id === 'cpu') ? [{ id: 'cpu', name: 'CPU', backend: 'cpu', available: false, reason: null }] : []),
+                ]
+                const chosenExists = withBaseOptions.some((device) => device.id === prefs.diarizationDevice)
+                const visibleDevices = chosenExists ? withBaseOptions : [...withBaseOptions, { id: prefs.diarizationDevice, name: prefs.diarizationDevice, backend: 'unknown', available: false, reason: 'Сохранённое устройство больше не обнаружено.' }]
+                return visibleDevices.map((device) => {
+                  const isAuto = device.id === 'auto'
+                  const isCpu = device.id === 'cpu'
+                  const backend = device.backend === 'cuda' ? 'CUDA' : device.backend === 'vulkan' ? 'Vulkan' : ''
+                  const label = isAuto ? 'Авто' : isCpu ? 'Процессор' : `${device.name}${backend ? ` (${backend})` : ''}`
+                  return <option key={device.id} value={device.id}>{label}{device.available ? '' : ' — недоступно'}</option>
+                })
+              })()}
+            </select>
+            {(() => {
+              const selected = options?.diarization?.devices.find((device) => device.id === prefs.diarizationDevice)
+              const missingSelection = Boolean(options?.diarization && !selected)
+              const unavailableReason = missingSelection
+                ? 'Сохранённое устройство больше не обнаружено. Выберите доступное устройство вручную.'
+                : selected && !selected.available
+                  ? diarizationReason(selected.reason)
+                  : options?.diarization && !options.diarization.ready
+                    ? 'Модель или компонент разделения говорящих пока не готовы.'
+                    : !options?.diarization
+                      ? 'Сервер не сообщил состояние разделения говорящих; задача может быть отклонена.'
+                      : ''
+              return <>
+                <p className={`diarization-readiness${unavailableReason ? ' unavailable' : ''}`} role="status">{unavailableReason ? `Недоступно: ${unavailableReason}` : `Готово · ${prefs.diarizationDevice === 'auto' ? 'Автоматический выбор' : diarizationDeviceLabel(prefs.diarizationDevice, options?.diarization?.devices)}`}</p>
+                {unavailableReason && <p className="diarization-submit-note">Настройки сохранены. При запуске сервер может отклонить задачу.</p>}
+              </>
+            })()}
+            {!options?.diarization && <p className="diarization-readiness">Состояние устройств пока неизвестно.</p>}
+          </>}
+        </fieldset>
         {!options && !optionsError && <p className="muted">Загружаем настройки…</p>}
         {optionsError && <div className="inline-error" role="alert">{optionsError}<button type="button" className="text-button" onClick={() => { setOptionsError(''); api.options().then(setOptions).catch((error) => setOptionsError(errorText(error))) }}>Повторить</button></div>}
       </form>
@@ -746,10 +813,11 @@ function Workspace() {
       </div>
       {openIds.length > 0 && <div className="task-tabs" role="tablist" aria-label="Задачи в рабочем пространстве">{openIds.map((id, index) => { const selected = job?.id === id; const summary = taskSummaries[id] ?? [queue.activeJob, ...queue.waitingJobs].find((item) => item?.id === id); const label = summary ? sourceHeading(summary as SimpleJob) : id === job?.id ? sourceHeading(job) : `Задача ${ordinals[id] ?? ''}`; const status = summary?.status ?? (selected ? job?.status : undefined); const canClose = status !== undefined && !isActiveStatus(status); const isRovingTab = selected || (index === 0 && !openIds.some((openId) => openId === job?.id)); return <div className={`task-tab ${selected ? 'selected' : ''}`} role="presentation" key={id}><button ref={(element) => { if (element) tabButtonRefs.current.set(id, element); else tabButtonRefs.current.delete(id) }} type="button" role="tab" tabIndex={isRovingTab ? 0 : -1} aria-selected={selected} aria-busy={pendingTaskId === id || undefined} aria-controls="task-panel" id={`tab-${id}`} title={summary?.source ?? (selected ? job?.source : label)} onKeyDown={(event) => handleTaskTabKey(event, index)} onClick={() => void selectTask(id)}>{ordinals[id] ? `${ordinals[id]}. ` : ''}{label}<span className={`tab-status ${status ?? ''}`}>{pendingTaskId === id ? 'Открываем…' : status ? statusLabels[status] : ''}</span>{pendingTaskId === id && <span className="sr-only">Открываем задачу…</span>}</button><button type="button" className="tab-close" aria-label={`Закрыть ${label}`} disabled={!canClose} onClick={() => void closeTask(id)}><X size={14} /></button></div> })}</div>}
       {showInitialLoading ? <div className="initial-loading" role="status"><LoaderCircle size={18} className="spin" />Загружаем настройки…</div> : !job ? <Welcome /> : <>
-        <div id="task-panel" role="tabpanel" aria-labelledby={`tab-${job.id}`} aria-busy={pendingTaskId !== null || undefined} className="task-panel"><div className="result-heading"><div className="result-heading-title"><p className="eyebrow">{active ? 'Обработка задачи' : 'Результат'}</p><h2 title={job.source}>{job.status === 'completed' ? 'Текст расшифровки' : sourceHeading(job)}</h2><p className="job-settings">{profileLabels[job.profile]} · {job.device === 'gpu' ? 'Видеокарта' : `Процессор, ${job.cpuThreads} поток.`} · {job.restorePunctuation ? 'Пунктуация включена' : 'Пунктуация выключена'}</p>{active && <p className="source-caption" title={sourceLabel(job)}>Источник: {sourceLabel(job)}</p>}</div>{job.status === 'completed' && <div className="result-actions"><span className={`save-indicator ${saveState}`} aria-live="polite">{saveState === 'saved' ? <><Check size={14} />Сохранено</> : saveState === 'saving' ? <><LoaderCircle size={14} className="spin" />Сохраняем…</> : 'Не сохранено'}</span><button type="button" className="secondary-button" onClick={() => void copyText()}><Clipboard size={16} />Копировать</button><button type="button" className="secondary-button" onClick={() => void download('txt')}>Скачать TXT</button><button type="button" className="secondary-button" onClick={() => void download('md')}>Скачать MD</button></div>}</div>
+        <div id="task-panel" role="tabpanel" aria-labelledby={`tab-${job.id}`} aria-busy={pendingTaskId !== null || undefined} className="task-panel"><div className="result-heading"><div className="result-heading-title"><p className="eyebrow">{active ? 'Обработка задачи' : 'Результат'}</p><h2 title={job.source}>{job.status === 'completed' ? 'Текст расшифровки' : sourceHeading(job)}</h2><p className="job-settings">{profileLabels[job.profile]} · {job.device === 'gpu' ? 'Видеокарта' : `Процессор, ${job.cpuThreads} поток.`} · {job.restorePunctuation ? 'Пунктуация включена' : 'Пунктуация выключена'} · {job.diarizationEnabled ? `Диаризация включена · ${diarizationDeviceLabel(job.diarizationDevice ?? job.diarization?.requestedDevice, options?.diarization?.devices)}` : 'Диаризация выключена'}{job.diarizationEnabled && job.status === 'completed' && job.diarization?.effectiveDevice && ` · Фактически: ${job.diarization.effectiveDevice.name}`}</p>{active && <p className="source-caption" title={sourceLabel(job)}>Источник: {sourceLabel(job)}</p>}</div>{job.status === 'completed' && <div className="result-actions"><span className={`save-indicator ${saveState}`} aria-live="polite">{saveState === 'saved' ? <><Check size={14} />Сохранено</> : saveState === 'saving' ? <><LoaderCircle size={14} className="spin" />Сохраняем…</> : 'Не сохранено'}</span><button type="button" className="secondary-button" onClick={() => void copyText()}><Clipboard size={16} />Копировать</button><button type="button" className="secondary-button" onClick={() => void download('txt')}>Скачать TXT</button><button type="button" className="secondary-button" onClick={() => void download('md')}>Скачать MD</button></div>}</div>
         {(() => {
           const checkpoints = checkpointsFor(job)
-          const currentStage = job.progress?.stage && stageOrder.includes(job.progress.stage) ? job.progress.stage : job.stage
+          const currentStageOrder = stageOrderFor(job.diarizationEnabled === true) as readonly Stage[]
+          const currentStage = job.progress?.stage && currentStageOrder.includes(job.progress.stage) ? job.progress.stage : job.stage
           const currentCheckpoint = checkpoints.find((checkpoint) => checkpoint.stage === currentStage)
           const progress = job.progress
           const percent = typeof progress?.percent === 'number' && Number.isFinite(progress.percent) ? Math.max(0, Math.min(100, progress.percent)) : null
@@ -785,7 +853,7 @@ function Workspace() {
             {(job.status === 'failed' || job.status === 'interrupted' || job.status === 'cancelled') && <button type="button" className="primary-button retry-button" disabled={enqueueBusy || active} onClick={() => void retryTask()}>{enqueueBusy ? <><LoaderCircle size={16} className="spin" />Добавляем…</> : 'Повторить попытку'}</button>}
           </section>
         })()}
-        {job.status === 'completed' ? <><textarea className="transcript-editor" aria-label="Текст расшифровки" value={draft} onChange={(event) => changeDraft(event.target.value)} spellCheck placeholder="Текст расшифровки появится здесь" />{job.detectedLanguage && job.detectedLanguage.toLowerCase().startsWith('ru') === false && job.restorePunctuation && <p className="notice">Пунктуация восстанавливается только для русской речи.</p>}{notice && <p className="notice">{notice}</p>}</> : null}
+        {job.status === 'completed' ? <><textarea className="transcript-editor" aria-label="Текст расшифровки" value={draft} onChange={(event) => changeDraft(event.target.value)} spellCheck placeholder="Текст расшифровки появится здесь" />{job.diarizationEnabled && <p className="notice">Номера говорящих относятся только к этой записи. Неопределённость и наложения речи отмечены в тексте.</p>}{job.detectedLanguage && job.detectedLanguage.toLowerCase().startsWith('ru') === false && job.restorePunctuation && <p className="notice">Пунктуация восстанавливается только для русской речи.</p>}{notice && <p className="notice">{notice}</p>}</> : null}
       </div></>}
       {formError && <div className="workspace-alert" role="alert">{formError}<button className="alert-dismiss" aria-label="Закрыть сообщение" onClick={() => setFormError('')}>×</button></div>}
     </section>

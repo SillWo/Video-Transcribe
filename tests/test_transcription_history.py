@@ -44,10 +44,10 @@ class TranscriptionHistoryTests(unittest.TestCase):
         self.assertIsNone(reopened.get("a" * 32)["finishedAt"])
         self.assertIsNone(reopened.get("a" * 32)["durationSeconds"])
 
-    def test_jobs_start_with_stable_six_stage_checkpoint_contract(self):
+    def test_jobs_start_with_stable_checkpoint_contract_including_diarization(self):
         record = self.record()
         self.assertEqual([item["stage"] for item in record["checkpoints"]],
-                         ["preparation", "source", "audio", "recognition", "postprocess", "result"])
+                         ["preparation", "source", "audio", "recognition", "diarization", "postprocess", "result"])
         self.assertTrue(all(item["status"] == "pending" for item in record["checkpoints"]))
         self.assertIsNone(record["progress"])
         self.assertIsNone(record["finishedAt"])

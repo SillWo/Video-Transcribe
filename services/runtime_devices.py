@@ -84,7 +84,8 @@ def enumerate_vulkan_gpus() -> list[dict[str, Any]]:
                     ("enabledExtensionCount", ctypes.c_uint32),
                     ("ppEnabledExtensionNames", ctypes.POINTER(ctypes.c_char_p))]
 
-    info = AppInfo(0, None, b"Video Transcribe", 1, b"Video Transcribe", 1, (1 << 22))
+    # Vulkan 1.1 exposes deviceUUID through vkGetPhysicalDeviceProperties2.
+    info = AppInfo(0, None, b"Video Transcribe", 1, b"Video Transcribe", 1, (1 << 22) | (1 << 12))
     create = InstanceCreateInfo(1, None, 0, ctypes.pointer(info), 0, None, 0, None)
     instance = ctypes.c_void_p()
     create_instance.argtypes = [ctypes.POINTER(InstanceCreateInfo), ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
@@ -103,6 +104,27 @@ def enumerate_vulkan_gpus() -> list[dict[str, Any]]:
         get_properties = library.vkGetPhysicalDeviceProperties
         get_properties.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         get_properties.restype = None
+        get_properties2 = getattr(library, "vkGetPhysicalDeviceProperties2", None)
+        if get_properties2 is None:
+            get_properties2 = getattr(library, "vkGetPhysicalDeviceProperties2KHR", None)
+        if get_properties2 is not None:
+            class DeviceIdProperties(ctypes.Structure):
+                _fields_ = [
+                    ("sType", ctypes.c_uint32), ("pNext", ctypes.c_void_p),
+                    ("deviceUUID", ctypes.c_uint8 * 16), ("driverUUID", ctypes.c_uint8 * 16),
+                    ("deviceLUID", ctypes.c_uint8 * 8), ("deviceNodeMask", ctypes.c_uint32),
+                    ("deviceLUIDValid", ctypes.c_uint32),
+                ]
+
+            class PhysicalDeviceProperties2Buffer(ctypes.Structure):
+                _fields_ = [("sType", ctypes.c_uint32), ("pNext", ctypes.c_void_p),
+                            ("properties", ctypes.c_uint8 * 1024)]
+
+            get_properties2.argtypes = [ctypes.c_void_p, ctypes.POINTER(PhysicalDeviceProperties2Buffer)]
+            get_properties2.restype = None
+        else:
+            DeviceIdProperties = None
+            PhysicalDeviceProperties2Buffer = None
         found = []
         for physical_index, device in enumerate(devices[:count.value]):
             raw = ctypes.create_string_buffer(1024)
@@ -112,8 +134,17 @@ def enumerate_vulkan_gpus() -> list[dict[str, Any]]:
             if props.deviceType == 4:
                 continue
             name = props.deviceName.split(b"\0", 1)[0].decode("utf-8", "replace") or "Vulkan GPU"
-            found.append({"name": name, "type": props.deviceType, "vendorId": props.vendorID,
-                          "deviceIndex": physical_index})
+            entry = {"name": name, "type": props.deviceType, "vendorId": props.vendorID,
+                     "deviceId": props.deviceID, "deviceIndex": physical_index,
+                     "runtimeIndex": len(found)}
+            if get_properties2 is not None:
+                identity = DeviceIdProperties(1000071004, None)
+                properties2 = PhysicalDeviceProperties2Buffer(1000059001, ctypes.cast(ctypes.pointer(identity), ctypes.c_void_p))
+                get_properties2(device, ctypes.byref(properties2))
+                device_uuid = bytes(identity.deviceUUID)
+                if any(device_uuid):
+                    entry["deviceUUID"] = device_uuid.hex()
+            found.append(entry)
         return found
     finally:
         destroy_instance.argtypes = [ctypes.c_void_p, ctypes.c_void_p]

@@ -89,6 +89,13 @@ fieldset legend { margin-bottom: 8px; padding: 0; color: var(--text-secondary); 
 .thread-control { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; color: var(--text-secondary); font-size: 12px; }
 .thread-control input { width: 61px; height: 36px; padding: 0 8px; border: 1px solid #dce2e9; border-radius: 7px; color: var(--text-primary); background: white; font-size: 14px; }
 .punctuation-field { padding: 12px 10px; border-top: 1px solid #edf0f3; border-bottom: 1px solid #edf0f3; }
+.diarization-field { min-width: 0; padding: 12px 10px; border-bottom: 1px solid #edf0f3; }
+.diarization-device-label { display: block; margin: 12px 0 6px 25px; color: var(--text-secondary); font-size: 12px; font-weight: 500; line-height: 1.4; }
+.diarization-device-select { display: block; width: calc(100% - 25px); min-width: 0; height: 38px; margin-left: 25px; padding: 0 28px 0 9px; border: 1px solid #dce2e9; border-radius: 7px; color: var(--text-primary); background: #fff; font-size: 12px; text-overflow: ellipsis; }
+.diarization-device-select:focus-visible { outline: 2px solid #3877d6; outline-offset: 2px; }
+.diarization-readiness, .diarization-submit-note { margin: 7px 0 0 25px; color: #427454; font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+.diarization-readiness.unavailable { color: #9a5149; }
+.diarization-submit-note { color: var(--text-muted); }
 .check-row { display: flex; align-items: center; gap: 9px; cursor: pointer; }
 .check-row input { width: 16px; height: 16px; margin: 0; accent-color: #3977d0; }
 .check-row span { display: flex; flex-direction: column; gap: 3px; }

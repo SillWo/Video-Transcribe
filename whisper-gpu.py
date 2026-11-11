@@ -3,7 +3,9 @@ import errno
 import json
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import timeit
 from os.path import isfile, join
@@ -11,6 +13,7 @@ from pathlib import Path
 from typing import TextIO
 
 from services.model_paths import HF_HUB_CACHE
+from services.model_paths import MODEL_TEMP_DIR
 import psutil
 import validators
 from faster_whisper import WhisperModel as whisper
@@ -141,15 +144,36 @@ def next_available_path(path: Path) -> Path:
         index += 1
 
 
-def serialize_segments(segments) -> list[dict]:
-    return [
-        {
+def serialize_segments(segments, *, word_timestamps=False) -> list[dict]:
+    result = []
+    for segment in segments:
+        row = {
             "start": float(segment.start),
             "end": float(segment.end),
             "text": segment.text.strip(),
         }
-        for segment in segments
-    ]
+        if word_timestamps:
+            words = getattr(segment, "words", None)
+            serialized_words = []
+            for word in words or []:
+                if isinstance(word, dict):
+                    word_text = word.get("text", word.get("word", ""))
+                    raw_start, raw_end = word.get("start"), word.get("end")
+                else:
+                    word_text = getattr(word, "word", getattr(word, "text", ""))
+                    raw_start, raw_end = getattr(word, "start", None), getattr(word, "end", None)
+                try:
+                    start = float(raw_start)
+                except (TypeError, ValueError):
+                    start = None
+                try:
+                    end = float(raw_end)
+                except (TypeError, ValueError):
+                    end = None
+                serialized_words.append({"text": str(word_text), "start": start, "end": end})
+            row["words"] = serialized_words
+        result.append(row)
+    return result
 
 
 def build_plain_text(segments: list[dict], combined_text: str, use_timestamps: bool) -> str:
@@ -160,7 +184,8 @@ def build_plain_text(segments: list[dict], combined_text: str, use_timestamps: b
     return "\n".join(lines).strip() + "\n"
 
 
-def build_output_payload(segments: list[dict], stats, combined_text: str, use_timestamps: bool) -> dict:
+def build_output_payload(segments: list[dict], stats, combined_text: str, use_timestamps: bool,
+                         diarization=None) -> dict:
     payload = {
         "language": stats.language,
         "language_probability": stats.language_probability,
@@ -171,6 +196,8 @@ def build_output_payload(segments: list[dict], stats, combined_text: str, use_ti
         payload["segments"] = segments
     else:
         payload["segments"] = [{"text": segment["text"]} for segment in segments]
+    if diarization is not None:
+        payload["diarization"] = diarization
 
     return payload
 
@@ -200,7 +227,8 @@ def _initialization_failure(exc: Exception, device: str) -> TaskFailure:
     return TaskFailure(str(exc), code, stage="recognition")
 
 
-def write_output(args, segments: list[dict], combined_text: str, stats, filename: str) -> tuple[Path, str]:
+def write_output(args, segments: list[dict], combined_text: str, stats, filename: str,
+                 diarization=None, diarization_text: str | None = None) -> tuple[Path, str]:
     output_suffix = args.output_format
     output_language = stats.language if args.language == "auto" else args.language
     output_path = Path(
@@ -209,16 +237,24 @@ def write_output(args, segments: list[dict], combined_text: str, stats, filename
     )
 
     if args.output_format == "srt":
+        if diarization is not None and diarization.get("status") == "completed":
+            segments = [{"start": turn["start"], "end": turn["end"],
+                         "text": f"{turn['label']}: {turn['text']}"}
+                        for turn in diarization["turns"]]
         with open(output_path, "w", encoding="utf-8") as srt_file:
             write_srt(segments, file=srt_file)
         rendered_result = output_path.read_text(encoding="utf-8")
 
     elif args.output_format == "txt":
-        rendered_result = build_plain_text(segments, combined_text, use_timestamps=args.use_timestamps)
+        rendered_result = (diarization_text if diarization_text is not None else
+                           build_plain_text(segments, combined_text, use_timestamps=args.use_timestamps))
+        if diarization_text is not None and not rendered_result.endswith("\n"):
+            rendered_result += "\n"
         output_path.write_text(rendered_result, encoding="utf-8")
 
     else:
-        payload = build_output_payload(segments, stats, combined_text, use_timestamps=args.use_timestamps)
+        payload = build_output_payload(segments, stats, combined_text, use_timestamps=args.use_timestamps,
+                                       diarization=diarization)
         rendered_result = json.dumps(payload, ensure_ascii=False, indent=2)
         output_path.write_text(rendered_result, encoding="utf-8")
 
@@ -236,6 +272,10 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
     start_time = timeit.default_timer()
     language = None if args.language == "auto" else args.language
     total_seconds = None
+    diarization_enabled = bool(getattr(args, "diarization", False))
+    asr_effective_device = getattr(model, "effective_device", getattr(args, "device", "cpu"))
+    asr_effective_backend = getattr(model, "effective_backend", "faster-whisper")
+    diarization_wav = None
     native_progress = None
     uses_native_whisper_cpp = isinstance(model, WhisperCppModel) or (
         isinstance(model, AutoFallbackModel) and isinstance(model.model, WhisperCppModel)
@@ -267,21 +307,44 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
         native_progress({"percent": percent, "processedSeconds": processed, "totalSeconds": total})
 
     try:
-        segments_iter, stats = model.transcribe(full_filepath, beam_size=args.beam_size, language=language)
+        transcription_path = full_filepath
+        if diarization_enabled:
+            from services.whisper_cpp import _find_ffmpeg
+            ffmpeg = _find_ffmpeg()
+            wav_fd, wav_name = tempfile.mkstemp(prefix="vt-diarization-audio-", suffix=".wav", dir=MODEL_TEMP_DIR)
+            os.close(wav_fd)
+            diarization_wav = Path(wav_name)
+            converted = subprocess.run([ffmpeg, "-y", "-i", str(full_filepath), "-vn", "-ac", "1", "-ar", "16000",
+                                        "-c:a", "pcm_s16le", str(diarization_wav)], capture_output=True, text=True,
+                                       encoding="utf-8", errors="replace", cwd=str(Path(__file__).resolve().parent))
+            if converted.returncode:
+                detail = (converted.stderr or converted.stdout or "FFmpeg audio conversion failed").strip()
+                raise TaskFailure(f"FFmpeg could not prepare diarization audio: {detail[-1200:]}",
+                                  "source_invalid", stage="source")
+            transcription_path = str(diarization_wav)
+        transcribe_kwargs = {"beam_size": args.beam_size, "language": language}
+        if diarization_enabled:
+            transcribe_kwargs["word_timestamps"] = True
+        segments_iter, stats = model.transcribe(transcription_path, **transcribe_kwargs)
         if native_progress is not None and not uses_native_whisper_cpp:
             # Consume the real lazy generator so progress follows completed segments.
             segment_list = []
             for index, segment in enumerate(segments_iter, start=1):
                 segment_list.append(segment)
                 report_segment_progress(segment, index)
-            segments = serialize_segments(segment_list)
+            segments = serialize_segments(segment_list, word_timestamps=diarization_enabled)
         else:
-            segments = serialize_segments(list(segments_iter))
+            segments = serialize_segments(list(segments_iter), word_timestamps=diarization_enabled)
     except Exception as exc:
+        if diarization_wav is not None:
+            diarization_wav.unlink(missing_ok=True)
         failure = _recognition_failure(exc, args, model)
         if failure is exc:
             raise
         raise failure from exc
+    asr_effective_device = getattr(model, "effective_device", getattr(args, "device", "cpu"))
+    asr_effective_backend = getattr(model, "effective_backend", "faster-whisper")
+    asr_segments = [{**segment, "words": list(segment.get("words", []))} for segment in segments]
     if native_progress is not None and not uses_native_whisper_cpp:
         native_progress({"percent": 100.0 if total_seconds else None,
                          "processedSeconds": total_seconds, "totalSeconds": total_seconds})
@@ -294,34 +357,79 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
     print(f"\nDetected language '{stats.language}' with probability {probability_text}")
 
     postprocess_notice = None
-    emit_event(args, "stage", stage="postprocess",
-               status="in_progress" if effective_restore_punctuation else "skipped",
-               message="Восстанавливаем пунктуацию в русском тексте." if effective_restore_punctuation else
-               ("Пунктуация пропущена: обнаружен не русский язык." if args.restore_punctuation else
-                "Восстановление пунктуации выключено."))
-    if effective_restore_punctuation:
-        print("Russian text post-processing enabled.")
-        print("Applying punctuation restoration to Russian segments.")
-        postprocess_progress = progress_callback(args, "postprocess", "Восстанавливаем пунктуацию.") if getattr(args, "single_source", False) else None
-        total_segments = len(segments)
-        for index, segment in enumerate(segments, start=1):
-            segment["text"] = restore_russian_segment_text(segment["text"])
-            if postprocess_progress:
-                postprocess_progress({"percent": min(99.0, index * 100.0 / max(1, total_segments)),
-                                      "message": f"Обработано фрагментов {index} из {total_segments}."})
-        combined_text = build_polished_russian_text_from_segments([segment["text"] for segment in segments])
-        if postprocess_progress:
-            postprocess_progress({"percent": 100.0, "message": "Пунктуация восстановлена."})
-        print("Russian text post-processing completed.")
-        emit_event(args, "stage", stage="postprocess", status="completed", message="Пунктуация восстановлена.")
-    else:
-        combined_text = "\n".join(segment["text"] for segment in segments).strip()
-        if args.restore_punctuation:
+    diarization = {"status": "disabled", "requestedDevice": getattr(args, "diarization_device", "auto"),
+                   "effectiveDevice": None, "turns": []}
+    diarization_text = None
+    if diarization_enabled:
+        emit_event(args, "stage", stage="diarization", status="in_progress",
+                   message="Определяем, кто говорит.")
+        try:
+            from services.diarization import assign_speakers, run_diarization
+            # faster-whisper keeps CTranslate2 weights loaded after transcription. Release
+            # them before Nemotron allocates its model; CLI recognition has exited already.
+            active_model = model.model if isinstance(model, AutoFallbackModel) else model
+            ctranslate_model = getattr(active_model, "model", None)
+            unload = getattr(ctranslate_model, "unload_model", None)
+            if not callable(unload):
+                unload = getattr(active_model, "unload_model", None)
+            if callable(unload):
+                unload()
+            diarized = run_diarization(diarization_wav, getattr(args, "diarization_device", "auto"))
+            turns = assign_speakers(asr_segments, diarized["intervals"])
+            diarization = {"status": "completed", "requestedDevice": getattr(args, "diarization_device", "auto"),
+                           "effectiveDevice": diarized["effectiveDevice"], "turns": turns}
+            emit_event(args, "stage", stage="diarization", status="completed", message="Диаризация завершена.")
+        finally:
+            if diarization_wav is not None:
+                diarization_wav.unlink(missing_ok=True)
+
+        emit_event(args, "stage", stage="postprocess",
+                   status="in_progress" if effective_restore_punctuation else "skipped",
+                   message="Восстанавливаем пунктуацию в русских репликах." if effective_restore_punctuation else
+                   ("Пунктуация пропущена: обнаружен не русский язык." if args.restore_punctuation else
+                    "Восстановление пунктуации выключено."))
+        if effective_restore_punctuation:
+            for turn in turns:
+                turn["text"] = restore_russian_segment_text(turn["text"])
+            emit_event(args, "stage", stage="postprocess", status="completed", message="Пунктуация восстановлена.")
+        elif args.restore_punctuation:
             postprocess_notice = "Пунктуация не восстановлена: обнаружен не русский язык."
             print(postprocess_notice)
+        from services.diarization import render_turns
+        diarization_text = render_turns(turns)
+        combined_text = diarization_text
+    else:
+        # Keep the established non-diarization recognition and postprocessing order intact.
+        emit_event(args, "stage", stage="postprocess",
+                   status="in_progress" if effective_restore_punctuation else "skipped",
+                   message="Восстанавливаем пунктуацию в русском тексте." if effective_restore_punctuation else
+                   ("Пунктуация пропущена: обнаружен не русский язык." if args.restore_punctuation else
+                    "Восстановление пунктуации выключено."))
+        if effective_restore_punctuation:
+            print("Russian text post-processing enabled.")
+            print("Applying punctuation restoration to Russian segments.")
+            postprocess_progress = progress_callback(args, "postprocess", "Восстанавливаем пунктуацию.") if getattr(args, "single_source", False) else None
+            total_segments = len(segments)
+            for index, segment in enumerate(segments, start=1):
+                segment["text"] = restore_russian_segment_text(segment["text"])
+                if postprocess_progress:
+                    postprocess_progress({"percent": min(99.0, index * 100.0 / max(1, total_segments)),
+                                          "message": f"Обработано фрагментов {index} из {total_segments}."})
+            combined_text = build_polished_russian_text_from_segments([segment["text"] for segment in segments])
+            if postprocess_progress:
+                postprocess_progress({"percent": 100.0, "message": "Пунктуация восстановлена."})
+            print("Russian text post-processing completed.")
+            emit_event(args, "stage", stage="postprocess", status="completed", message="Пунктуация восстановлена.")
+        else:
+            combined_text = "\n".join(segment["text"] for segment in segments).strip()
+            if args.restore_punctuation:
+                postprocess_notice = "Пунктуация не восстановлена: обнаружен не русский язык."
+                print(postprocess_notice)
 
     try:
-        output_path, rendered_result = write_output(args, segments, combined_text, stats, filename)
+        output_path, rendered_result = write_output(args, segments, combined_text, stats, filename,
+                                                    diarization=diarization if diarization_enabled else None,
+                                                    diarization_text=diarization_text)
     except TaskFailure:
         raise
     except Exception as exc:
@@ -344,9 +452,10 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
         "rendered_result": rendered_result,
         "segments": segments if args.use_timestamps else [{"text": segment["text"]} for segment in segments],
         "elapsed_seconds": round(elapsed_seconds, 2),
-        "effective_device": getattr(model, "effective_device", getattr(args, "device", "cpu")),
-        "effective_backend": getattr(model, "effective_backend", "faster-whisper"),
+        "effective_device": asr_effective_device,
+        "effective_backend": asr_effective_backend,
     }
+    result["diarization"] = diarization
     if postprocess_notice:
         result["notice"] = postprocess_notice
 
@@ -357,6 +466,7 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
         status="completed",
         message=f"Completed {Path(filename).name}",
         result=result,
+        diarization=diarization,
     )
     return result
 
@@ -541,10 +651,7 @@ def preserve_audio_copy(args, source_media_file: str) -> str | None:
     return str(target)
 
 
-def main():
-    global audio_file
-    media_files = []
-
+def build_argument_parser():
     parser = argparse.ArgumentParser("Generates subtitiles of the video file as an input")
     parser.add_argument("-f", "--filename", help="Name of the media file stored in the filesystem or URL of a video/audio file that needs to subtitles. URL can also be a list of media")
     parser.add_argument("-i", "--input_dir", help="Input directory where video files are. --filename overrides this")
@@ -569,8 +676,18 @@ def main():
     parser.add_argument("--output_format", help="Output format to create", choices=["txt", "srt", "json"], default="srt")
     parser.add_argument("--no_timestamps", help="Disable timestamps in txt/json output. Ignored for srt.", action="store_true")
     parser.add_argument("--restore_punctuation", help="Restore punctuation for explicitly selected Russian transcription.", action="store_true")
+    parser.add_argument("--diarization", help="Enable Nemotron speaker diarization.", action="store_true", default=False)
+    parser.add_argument("--diarization-device", help="Nemotron device ID (auto, cpu, cuda:N, or vulkan:N).", type=str, default="auto")
     parser.add_argument("--single-source", help=argparse.SUPPRESS, action="store_true")
     parser.add_argument("--web_json", help=argparse.SUPPRESS, action="store_true")
+    return parser
+
+
+def main():
+    global audio_file
+    media_files = []
+
+    parser = build_argument_parser()
 
     args = parser.parse_args()
     configure_web_stdio(args)
@@ -606,7 +723,7 @@ def main():
         except OSError as exc:
             raise TaskFailure(str(exc), "output_failed", stage="result") from exc
         add_media_files(args, media_files, debug=not args.quiet, verbose=args.verbose)
-        model = None if getattr(args, "single_source", False) else initialize(args)
+        model = None if getattr(args, "single_source", False) or args.diarization else initialize(args)
         results = []
 
         for media_file in media_files:
@@ -654,7 +771,7 @@ def main():
             elif getattr(args, "single_source", False):
                 emit_event(args, "stage", stage="audio", status="skipped", message="Подготовка аудио не требуется.")
 
-            if getattr(args, "single_source", False):
+            if getattr(args, "single_source", False) or args.diarization:
                 emit_event(args, "stage", stage="recognition", status="in_progress",
                            message="Загружаем модель в память.")
                 model = initialize(args)

@@ -176,6 +176,16 @@ function Invoke-RequiredModelPreparation([switch]$NoDownload) {
     if ($LASTEXITCODE -ne 0) { Fail 'Подготовка обязательных моделей не завершена. Повторный запуск продолжит загрузку с уже сохранённых файлов.' }
 }
 
+function Invoke-DiarizationPreparation([switch]$NoDownload) {
+    $arguments = @('-m', 'services.diarization_runtime')
+    if ($NoDownload) { $arguments += '--check-only' }
+    Write-Host 'Проверяю локальную диаризацию Nemotron-3...'
+    Invoke-Python $arguments
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host 'ПРЕДУПРЕЖДЕНИЕ: диаризация не полностью подготовлена. Приложение продолжит запуск; проверьте сообщения выше и повторите start.ps1 для загрузки недостающих файлов.' -ForegroundColor Yellow
+    }
+}
+
 function Get-ExecutableVersion([string]$Path, [string]$Argument) {
     if (-not $Path) { return $null }
     try { return ((& $Path $Argument 2>$null | Select-Object -First 1).Trim()) } catch { return $null }
@@ -454,6 +464,7 @@ function Ensure-Environment {
             finally { Pop-Location; $env:ELECTRON_CACHE = $savedElectronCache }
         }
         Invoke-CudaRuntimePreparation -NoDownload
+        Invoke-DiarizationPreparation -NoDownload
         if ($SetupOnly) {
             Invoke-RequiredModelPreparation -NoDownload
         } else {
@@ -550,6 +561,7 @@ function Ensure-Environment {
         Set-Content -LiteralPath $buildMarker -Value $uiFingerprint -NoNewline -Encoding ascii
     }
     Invoke-CudaRuntimePreparation
+    Invoke-DiarizationPreparation
     if ($SetupOnly) { Invoke-RequiredModelPreparation }
 }
 
