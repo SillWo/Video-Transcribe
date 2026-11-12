@@ -171,6 +171,7 @@ function Invoke-CudaRuntimePreparation([switch]$NoDownload) {
 function Invoke-RequiredModelPreparation([switch]$NoDownload) {
     $arguments = @('-m', 'services.prepare_models')
     if ($NoDownload) { $arguments += '--check-only' }
+    if ($SetupOnly) { $arguments += '--setup-only' }
     if (-not $script:IncludePostprocess) { $arguments += '--skip-postprocess' }
     Invoke-Python $arguments
     if ($LASTEXITCODE -ne 0) { Fail 'Подготовка обязательных моделей не завершена. Повторный запуск продолжит загрузку с уже сохранённых файлов.' }

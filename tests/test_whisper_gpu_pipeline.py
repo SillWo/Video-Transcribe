@@ -353,6 +353,28 @@ class WhisperGpuTranscribeTests(unittest.TestCase):
         self.assertEqual(result["text"], "hello world")
         self.assertIn("не русский язык", result["notice"])
 
+    def test_silent_empty_diarization_result_keeps_unknown_language_and_empty_turns(self):
+        class SilentModel:
+            effective_device = "cpu"
+            effective_backend = "ASR worker"
+
+            def transcribe(self, *_args, **_kwargs):
+                return [], SimpleNamespace(language=None, language_probability=None, duration=2.0)
+
+        args = self.build_args(language="auto", restore_punctuation=False)
+        args.diarization = True
+        args.diarization_device = "auto"
+        args.nproc = 2
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.object(whisper_gpu.time, "strftime", return_value="20260417-120000"), \
+                patch.object(whisper_gpu.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
+                patch("utils.text_postprocess.configure_punctuation_device"):
+            args.output_dir = temp_dir
+            result = whisper_gpu.transcribe(args, SilentModel(), "input.wav", "media.wav")
+        self.assertIsNone(result["detected_language"])
+        self.assertEqual(result["segments"], [])
+        self.assertEqual(result["diarization"]["turns"], [])
+
     def test_auto_gpu_fallback_catches_deferred_iteration_failure_without_partial_results(self):
         class FailingGpu:
             def transcribe(self, *_args, **_kwargs):

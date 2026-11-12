@@ -1,0 +1,8 @@
+transcribe-cpp[cu12]==0.4.1
+transcribe-cpp-native==0.4.1
+transcribe-cpp-native-cu12 @ https://github.com/handy-computer/transcribe.cpp/releases/download/v0.4.1/transcribe_cpp_native_cu12-0.4.1-py3-none-win_amd64.whl#sha256=7af39bbbddd79039d9b2d400ab96c7248b1ad5073be2d4161dafddb649bfe7d1 ; sys_platform == 'win32'
+transcribe-cpp-native-cu12 @ https://github.com/handy-computer/transcribe.cpp/releases/download/v0.4.1/transcribe_cpp_native_cu12-0.4.1-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl#sha256=cfbb65ec833effdc18e424d1e3ca7312d33dcd0e92f42866de0d6b8ef52492f0 ; sys_platform == 'linux' and platform_machine == 'x86_64'
+nvidia-cuda-runtime-cu12==12.9.79
+nvidia-cuda-nvrtc-cu12==12.9.86
+nvidia-cublas-cu12==12.9.2.10
+numpy==2.4.4

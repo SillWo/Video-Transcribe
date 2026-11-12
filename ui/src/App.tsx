@@ -4,17 +4,21 @@ import { AlertCircle, Check, Circle, Clipboard, FileText, LoaderCircle, Minus, P
 import { API_BASE, fetchJson, type FileSelection } from './lib/api'
 import { DraftManager, SelectionGate, flushAndRead } from './lib/draftManager'
 import { defaultDiarizationPrefs, diarizationRequestFields, sanitizeDiarizationPrefs, sanitizeStoredPrefs, stageOrderFor } from './lib/diarization'
+import { canSubmitOnDevice, defaultDeviceForProfile, gpuReadinessLabel, profileDeviceCapability, type AsrDeviceCapability } from './lib/asrCapabilities'
+import { resolveTaskProgressView, type TaskStage } from './lib/taskProgress'
 
 type Profile = 'quality' | 'balanced' | 'economy'
 type Device = 'cpu' | 'gpu'
 type JobStatus = 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'interrupted' | 'cancelled'
-type Stage = 'preparation' | 'source' | 'audio' | 'recognition' | 'diarization' | 'postprocess' | 'result'
+type Stage = TaskStage
 type Checkpoint = { stage: Stage; status: 'pending' | 'active' | 'completed' | 'skipped' | 'failed' | 'cancelled'; startedAt: string | null; completedAt: string | null }
-type JobProgress = { stage: Stage; percent: number | null; completedBytes: number | null; totalBytes: number | null; processedSeconds: number | null; totalSeconds: number | null; message: string | null; updatedAt: string }
+type JobProgress = { stage: Stage; phase?: string | null; phaseStartedAt?: string | null; percent: number | null; completedBytes: number | null; totalBytes: number | null; processedSeconds: number | null; totalSeconds: number | null; message: string | null; updatedAt: string }
 type SimpleJob = {
   id: string; sourceType: 'url' | 'file'; source: string; profile: Profile; device: Device
+  model?: string | null; effectiveModel?: string | null; effectiveDevice?: string | null; effectiveBackend?: string | null; precision?: string | null
+  asrDiagnostics?: Record<string, unknown> | null
   cpuThreads: number; restorePunctuation: boolean; diarizationEnabled?: boolean; diarizationDevice?: string
-  diarization?: { status: string; requestedDevice: string; effectiveDevice: { id: string; name: string; backend: string } | null; turns?: { start: number; end: number; text: string; speakerIds: number[]; label: string }[] }
+  diarization?: { status: string; requestedDevice: string; effectiveDevice: { id: string; name: string; backend: string } | null; turns?: { start: number | null; end: number | null; timingKnown?: boolean; text: string; speakerIds: number[]; label: string }[] }
   status: JobStatus
   stage: Stage; progress?: JobProgress | null; checkpoints?: Checkpoint[]; createdAt: string
   finishedAt?: string | null; durationSeconds?: number | null
@@ -26,8 +30,8 @@ type Summary = Omit<SimpleJob, 'text'> & { queuePosition?: number | null }
 type HistoryItem = Omit<SimpleJob, 'text'> & { queuePosition?: number | null }
 type QueueState = { paused: boolean; pauseReason: { code: string; message: string } | null; cancelling: boolean; activeJob: Summary | null; waitingJobs: Summary[]; waitingCount: number }
 type Options = {
-  profiles: { id: Profile; label: string; model: string }[]
-  devices: { cpu: { available: boolean; name: string }; gpu: { available: boolean; name: string; reason: string | null } }
+  profiles: { id: Profile; label: string; model: string; devices?: Partial<Record<Device, AsrDeviceCapability>>; defaultDevice?: Device }[]
+  devices: { cpu: AsrDeviceCapability; gpu: AsrDeviceCapability }
   defaultDevice: Device; maxCpuThreads: number
   diarization?: { enabledByDefault: boolean; defaultDevice: string; devices: { id: string; name: string; backend: string; available: boolean; reason: string | null }[]; ready: boolean }
 }
@@ -198,6 +202,9 @@ function Workspace() {
   const [optionsError, setOptionsError] = useState('')
   const [preferencesReady, setPreferencesReady] = useState(false)
   const [job, setJob] = useState<SimpleJob | null>(null)
+  const currentJobId = job?.id ?? null
+  const currentJobStatus = job?.status ?? null
+  const currentJobStage = job?.stage ?? null
   const [queue, setQueue] = useState<QueueState>({ paused: false, pauseReason: null, cancelling: false, activeJob: null, waitingJobs: [], waitingCount: 0 })
   const [queueLoaded, setQueueLoaded] = useState(false)
   const [queueError, setQueueError] = useState('')
@@ -255,7 +262,7 @@ function Workspace() {
       if (optionsResult.status === 'fulfilled') {
         const value = optionsResult.value
         setOptions(value)
-          nextPrefs = { ...nextPrefs, device: stored.device ?? value.defaultDevice, cpuThreads: clamp(stored.cpuThreads ?? value.maxCpuThreads, 1, value.maxCpuThreads) }
+          nextPrefs = { ...nextPrefs, device: stored.device ?? defaultDeviceForProfile(value, nextPrefs.profile), cpuThreads: clamp(stored.cpuThreads ?? value.maxCpuThreads, 1, value.maxCpuThreads) }
       } else setOptionsError(errorText(optionsResult.reason))
 
       if (sessionResult.status === 'rejected') setFormError(`Не удалось восстановить последнюю задачу. ${errorText(sessionResult.reason)}`)
@@ -279,6 +286,16 @@ function Workspace() {
     })
     return () => { active = false }
   }, [])
+  useEffect(() => {
+    if (!currentJobId || !currentJobStatus || !isActiveStatus(currentJobStatus)) return
+    let active = true
+    const refreshOptions = () => {
+      void api.options().then((value) => { if (active) setOptions(value) }).catch(() => undefined)
+    }
+    refreshOptions()
+    const timer = currentJobStage === 'preparation' ? window.setInterval(refreshOptions, 2500) : undefined
+    return () => { active = false; if (timer !== undefined) window.clearInterval(timer) }
+  }, [currentJobId, currentJobStatus, currentJobStage])
 
   useEffect(() => {
     let stopped = false
@@ -480,7 +497,9 @@ function Workspace() {
 
   const active = job !== null && isActiveStatus(job.status)
   const formLocked = enqueueBusy || queue.cancelling
-  const canSubmit = Boolean(options && !formLocked && (sourceType === 'url' ? isHttpUrl(source.trim()) : fileBatch.length > 0))
+  const selectedGpuCapability = profileDeviceCapability(options, prefs.profile, 'gpu')
+  const selectedDeviceAllowed = canSubmitOnDevice(options, prefs.profile, prefs.device)
+  const canSubmit = Boolean(options && !formLocked && selectedDeviceAllowed && (sourceType === 'url' ? isHttpUrl(source.trim()) : fileBatch.length > 0))
   const showInitialLoading = !preferencesReady && !job
 
   const pickFile = async () => {
@@ -746,8 +765,10 @@ function Workspace() {
           <legend>Устройство</legend>
           <div className="segmented" role="radiogroup" aria-label="Устройство для распознавания">
             <button type="button" role="radio" aria-checked={prefs.device === 'cpu'} className={prefs.device === 'cpu' ? 'selected' : ''} onClick={() => setPrefs((value) => ({ ...value, device: 'cpu' }))}>Процессор</button>
-            <button type="button" role="radio" aria-checked={prefs.device === 'gpu'} className={prefs.device === 'gpu' ? 'selected' : ''} disabled={!options?.devices.gpu.available} title={options?.devices.gpu.available ? undefined : 'Видеокарта недоступна. Можно продолжить на процессоре.'} onClick={() => setPrefs((value) => ({ ...value, device: 'gpu' }))}>Видеокарта{options && !options.devices.gpu.available ? <span className="unavailable">Недоступно</span> : null}</button>
+            <button type="button" role="radio" aria-checked={prefs.device === 'gpu'} className={prefs.device === 'gpu' ? 'selected' : ''} disabled={!selectedGpuCapability || (!selectedGpuCapability.available && !selectedGpuCapability.canPrepare)} title={selectedGpuCapability?.reason ?? undefined} onClick={() => setPrefs((value) => ({ ...value, device: 'gpu' }))}>Видеокарта{selectedGpuCapability && <span className="unavailable">{gpuReadinessLabel(selectedGpuCapability)}</span>}</button>
           </div>
+          {prefs.device === 'gpu' && selectedGpuCapability && !selectedDeviceAllowed && <p className="diarization-readiness unavailable" role="status">{selectedGpuCapability.reason || 'Видеокарта не прошла проверку для этого профиля.'}</p>}
+          {prefs.device === 'gpu' && selectedGpuCapability && selectedDeviceAllowed && selectedGpuCapability.state === 'needs_preparation' && <p className="diarization-readiness" role="status">{selectedGpuCapability.reason || 'Компоненты видеокарты подготовятся автоматически перед первым запуском.'}</p>}
           {prefs.device === 'cpu' && options && <label className="thread-control" htmlFor="cpu-threads"><span>Потоки процессора</span><input id="cpu-threads" type="number" min={1} max={options.maxCpuThreads} value={prefs.cpuThreads} onChange={(event) => setPrefs((value) => ({ ...value, cpuThreads: clamp(Number(event.target.value) || 1, 1, options.maxCpuThreads) }))} /></label>}
         </fieldset>
 
@@ -817,14 +838,15 @@ function Workspace() {
         {(() => {
           const checkpoints = checkpointsFor(job)
           const currentStageOrder = stageOrderFor(job.diarizationEnabled === true) as readonly Stage[]
-          const currentStage = job.progress?.stage && currentStageOrder.includes(job.progress.stage) ? job.progress.stage : job.stage
+          const progressView = resolveTaskProgressView(job.stage, job.progress, currentStageOrder)
+          const currentStage = progressView.currentStage
           const currentCheckpoint = checkpoints.find((checkpoint) => checkpoint.stage === currentStage)
-          const progress = job.progress
+          const progress = progressView.progress
           const percent = typeof progress?.percent === 'number' && Number.isFinite(progress.percent) ? Math.max(0, Math.min(100, progress.percent)) : null
           const quiet = Boolean(active && progress?.updatedAt && ['preparation', 'source'].includes(currentStage) && elapsedSince(progress.updatedAt, clockNow) !== null && elapsedSince(progress.updatedAt, clockNow)! > 20)
-          const stageAge = elapsedSince(currentCheckpoint?.startedAt ?? null, clockNow)
+          const stageAge = elapsedSince(progressView.startedAt ?? currentCheckpoint?.startedAt ?? null, clockNow)
           const detail = stageProgressText(progress)
-          const heading = progress?.message?.trim() || stageName(currentStage)
+          const heading = progressView.label || progress?.message?.trim() || stageName(currentStage)
           const waitingSeconds = job.status === 'queued' ? elapsedSince(job.createdAt, clockNow) : job.queueWaitSeconds ?? null
           const hasSplitTiming = job.startedAt !== undefined || job.queueWaitSeconds !== undefined || job.processingDurationSeconds !== undefined
           const processingSeconds = job.status === 'running' || job.status === 'cancelling'
@@ -835,13 +857,13 @@ function Workspace() {
           const cancellationPending = job.status === 'cancelling' && !retryableCancellation
           return <section className={`work-panel ${job.status}`} aria-label="Этапы расшифровки">
             {job.status === 'queued' && <div className="queue-position"><div><strong>Ожидает запуска</strong><p>Место в очереди: {queuedPosition ?? '—'}</p></div><span className="status-badge queued">Ожидает</span><button type="button" className="cancel-button" onClick={() => void cancelJob()} disabled={cancelBusy} aria-label={cancelBusy ? 'Отменяем задачу' : 'Отмена'}>{cancelBusy ? <LoaderCircle size={16} className="spin" /> : <X size={16} />}<span>{cancelBusy ? 'Отменяем…' : 'Отмена'}</span></button></div>}
-            {active && job.status !== 'queued' && <div className="work-current"><div className="work-current-icon"><LoaderCircle size={19} className="spin" /></div><div className="work-current-copy"><strong>{heading}</strong><p>{quiet ? 'Ожидаем данные…' : stageName(currentStage)}{stageAge !== null && <span className="elapsed"> · этап {clockText(stageAge)}</span>}</p></div><span className={`status-badge ${job.status}`}>{statusLabels[job.status]}</span><button type="button" className="cancel-button" onClick={() => void cancelJob()} disabled={cancelBusy || cancellationPending} aria-label={cancelBusy || cancellationPending ? 'Отменяем задачу' : 'Отмена'}>{cancelBusy || cancellationPending ? <LoaderCircle size={16} className="spin" /> : <X size={16} />}<span>{cancelBusy || cancellationPending ? 'Отменяем…' : 'Отмена'}</span></button></div>}
+            {active && job.status !== 'queued' && <div className="work-current"><div className="work-current-icon"><LoaderCircle size={19} className="spin" /></div><div className="work-current-copy"><strong>{heading}</strong><p>{quiet ? 'Ожидаем данные…' : progressView.label || stageName(currentStage)}{stageAge !== null && <span className="elapsed"> · этап {clockText(stageAge)}</span>}</p></div><span className={`status-badge ${job.status}`}>{statusLabels[job.status]}</span><button type="button" className="cancel-button" onClick={() => void cancelJob()} disabled={cancelBusy || cancellationPending} aria-label={cancelBusy || cancellationPending ? 'Отменяем задачу' : 'Отмена'}>{cancelBusy || cancellationPending ? <LoaderCircle size={16} className="spin" /> : <X size={16} />}<span>{cancelBusy || cancellationPending ? 'Отменяем…' : 'Отмена'}</span></button></div>}
             {!active && <div className={`work-terminal-heading ${job.status}`}><span>{job.status === 'completed' ? <Check size={18} /> : job.status === 'cancelled' ? <Minus size={18} /> : <AlertCircle size={18} />}</span><div><strong>{job.status === 'completed' ? 'Расшифровка готова' : job.status === 'cancelled' ? 'Отменена' : job.status === 'failed' ? 'Не удалось расшифровать видео' : 'Задача была прервана'}</strong>{job.status !== 'completed' && <p>{job.status === 'cancelled' ? 'Обработка остановлена. Можно запустить новую задачу.' : safeError(job.error) || 'Можно запустить новую попытку с текущими настройками.'}</p>}</div></div>}
             {hasSplitTiming ? <div className={job.status === 'completed' ? 'completed-timing' : undefined}><div className="overall-time"><span>Ожидание в очереди</span><strong>{waitingSeconds !== null ? clockText(waitingSeconds) : '—'}</strong></div><div className="overall-time"><span>Обработка</span><strong>{processingSeconds !== null ? clockText(processingSeconds) : job.status === 'interrupted' && !job.finishedAt ? 'Время неизвестно' : '—'}</strong></div></div> : <div className="overall-time"><span>Общее время</span><strong>{terminalDurationSeconds(job) !== null ? clockText(terminalDurationSeconds(job)!) : '—'}</strong></div>}
             {checkpoints.length > 0 && <ol className="checkpoint-list" aria-label="Этапы обработки">
               {checkpoints.map((checkpoint) => <li key={checkpoint.stage} className={`checkpoint ${checkpoint.status}${checkpoint.stage === currentStage && active ? ' current' : ''}`} aria-current={checkpoint.stage === currentStage && active ? 'step' : undefined}>
                 <span className="checkpoint-icon" aria-hidden="true">{checkpoint.status === 'completed' ? <Check size={14} /> : checkpoint.status === 'active' && active ? <LoaderCircle size={14} className="spin" /> : checkpoint.status === 'failed' ? <AlertCircle size={14} /> : checkpoint.status === 'skipped' ? <span className="skip-mark">–</span> : checkpoint.status === 'cancelled' ? <Minus size={14} /> : <Circle size={12} />}</span>
-                <span className="checkpoint-label">{stageName(checkpoint.stage)}{(checkpoint.status === 'skipped' || checkpoint.status === 'cancelled') && <small>{checkpoint.status === 'skipped' ? 'Пропущено' : 'Отменено'}</small>}</span>
+                <span className="checkpoint-label">{checkpoint.stage === currentStage && active && progressView.label ? progressView.label : stageName(checkpoint.stage)}{(checkpoint.status === 'skipped' || checkpoint.status === 'cancelled') && <small>{checkpoint.status === 'skipped' ? 'Пропущено' : 'Отменено'}</small>}</span>
               </li>)}
             </ol>}
             {active && job.status !== 'queued' && <div className="stage-progress" aria-label="Прогресс текущей операции">

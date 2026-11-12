@@ -1,3 +1,6 @@
+import contextlib
+import importlib.util
+import io
 import tempfile
 import unittest
 import json
@@ -256,6 +259,66 @@ class SimpleApiTests(unittest.TestCase):
         self.assertNotIn(b"transcript text", web_api.history_store.db_path.read_bytes())
         self.assertEqual(self.client.delete(f"/api/simple/history/{body['id']}").status_code, 409)
 
+    def test_start_remaps_queued_cpu_and_gpu_jobs_from_profile_and_persists_effective_model(self):
+        from services.runtime_devices import asr_gpu_candidate
+        for requested, expected_backend in (("cpu", "cpu"), ("gpu", "directml")):
+            with self.subTest(device=requested):
+                job_id = ("a" if requested == "cpu" else "b") * 32
+                metadata, settings = web_api._simple_metadata(
+                    job_id, "C:/source.wav", "file", "balanced", requested, 4, False,
+                )
+                metadata["model"] = "large-v3-turbo"  # Simulate a queued legacy preset.
+                metadata["settings"]["model"] = "large-v3-turbo"
+                settings["model"] = "large-v3-turbo"
+                web_api.history_store.create(metadata)
+                job = JobState(id=job_id, settings=settings)
+                web_api.jobs[job_id] = job
+                candidate = {"canPrepare": True, "backend": "directml", "deviceIndex": 5,
+                             "name": "AMD Radeon", "identity": "dxgi-luid", "driverVersion": "1"}
+                patcher = patch("services.runtime_devices.asr_gpu_candidate", return_value=candidate)
+                with patcher:
+                    selected = web_api._resolve_simple_execution(job_id, job)
+
+                self.assertEqual(job.settings["model"], "parakeet-tdt-0.6b-v3")
+                self.assertEqual(job.settings["device"], expected_backend)
+                self.assertEqual(job.settings["_gpuIndex"], 5 if requested == "gpu" else None)
+                self.assertEqual(selected is not None, requested == "gpu")
+                saved = web_api.history_store.get(job_id)
+                self.assertEqual(saved["model"], "parakeet-tdt-0.6b-v3")
+                self.assertEqual(saved["effectiveModel"], "parakeet-tdt-0.6b-v3")
+                self.assertEqual(saved["effectiveBackend"], expected_backend)
+
+    def test_finished_legacy_history_keeps_its_original_model(self):
+        job_id = "f" * 32
+        metadata, _settings = web_api._simple_metadata(
+            job_id, "C:/source.wav", "file", "quality", "cpu", 4, False,
+        )
+        metadata["model"] = "large-v3"
+        metadata["settings"]["model"] = "large-v3"
+        web_api.history_store.create(metadata)
+        web_api.history_store.update(job_id, status="completed", model="large-v3")
+
+        shape = self.client.get(f"/api/simple/jobs/{job_id}").json()
+
+        self.assertEqual(shape["model"], "large-v3")
+        self.assertEqual(web_api.history_store.get(job_id)["model"], "large-v3")
+
+    def test_explicit_gpu_selection_fails_instead_of_rewriting_to_cpu(self):
+        job_id = "d" * 32
+        metadata, settings = web_api._simple_metadata(
+            job_id, "C:/source.wav", "file", "quality", "gpu", 4, False,
+        )
+        web_api.history_store.create(metadata)
+        job = JobState(id=job_id, settings=settings)
+        web_api.jobs[job_id] = job
+        unavailable = {"canPrepare": False, "backend": None, "deviceIndex": None,
+                       "reason": "GPU smoke failed for this profile."}
+        with patch("services.runtime_devices.asr_gpu_candidate", return_value=unavailable):
+            with self.assertRaisesRegex(web_api.TaskFailure, "GPU smoke failed"):
+                web_api._resolve_simple_execution(job_id, job)
+        self.assertEqual(job.settings["_requestedDevice"], "gpu")
+        self.assertEqual(job.settings["device"], "cpu")
+
     def test_source_validation_and_history_shapes(self):
         with patch.object(web_api, "run_job", return_value=None), \
              patch.object(web_api.simple_profiles, "resolve", return_value=("small", "cpu")):
@@ -302,7 +365,59 @@ class SimpleApiTests(unittest.TestCase):
         self.assertEqual(fragments["message"], "Обработано фрагментов 12 из 37.")
         web_api._simple_progress(job_id, "postprocess", {"message": "Обработано фрагментов C:/secret из 37."})
         private = self.client.get(f"/api/simple/jobs/{job_id}").json()["progress"]
-        self.assertEqual(private["message"], "Обработка текста")
+        self.assertEqual(private["message"], "Восстановление пунктуации")
+
+    def test_alignment_phase_survives_worker_cli_api_chain_then_clears_for_postprocess(self):
+        from services.asr_engine import NewAsrModel
+
+        worker_values = []
+        model = NewAsrModel("qwen3-asr-1.7b", "cpu", progress=worker_values.append)
+        model._forward_worker_event(
+            {"type": "progress", "stage": "alignment", "message": "worker private text",
+             "processedSeconds": 12.0, "totalSeconds": 60.0},
+            "recognition",
+        )
+        self.assertEqual(worker_values[0]["stage"], "recognition")
+        self.assertEqual(worker_values[0]["phase"], "alignment")
+
+        module_path = Path(web_api.__file__).resolve().with_name("whisper-gpu.py")
+        spec = importlib.util.spec_from_file_location("whisper_gpu_progress_chain", module_path)
+        whisper_gpu = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(whisper_gpu)
+        args = type("Args", (), {"web_json": True})()
+        with contextlib.redirect_stdout(io.StringIO()) as output, \
+                patch.object(whisper_gpu.timeit, "default_timer", side_effect=[1.0, 1.1]):
+            report = whisper_gpu.progress_callback(args, "recognition", "Распознавание речи")
+            report({"message": "ASR progress"})
+            report(worker_values[0])
+        events = [json.loads(line[len(whisper_gpu.JSON_EVENT_PREFIX):])
+                  for line in output.getvalue().splitlines()
+                  if line.startswith(whisper_gpu.JSON_EVENT_PREFIX)]
+        self.assertEqual(len(events), 2)
+        alignment_event = events[1]
+        self.assertEqual(alignment_event["phase"], "alignment")
+        self.assertEqual(alignment_event["workerStage"], "alignment")
+
+        job_id = "9" * 32
+        web_api.history_store.create({"id": job_id, "sourceType": "file", "source": "C:/source.wav",
+                                      "profile": "quality", "device": "cpu", "cpuThreads": 2,
+                                      "restorePunctuation": True})
+        web_api._simple_progress(job_id, alignment_event["stage"], alignment_event)
+        first = web_api.history_store.get(job_id)["progress"]
+        self.assertEqual(first["phase"], "alignment")
+        self.assertEqual(first["message"], "Выравнивание слов")
+        first_started_at = first["phaseStartedAt"]
+        web_api._simple_progress(job_id, alignment_event["stage"], alignment_event)
+        repeated = web_api.history_store.get(job_id)["progress"]
+        self.assertEqual(repeated["phaseStartedAt"], first_started_at)
+
+        web_api._simple_progress(job_id, "postprocess", {"percent": 10})
+        postprocess = web_api.history_store.get(job_id)["progress"]
+        self.assertIsNone(postprocess["phase"])
+        self.assertIsNone(postprocess["phaseStartedAt"])
+        self.assertIsNone(postprocess["processedSeconds"])
+        self.assertIsNone(postprocess["totalSeconds"])
+        self.assertEqual(postprocess["message"], "Восстановление пунктуации")
 
     def test_worker_events_persist_success_artifacts_and_failure_without_artifacts(self):
         def make_job(job_id, status_lines, exit_code=0):
@@ -332,15 +447,23 @@ class SimpleApiTests(unittest.TestCase):
         success_id = "c" * 32
         result_event = {"type": "result", "stage": "result", "result": {
             "text": "recognized words", "output_path": str(web_api.history_store.job_dir(success_id) / "output" / "captions.txt"),
-            "output_format": "txt", "detected_language": "en"}}
-        factory, _ = make_job(success_id, [result_event])
+            "output_format": "txt", "detected_language": "en",
+            "diagnostics": {"asr": {"gpu_verified": True}, "alignment": {"status": "completed"},
+                            "language": {"detected": "en"}}}}
+        completed_result = dict(result_event["result"])
+        complete_event = {"type": "complete", "results": [completed_result]}
+        factory, _ = make_job(success_id, [result_event, complete_event])
         with (patch.object(web_api, "JobProcessController", _FakeController),
               patch.object(web_api.subprocess, "Popen", side_effect=factory)):
             web_api.run_job(success_id, "C:/source.wav")
         completed = web_api.history_store.get(success_id)
         self.assertEqual(completed["status"], "completed")
+        expected_diagnostics = {"asr": {"gpu_verified": True}, "alignment": {"status": "completed"},
+                                "language": {"detected": "en"}}
+        self.assertEqual(completed["asrDiagnostics"], expected_diagnostics)
         completed_shape = self.client.get(f"/api/simple/jobs/{success_id}").json()
         self.assertIsInstance(completed_shape["finishedAt"], str)
+        self.assertEqual(completed_shape["asrDiagnostics"], expected_diagnostics)
         self.assertGreaterEqual(completed_shape["durationSeconds"], 0)
         self.assertEqual(web_api.history_store.read_text(success_id), "recognized words")
         self.assertEqual(web_api.history_store.artifact(success_id, "md").read_text(encoding="utf-8"), "recognized words")
@@ -361,6 +484,45 @@ class SimpleApiTests(unittest.TestCase):
         self.assertEqual(failed_shape["error"], "Не удалось обработать эту запись. Проверьте источник и повторите попытку.")
         self.assertIn("[error] decode failed", web_api.jobs[failed_id].logs)
 
+    def test_successful_silence_result_survives_complete_event_and_exports_empty_text(self):
+        job_id = "e" * 32
+        output_dir = web_api.history_store.job_dir(job_id) / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output = output_dir / "captions.txt"
+        output.write_text("", encoding="utf-8")
+        web_api.history_store.create({"id": job_id, "sourceType": "file", "source": "C:/silent.wav",
+                                      "profile": "economy", "device": "cpu", "cpuThreads": 2,
+                                      "restorePunctuation": False, "diarizationEnabled": False})
+        settings = {"_simple": True, "_outputDir": str(output_dir), "language": "auto", "model": "small",
+                    "device": "cpu", "nproc": 2, "outputFormat": "txt", "saveAudio": False,
+                    "useTimestamps": False, "restorePunctuation": False, "diarizationEnabled": False}
+        with web_api.jobs_lock:
+            web_api.jobs[job_id] = JobState(id=job_id, settings=settings)
+        result = {"text": "", "output_path": str(output), "output_format": "txt",
+                  "detected_language": None, "segments": []}
+        events = [
+            {"type": "result", "stage": "result", "result": result},
+            {"type": "complete", "results": [result]},
+        ]
+        encoded = [web_api.JSON_EVENT_PREFIX + json.dumps(event) + "\n" for event in events]
+
+        def factory(command, **kwargs):
+            return _FakeProcess() if "services.resource_preparation" in command else _FakeProcess(encoded)
+
+        with (patch.object(web_api, "JobProcessController", _FakeController),
+              patch.object(web_api.subprocess, "Popen", side_effect=factory)):
+            web_api.run_job(job_id, "C:/silent.wav")
+
+        record = web_api.history_store.get(job_id)
+        self.assertEqual(record["status"], "completed")
+        self.assertEqual(web_api.history_store.read_text(job_id), "")
+        self.assertEqual(web_api.history_store.artifact(job_id, "md").read_text(encoding="utf-8"), "")
+        response = self.client.get(f"/api/simple/jobs/{job_id}")
+        self.assertEqual(response.json()["text"], "")
+        self.assertIsNone(response.json()["detectedLanguage"])
+        self.assertEqual(response.json()["diarization"]["turns"], [])
+        self.assertEqual(self.client.get(f"/api/simple/jobs/{job_id}/download?format=txt").content, b"")
+        self.assertEqual(self.client.get(f"/api/simple/jobs/{job_id}/download?format=md").content, b"")
     def test_missing_simple_model_is_prepared_before_process_start(self):
         job_id = "b" * 32
         output_dir = web_api.history_store.job_dir(job_id) / "output"
@@ -388,7 +550,7 @@ class SimpleApiTests(unittest.TestCase):
         self.assertEqual(popen.call_count, 2)
         prepare_command = popen.call_args_list[0].args[0]
         self.assertEqual(prepare_command, [web_api.sys.executable, "-m", "services.resource_preparation",
-                                           "--model", "large-v3", "--device", "cpu"])
+                                           "--model", "qwen3-asr-1.7b", "--device", "cpu"])
         prepare_env = popen.call_args_list[0].kwargs["env"]
         asr_env = popen.call_args_list[1].kwargs["env"]
         self.assertIs(popen.call_args_list[0].kwargs["stdin"], web_api.subprocess.DEVNULL)
@@ -420,6 +582,103 @@ class SimpleApiTests(unittest.TestCase):
               patch.object(web_api, "run_job", return_value=None)):
             second = self.client.post("/api/simple/jobs", json=self.payload()).json()
         self.assertNotEqual(first["id"], second["id"])
+
+    def test_missing_worker_executable_is_logged_with_command_context_and_fails_job(self):
+        with (patch.object(web_api.simple_profiles, "resolve", return_value=("small", "cpu")),
+              patch.object(web_api, "run_job", return_value=None)):
+            body = self.client.post("/api/simple/jobs", json=self.payload()).json()
+
+        with (patch.object(web_api, "JobProcessController", _FakeController),
+              patch.object(web_api.subprocess, "Popen", side_effect=FileNotFoundError(2, "not found")),
+              self.assertLogs(web_api.logger, level="ERROR") as captured):
+            web_api.run_job(body["id"], "https://example.org/watch/123")
+
+        output = "\n".join(captured.output)
+        self.assertIn("Could not start owned process", output)
+        self.assertIn(repr(str(web_api.sys.executable)), output)
+        self.assertIn(str(web_api.APP_ROOT), output)
+        self.assertIn(f"job_id={body['id']}", output)
+        self.assertIn("stage=preparation", output)
+        record = web_api.history_store.get(body["id"])
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["errorCode"], "internal_error")
+
+    def test_gpu_smoke_rechecks_runtime_alias_after_child_preparation(self):
+        from services import asr_resources
+
+        with (patch.object(web_api.simple_profiles, "resolve", return_value=("small", "cpu")),
+              patch.object(web_api, "run_job", return_value=None)):
+            body = self.client.post("/api/simple/jobs", json=self.payload(device="gpu")).json()
+
+        candidate = {"canPrepare": True, "backend": "directml", "deviceIndex": 0,
+                     "name": "Test GPU", "identity": "test-gpu", "driverVersion": "1"}
+        alias_python = asr_resources._python_at(asr_resources._CANDIDATES[("parakeet", "directml")][0])
+        child_prepared = False
+
+        def installed_exact(python, _kind, _backend):
+            return child_prepared and Path(python) == alias_python
+
+        def run_owned(_controller, command, **_kwargs):
+            nonlocal child_prepared
+            self.assertIn("services.resource_preparation", command)
+            child_prepared = True
+            return 0
+
+        def smoke(_job, controller, selected_gpu):
+            self.assertIs(selected_gpu, candidate)
+            self.assertEqual(asr_resources.runtime_python("parakeet", "directml"), alias_python)
+            controller.cancel()
+
+        with (patch.object(web_api, "JobProcessController", _FakeController),
+              patch("services.runtime_devices.asr_gpu_candidate", return_value=candidate),
+              patch.object(asr_resources, "_installed_exact", side_effect=installed_exact),
+              patch.object(web_api, "_run_owned_process", side_effect=run_owned),
+              patch.object(web_api, "_run_simple_gpu_smoke", side_effect=smoke) as gpu_smoke):
+            web_api.run_job(body["id"], "https://example.org/watch/123")
+
+        gpu_smoke.assert_called_once()
+        self.assertEqual(web_api.history_store.get(body["id"])["status"], "cancelled")
+
+    def test_failed_gpu_preparation_does_not_invalidate_runtime_cache_or_run_smoke(self):
+        with (patch.object(web_api.simple_profiles, "resolve", return_value=("small", "cpu")),
+              patch.object(web_api, "run_job", return_value=None)):
+            body = self.client.post("/api/simple/jobs", json=self.payload(device="gpu")).json()
+
+        candidate = {"canPrepare": True, "backend": "directml", "deviceIndex": 0,
+                     "name": "Test GPU", "identity": "test-gpu", "driverVersion": "1"}
+        with (patch.object(web_api, "JobProcessController", _FakeController),
+              patch("services.runtime_devices.asr_gpu_candidate", return_value=candidate),
+              patch("services.asr_resources.invalidate_runtime_cache") as invalidate,
+              patch.object(web_api, "_run_owned_process", return_value=1),
+              patch.object(web_api, "_run_simple_gpu_smoke") as gpu_smoke):
+            web_api.run_job(body["id"], "https://example.org/watch/123")
+
+        invalidate.assert_not_called()
+        gpu_smoke.assert_not_called()
+        self.assertEqual(web_api.history_store.get(body["id"])["status"], "failed")
+
+    def test_cancelled_gpu_preparation_does_not_invalidate_runtime_cache_or_run_smoke(self):
+        with (patch.object(web_api.simple_profiles, "resolve", return_value=("small", "cpu")),
+              patch.object(web_api, "run_job", return_value=None)):
+            body = self.client.post("/api/simple/jobs", json=self.payload(device="gpu")).json()
+
+        candidate = {"canPrepare": True, "backend": "directml", "deviceIndex": 0,
+                     "name": "Test GPU", "identity": "test-gpu", "driverVersion": "1"}
+
+        def cancel_during_preparation(controller, _command, **_kwargs):
+            controller.cancel()
+            return 0
+
+        with (patch.object(web_api, "JobProcessController", _FakeController),
+              patch("services.runtime_devices.asr_gpu_candidate", return_value=candidate),
+              patch("services.asr_resources.invalidate_runtime_cache") as invalidate,
+              patch.object(web_api, "_run_owned_process", side_effect=cancel_during_preparation),
+              patch.object(web_api, "_run_simple_gpu_smoke") as gpu_smoke):
+            web_api.run_job(body["id"], "https://example.org/watch/123")
+
+        invalidate.assert_not_called()
+        gpu_smoke.assert_not_called()
+        self.assertEqual(web_api.history_store.get(body["id"])["status"], "cancelled")
 
     def _create_controlled_job(self):
         with (patch.object(web_api.simple_profiles, "resolve", return_value=("small", "cpu")),

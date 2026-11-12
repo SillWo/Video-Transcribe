@@ -26,6 +26,20 @@ class TextPostprocessTests(unittest.TestCase):
         self.assertEqual(result, "")
         model_loader.assert_not_called()
 
+    def test_cuda_inference_failure_retries_once_on_cpu_with_same_input(self):
+        model = Mock()
+        model.punctuate.side_effect = [RuntimeError("CUDA out of memory"), "Привет."]
+        original_device = text_postprocess._PUNCTUATION_DEVICE
+        try:
+            text_postprocess._PUNCTUATION_DEVICE = "cuda"
+            with patch("utils.text_postprocess.load_punctuation_model", return_value=model):
+                self.assertEqual(text_postprocess.restore_russian_segment_text("Привет!"), "Привет.")
+        finally:
+            text_postprocess._PUNCTUATION_DEVICE = original_device
+        self.assertEqual(model.punctuate.call_args_list[0].args, ("привет",))
+        self.assertEqual(model.punctuate.call_args_list[1].args, ("привет",))
+        model.to.assert_called_once_with("cpu")
+
     def test_build_polished_russian_text_from_segments_drops_empty_items_and_returns_single_line(self):
         mock_sentences = [
             SimpleNamespace(text=" Привет, мир. "),

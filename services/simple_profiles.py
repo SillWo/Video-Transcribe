@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from services.runtime_devices import get_device_details, get_simple_gpu_details
+from services.asr_capabilities import profile_device_options
+from services.runtime_devices import asr_gpu_candidate, get_simple_gpu_details
 
 PROFILES = {
-    "quality": ("Качество", "large-v3"),
-    "balanced": ("Баланс", "large-v3-turbo"),
+    "quality": ("Качество", "qwen3-asr-1.7b"),
+    "balanced": ("Баланс", "parakeet-tdt-0.6b-v3"),
     "economy": ("Экономный", "small"),
 }
 
@@ -30,22 +31,7 @@ def _public_gpu_reason(details: dict) -> str | None:
 
 
 def options(max_cpu_threads: int) -> dict:
-    details = {item["id"]: item for item in get_device_details()}
-    gpu = gpu_details()
-    devices = {
-        "cpu": {"available": True, "name": details.get("cpu", {}).get("name", "CPU")},
-        "gpu": {
-            "available": bool(gpu.get("available")),
-            "name": gpu.get("name") or "GPU",
-            "reason": _public_gpu_reason(gpu),
-        },
-    }
-    return {
-        "profiles": [{"id": key, "label": value[0], "model": value[1]} for key, value in PROFILES.items()],
-        "devices": devices,
-        "defaultDevice": "gpu" if devices["gpu"]["available"] else "cpu",
-        "maxCpuThreads": max_cpu_threads,
-    }
+    return profile_device_options(PROFILES, max_cpu_threads)
 
 
 def resolve(profile: str, device: str) -> tuple[str, str]:
@@ -56,7 +42,10 @@ def resolve(profile: str, device: str) -> tuple[str, str]:
     model = PROFILES[profile][1]
     if device == "cpu":
         return model, "cpu"
+    candidate = asr_gpu_candidate(model)
+    if candidate.get("canPrepare") and candidate.get("backend"):
+        return model, candidate["backend"]
     gpu = gpu_details()
-    if gpu.get("available") and gpu.get("backend") in {"cuda", "vulkan"}:
+    if model == "small" and gpu.get("backend") in {"cuda", "vulkan"}:
         return model, gpu["backend"]
     raise ValueError(_public_gpu_reason(gpu) or "Совместимый GPU сейчас недоступен.")

@@ -20,7 +20,21 @@ def run_diarization(wav_path, requested_device="auto") -> dict:
     from services.diarization_runtime import resolve_diarization_device, resolve_diarization_model
 
     device = resolve_diarization_device(requested_device)
-    model_path = Path(resolve_diarization_model())
+    try:
+        return _run_diarization_device(wav_path, device, resolve_diarization_model)
+    except TaskFailure as exc:
+        retryable_codes = {"device_unavailable", "device_error", "out_of_memory", "diarization_failed"}
+        if requested_device != "auto" or device.get("id") == "cpu" or exc.code not in retryable_codes:
+            raise
+        print(f"Nemotron {device.get('backend')} failed ({exc}); retrying diarization on CPU.", flush=True)
+        cpu_device = resolve_diarization_device("cpu")
+        result = _run_diarization_device(wav_path, cpu_device, resolve_diarization_model)
+        result["fallbackReason"] = str(exc)
+        return result
+
+
+def _run_diarization_device(wav_path, device: dict, resolve_model) -> dict:
+    model_path = Path(resolve_model())
     info = Path(device["executable"])
     if not info.is_file():
         raise TaskFailure("Nemotron diarization executable is unavailable.", "device_unavailable", stage="diarization")
@@ -154,23 +168,17 @@ def assign_speakers(segments, intervals, *, restore_punctuation=False) -> list[d
             try:
                 start, end = float(word["start"]), float(word["end"])
                 valid_time = math.isfinite(start) and math.isfinite(end) and 0 <= start < end
-                if not valid_time:
-                    start, end = float(segment.get("start", 0)), float(segment.get("end", 0))
-                clean_words.append({"start": start, "end": end, "text": str(word.get("text", "")),
-                                    "_fallback": not valid_time, "_segment_index": segment_index})
+                clean_words.append({"start": start if valid_time else None, "end": end if valid_time else None,
+                                    "text": str(word.get("text", "")), "_fallback": not valid_time,
+                                    "_segment_index": segment_index})
             except (KeyError, TypeError, ValueError):
-                clean_words.append({"start": float(segment.get("start", 0)),
-                                    "end": float(segment.get("end", 0)), "text": str(word.get("text", "")),
+                clean_words.append({"start": None, "end": None, "text": str(word.get("text", "")),
                                     "_fallback": True, "_segment_index": segment_index})
         if not clean_words or _join_text(clean_words) != text.strip():
             entries.append({"start": segment.get("start", 0), "end": segment.get("end", 0),
                             "text": text, "_fallback": True, "_segment_index": segment_index})
         else:
-            if not any(not word["_fallback"] for word in clean_words):
-                entries.append({"start": segment.get("start", 0), "end": segment.get("end", 0),
-                                "text": text, "_fallback": True, "_segment_index": segment_index})
-            else:
-                entries.extend(clean_words)
+            entries.extend(clean_words)
 
     # Sweep sorted midpoints against interval start/end events.
     indexed = sorted(((index, word) for index, word in enumerate(entries) if not word.get("_fallback")),
@@ -196,14 +204,17 @@ def assign_speakers(segments, intervals, *, restore_punctuation=False) -> list[d
 
     turns = []
     for index, item in enumerate(entries):
-        try:
-            start, end = float(item["start"]), float(item["end"])
-        except (TypeError, ValueError):
-            start, end = 0.0, 0.0
+        start, end = item["start"], item["end"]
         ids = [] if item.get("_fallback") else speakers_for_entry.get(index, [])
         text_part = str(item.get("text", ""))
-        if turns and turns[-1]["speakerIds"] == ids and start - turns[-1]["end"] <= 1.5:
-            turns[-1]["end"] = max(turns[-1]["end"], end)
+        untimed_unknown = item.get("_fallback") and start is None and end is None
+        previous_untimed_unknown = bool(turns and turns[-1].get("timingKnown") is False)
+        merge_untimed = untimed_unknown and previous_untimed_unknown
+        merge_timed = (turns and not untimed_unknown and turns[-1].get("timingKnown") is not False
+                       and start is not None and end is not None and start - turns[-1]["end"] <= 1.5)
+        if turns and turns[-1]["speakerIds"] == ids and (merge_untimed or merge_timed):
+            if not merge_untimed:
+                turns[-1]["end"] = max(turns[-1]["end"], end)
             previous_text = "".join(turns[-1]["_words"])
             if (turns[-1]["_segment_index"] != item.get("_segment_index") and previous_text and text_part
                     and not previous_text[-1].isspace() and not text_part[0].isspace()):
@@ -211,7 +222,7 @@ def assign_speakers(segments, intervals, *, restore_punctuation=False) -> list[d
             turns[-1]["_words"].append(text_part)
             turns[-1]["_segment_index"] = item.get("_segment_index")
         else:
-            turns.append({"start": start, "end": end, "speakerIds": ids,
+            turns.append({"start": start, "end": end, "timingKnown": not untimed_unknown, "speakerIds": ids,
                           "_words": [text_part], "_segment_index": item.get("_segment_index")})
 
     result = []
@@ -221,7 +232,7 @@ def assign_speakers(segments, intervals, *, restore_punctuation=False) -> list[d
         if restore_punctuation:
             from utils.text_postprocess import restore_russian_segment_text
             text = restore_russian_segment_text(text)
-        result.append({"start": turn["start"], "end": turn["end"], "text": text,
+        result.append({"start": turn["start"], "end": turn["end"], "timingKnown": turn["timingKnown"], "text": text,
                        "speakerIds": turn["speakerIds"], "label": _label(turn["speakerIds"])})
     return result
 
@@ -229,6 +240,9 @@ def assign_speakers(segments, intervals, *, restore_punctuation=False) -> list[d
 def render_turns(turns) -> str:
     lines = []
     for turn in turns:
+        if turn.get("timingKnown") is False or turn.get("start") is None:
+            lines.append(f"{turn['label']}: {turn['text']}")
+            continue
         seconds = max(0, int(float(turn["start"])))
         hours, remainder = divmod(seconds, 3600)
         minutes, seconds = divmod(remainder, 60)

@@ -99,6 +99,23 @@ def ensure_selected_resources(settings: dict, on_progress: Progress | None = Non
     """Validate and fetch only the model and optional punctuation chosen for a job."""
     model_id = settings["model"]
     device = settings["device"]
+    from services.asr_resources import ensure_asr_resources, is_new_asr
+
+    if is_new_asr(model_id):
+        backend = device
+        if model_id == "parakeet-tdt-0.6b-v3" and device == "vulkan":
+            backend = "directml"
+        # The Parakeet ONNX runtime uses the DirectML wheel for AMD/Intel GPU
+        # selection; native GGUF backends retain cpu/vulkan names.
+        ensure_asr_resources(model_id, backend, diarization=bool(settings.get("diarization")),
+                             on_progress=on_progress)
+        if settings.get("restorePunctuation"):
+            _download_punctuation(on_progress)
+        _emit(on_progress, message="Подготовка завершена")
+        return
+    if model_id == "small" and device != "cpu":
+        from services.asr_resources import ensure_validation_audio
+        ensure_validation_audio(on_progress)
     if device == "vulkan":
         from services.prepare_models import _vulkan_cached
 
@@ -175,8 +192,9 @@ def main(argv: list[str] | None = None) -> int:
             reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Prepare resources for one transcription")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--device", choices=("cpu", "cuda", "vulkan"), required=True)
+    parser.add_argument("--device", choices=("cpu", "cuda", "vulkan", "directml"), required=True)
     parser.add_argument("--restore-punctuation", action="store_true")
+    parser.add_argument("--diarization", action="store_true")
     args = parser.parse_args(argv)
 
     def progress(payload: dict) -> None:
@@ -188,8 +206,11 @@ def main(argv: list[str] | None = None) -> int:
                                  "totalBytes": total, "message": payload.get("message")})
 
     try:
-        ensure_selected_resources({"model": args.model, "device": args.device,
-                                   "restorePunctuation": args.restore_punctuation}, progress)
+        settings = {"model": args.model, "device": args.device,
+                    "restorePunctuation": args.restore_punctuation}
+        if args.diarization:
+            settings["diarization"] = True
+        ensure_selected_resources(settings, progress)
     except TaskFailure as exc:
         _emit_preparation_event({"type": "error", "stage": "preparation", "status": "failed",
                                  "message": str(exc), "code": exc.code})

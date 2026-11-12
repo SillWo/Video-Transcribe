@@ -8,12 +8,12 @@ from pathlib import Path
 
 from services.model_management import _build_download_plan, download_registered_model, get_model_status
 from services.model_paths import HF_HUB_CACHE
-from services.runtime_devices import APP_ROOT, _windows_gpu_inventory, enumerate_vulkan_gpus, get_simple_gpu_details
+from services.runtime_devices import APP_ROOT, _windows_gpu_inventory, asr_gpu_candidate, enumerate_vulkan_gpus, get_simple_gpu_details
 from services.whisper_cpp import MODEL_REPO, model_filename, resolve_model_path
 from utils.text_postprocess import HF_HOME
 
-FASTER_MODELS = ("small", "large-v3-turbo", "large-v3")
-VULKAN_MODELS = ("small", "large-v3-turbo", "large-v3")
+FASTER_MODELS = ("small",)
+VULKAN_MODELS = ("small",)
 
 
 def _report_size(model_id: str) -> str:
@@ -77,18 +77,45 @@ def _punctuation_expected_size() -> str:
         return "size unavailable"
 
 
-def prepare(*, check_only: bool = False, skip_postprocess: bool = False, progress=print) -> int:
+def prepare(*, check_only: bool = False, skip_postprocess: bool = False,
+            setup_only: bool = False, progress=print) -> int:
     gpu = get_simple_gpu_details()
     need_vulkan = (gpu.get("backend") == "vulkan"
                    or any(item.get("vendorId") == 0x1002 for item in enumerate_vulkan_gpus())
                    or any(item.get("vendorId") == 0x1002 for item in _windows_gpu_inventory()))
     missing: list[str] = []
+    faster_models = ("small",) if setup_only else FASTER_MODELS
+    vulkan_models = ("small",) if setup_only else VULKAN_MODELS
     tasks = [("faster-whisper", model_id, lambda model_id=model_id: get_model_status(model_id).get("status") == "downloaded",
               lambda model_id=model_id: download_registered_model(model_id, lambda _p, text: progress(f"{model_id}: {text}")))
-             for model_id in FASTER_MODELS]
+             for model_id in faster_models]
     if need_vulkan:
         tasks.extend(("whisper.cpp", model_id, lambda model_id=model_id: _vulkan_cached(model_id),
-                      lambda model_id=model_id: resolve_model_path(model_id, progress=progress)) for model_id in VULKAN_MODELS)
+                      lambda model_id=model_id: resolve_model_path(model_id, progress=progress)) for model_id in vulkan_models)
+
+    if setup_only:
+        from services.asr_resources import asr_resource_status, ensure_asr_resources
+        selected_profiles = []
+        for profile_id in ("parakeet-tdt-0.6b-v3", "qwen3-asr-1.7b"):
+            candidate = asr_gpu_candidate(profile_id)
+            gpu_backend = candidate.get("backend") if candidate.get("canPrepare") else None
+            profile_backends = ["cpu"]
+            if gpu_backend in {"cuda", "vulkan", "directml"}:
+                profile_backends.append(gpu_backend)
+            selected_profiles.extend((profile_id, backend) for backend in profile_backends)
+        for profile_id, backend in selected_profiles:
+            label = f"{profile_id} ({backend})"
+            if check_only:
+                status = asr_resource_status(profile_id, backend, diarization=True)
+                if status["ready"]:
+                    progress(f"ASR {label}: validated and ready.")
+                else:
+                    missing.append(f"ASR {label}: {len(status['missing'])} resource(s) missing")
+            else:
+                progress(f"Preparing ASR profile {label}.")
+                ensure_asr_resources(profile_id, backend, diarization=True,
+                                     on_progress=lambda event, label=label: progress(
+                                         f"{label}: {event.get('message', 'Preparing')}"))
 
     progress(f"Model cache: {HF_HUB_CACHE}")
     progress(f"Project runtime: {APP_ROOT / '.runtime'}")
@@ -130,9 +157,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare required transcription model caches")
     parser.add_argument("--check-only", action="store_true", help="Report missing models without downloading")
     parser.add_argument("--skip-postprocess", action="store_true", help="Skip the optional Russian punctuation model")
+    parser.add_argument("--setup-only", action="store_true", help="Prepare the small profile and the new ASR profiles")
     args = parser.parse_args()
     try:
-        return prepare(check_only=args.check_only, skip_postprocess=args.skip_postprocess)
+        return prepare(check_only=args.check_only, skip_postprocess=args.skip_postprocess,
+                       setup_only=args.setup_only)
     except Exception as exc:
         print(f"Model preparation failed: {exc}")
         return 1

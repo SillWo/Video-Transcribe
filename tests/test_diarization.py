@@ -50,6 +50,37 @@ class SpeakerAssignmentTests(unittest.TestCase):
         )
         self.assertEqual(turns[0]["text"], "слово")
         self.assertEqual(turns[0]["speakerIds"], [])
+        self.assertIsNone(turns[0]["start"])
+        self.assertIsNone(turns[0]["end"])
+        self.assertFalse(turns[0]["timingKnown"])
+
+    def test_invalid_word_times_stay_untimed_and_keep_text_order(self):
+        turns = assign_speakers([{"start": 4, "end": 8, "text": "один два три", "words": [
+            {"text": "один", "start": 4.1, "end": 4.5},
+            {"text": " два", "start": 0, "end": 0},
+            {"text": " три", "start": float("nan"), "end": 7},
+        ]}], [{"start": 4, "end": 5, "speaker": 1}])
+        self.assertEqual([turn["text"] for turn in turns], ["один", "два три"])
+        self.assertEqual(turns[0]["speakerIds"], [1])
+        self.assertEqual(turns[1]["speakerIds"], [])
+        self.assertIsNone(turns[1]["start"])
+        self.assertIsNone(turns[1]["end"])
+        self.assertFalse(turns[1]["timingKnown"])
+
+    def test_all_invalid_word_times_do_not_fall_back_to_segment_bounds(self):
+        turns = assign_speakers([{"start": 9, "end": 10, "text": "раз два", "words": [
+            {"text": "раз", "start": None, "end": 9.2},
+            {"text": " два", "start": 9.3, "end": float("inf")},
+        ]}], [])
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["text"], "раз два")
+        self.assertIsNone(turns[0]["start"])
+        self.assertFalse(turns[0]["timingKnown"])
+
+    def test_render_omits_timestamp_for_untimed_unknown_turn(self):
+        rendered = render_turns([{"start": None, "end": None, "timingKnown": False, "text": "слово",
+                                  "speakerIds": [], "label": "Говорящий не определён"}])
+        self.assertEqual(rendered, "Говорящий не определён: слово")
 
     def test_unicode_subtokens_reconstruct_exactly(self):
         turns = assign_speakers(
@@ -83,8 +114,9 @@ class SpeakerAssignmentTests(unittest.TestCase):
                 {"text": " three", "start": 2.6, "end": 2.9},
             ]},
         ], [])
-        self.assertEqual([turn["text"] for turn in turns], ["one two one bad three"])
-        self.assertEqual(turns[0]["speakerIds"], [])
+        self.assertEqual([turn["text"] for turn in turns], ["one two one", "bad", "three"])
+        self.assertIsNone(turns[1]["start"])
+        self.assertFalse(turns[1]["timingKnown"])
 
     def test_render_uses_floored_second_and_speaker_label(self):
         rendered = render_turns([{"start": 3661.9, "end": 3662, "text": "да", "speakerIds": [1],

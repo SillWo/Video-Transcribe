@@ -159,6 +159,13 @@ class WhisperCppParsingTests(unittest.TestCase):
 
 
 class RuntimeDeviceTests(unittest.TestCase):
+    def test_windows_gpu_inventory_does_not_inherit_host_stdin(self):
+        result = SimpleNamespace(returncode=0, stdout="[]")
+        with (patch.object(runtime_devices.os, "name", "nt"),
+              patch.object(subprocess, "run", return_value=result) as run):
+            self.assertEqual(runtime_devices._windows_gpu_inventory(), [])
+        self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
     def test_runtime_discovery_requires_executable_and_non_cpu_adapter(self):
         with patch.object(runtime_devices, "find_whisper_cpp_executable", return_value="cli"), \
                 patch.object(runtime_devices, "enumerate_vulkan_gpus", return_value=[{"name": "Radeon 780M"}]), \
@@ -248,6 +255,64 @@ class RuntimeDeviceTests(unittest.TestCase):
         expected = {"available": True, "name": "Radeon", "reason": None, "backend": "vulkan", "deviceIndex": 3}
         with patch.object(simple_profiles, "get_simple_gpu_details", return_value=expected):
             self.assertEqual(simple_profiles.gpu_details(), expected)
+
+    def test_model_candidates_use_model_specific_gpu_backend_and_index_namespace(self):
+        with patch.object(runtime_devices, "_dxgi_gpu_inventory", return_value=[
+                {"name": "Intel Arc", "vendorId": 0x8086, "deviceIndex": 2, "luid": "dxgi-2"}]), \
+                patch.object(runtime_devices, "_windows_gpu_inventory", return_value=[]) as windows_inventory, \
+                patch.object(runtime_devices, "enumerate_vulkan_gpus", return_value=[
+                    {"name": "Intel Arc", "vendorId": 0x8086, "deviceIndex": 7, "runtimeIndex": 1}]) as vulkan_inventory, \
+                patch.object(runtime_devices, "cuda_device_count", return_value=0):
+            parakeet = runtime_devices.asr_gpu_candidate("parakeet-tdt-0.6b-v3")
+            qwen = runtime_devices.asr_gpu_candidate("qwen3-asr-1.7b")
+            small = runtime_devices.asr_gpu_candidate("small")
+
+        self.assertEqual((parakeet["backend"], parakeet["deviceIndex"]), ("directml", 2))
+        self.assertEqual((qwen["backend"], qwen["deviceIndex"]), ("vulkan", 1))
+        self.assertEqual((small["backend"], small["deviceIndex"]), ("vulkan", 1))
+        self.assertTrue(parakeet["canPrepare"])
+        self.assertTrue(qwen["canPrepare"])
+        self.assertEqual(windows_inventory.call_count, 1)
+        self.assertEqual(vulkan_inventory.call_count, 1)
+
+    def test_nvidia_remains_first_candidate_for_new_asr(self):
+        with patch.object(runtime_devices, "_dxgi_gpu_inventory", return_value=[]), \
+                patch.object(runtime_devices, "_windows_gpu_inventory", return_value=[]), \
+                patch.object(runtime_devices, "enumerate_vulkan_gpus", return_value=[
+                    {"name": "NVIDIA RTX", "vendorId": 0x10DE, "deviceIndex": 0},
+                    {"name": "Radeon", "vendorId": 0x1002, "deviceIndex": 1}]), \
+                patch.object(runtime_devices, "cuda_device_count", return_value=1), \
+                patch.object(runtime_devices, "cuda_runtime_status", return_value=(True, None)):
+            candidate = runtime_devices.asr_gpu_candidate("parakeet-tdt-0.6b-v3")
+
+        self.assertEqual(candidate["backend"], "cuda")
+        self.assertEqual(candidate["deviceIndex"], 0)
+
+    def test_intel_economy_can_use_vulkan_whisper_cpp(self):
+        with patch.object(runtime_devices, "_dxgi_gpu_inventory", return_value=[
+                {"name": "Intel Arc", "vendorId": 0x8086, "deviceIndex": 0}]), \
+                patch.object(runtime_devices, "_windows_gpu_inventory", return_value=[]), \
+                patch.object(runtime_devices, "enumerate_vulkan_gpus", return_value=[
+                    {"name": "Intel Arc", "vendorId": 0x8086, "deviceIndex": 4, "runtimeIndex": 0}]), \
+                patch.object(runtime_devices, "find_whisper_cpp_executable", return_value="whisper-cli"):
+            candidate = runtime_devices.asr_gpu_candidate("small")
+
+        self.assertEqual(candidate["backend"], "vulkan")
+        self.assertEqual(candidate["deviceIndex"], 0)
+
+    def test_asr_candidate_attaches_only_unambiguous_windows_driver_identity(self):
+        inventory = [{"name": "AMD Radeon 780M Graphics", "vendorId": 0x1002,
+                      "deviceId": 0x1900, "driverVersion": "32.0.32015.7029",
+                      "pnpDeviceId": "PCI\\VEN_1002&DEV_1900"}]
+        with patch.object(runtime_devices, "_dxgi_gpu_inventory", return_value=[
+                {"name": "AMD Radeon 780M Graphics", "vendorId": 0x1002,
+                 "deviceId": 0x1900, "deviceIndex": 0, "luid": "adapter-luid"}]), \
+                patch.object(runtime_devices, "_windows_gpu_inventory", return_value=inventory), \
+                patch.object(runtime_devices, "enumerate_vulkan_gpus", return_value=[]):
+            candidate = runtime_devices.asr_gpu_candidate("parakeet-tdt-0.6b-v3")
+        self.assertEqual(candidate["driverVersion"], "32.0.32015.7029")
+        self.assertEqual(candidate["deviceIndex"], 0)
+        self.assertEqual(candidate["identity"], "adapter-luid")
 
 
 class ModelStorageTests(unittest.TestCase):

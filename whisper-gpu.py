@@ -31,7 +31,8 @@ JSON_EVENT_PREFIX = "__VT_JSON__ "
 
 
 def sizes_supported() -> list[str]:
-    return available_models()
+    from services.asr_resources import NEW_MODELS
+    return [*available_models(), *sorted(NEW_MODELS)]
 
 
 def logical_cpu_count() -> int:
@@ -84,11 +85,13 @@ def progress_callback(args, stage: str, message: str):
     """Build a throttled structured progress callback for the simple UI path."""
     last_time = 0.0
     last_percent = None
+    last_phase = None
 
     def report(values):
-        nonlocal last_time, last_percent
+        nonlocal last_time, last_percent, last_phase
         values = values or {}
         percent = values.get("percent")
+        phase = "alignment" if values.get("phase") == "alignment" else None
         now = timeit.default_timer()
         if percent is not None:
             try:
@@ -96,15 +99,20 @@ def progress_callback(args, stage: str, message: str):
             except (TypeError, ValueError):
                 percent = None
         changed_enough = percent is not None and (last_percent is None or abs(percent - last_percent) >= 1.0)
-        if last_time and now - last_time < 1.0 and not changed_enough:
+        phase_changed = phase != last_phase
+        if last_time and now - last_time < 1.0 and not changed_enough and not phase_changed:
             return
         last_time = now
+        last_phase = phase
         if percent is not None:
             last_percent = percent
-        emit_event(args, "progress", stage=stage, percent=percent,
-                   completedBytes=values.get("completedBytes"), totalBytes=values.get("totalBytes"),
-                   processedSeconds=values.get("processedSeconds"), totalSeconds=values.get("totalSeconds"),
-                   message=values.get("message", message))
+        event = {"stage": stage, "percent": percent,
+                 "completedBytes": values.get("completedBytes"), "totalBytes": values.get("totalBytes"),
+                 "processedSeconds": values.get("processedSeconds"), "totalSeconds": values.get("totalSeconds"),
+                 "message": values.get("message", message)}
+        if phase == "alignment":
+            event.update(phase="alignment", workerStage="alignment")
+        emit_event(args, "progress", **event)
 
     return report
 
@@ -289,6 +297,8 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
             model.model.transcription_progress = native_progress
         elif not isinstance(model, AutoFallbackModel):
             native_progress = progress_callback(args, "recognition", "Распознавание речи.")
+            if model.__class__.__name__ == "NewAsrModel":
+                model.transcription_progress = native_progress
 
     def report_segment_progress(segment, completed, total_hint=None):
         nonlocal total_seconds
@@ -349,8 +359,12 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
         native_progress({"percent": 100.0 if total_seconds else None,
                          "processedSeconds": total_seconds, "totalSeconds": total_seconds})
     emit_event(args, "stage", stage="recognition", status="completed", message="Распознавание завершено.")
-    effective_language = stats.language if args.language == "auto" else args.language
+    effective_language = (stats.language if args.language == "auto" else args.language) or ""
     effective_restore_punctuation = bool(args.restore_punctuation and effective_language.lower() == "ru")
+
+    from utils.text_postprocess import configure_punctuation_device
+    configure_punctuation_device("cuda" if asr_effective_device == "cuda" else "cpu",
+                                 asr_device=asr_effective_device)
 
     probability = stats.language_probability
     probability_text = f"{probability:f}" if probability is not None else "unavailable"
@@ -360,7 +374,7 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
     diarization = {"status": "disabled", "requestedDevice": getattr(args, "diarization_device", "auto"),
                    "effectiveDevice": None, "turns": []}
     diarization_text = None
-    if diarization_enabled:
+    if diarization_enabled and asr_segments:
         emit_event(args, "stage", stage="diarization", status="in_progress",
                    message="Определяем, кто говорит.")
         try:
@@ -398,6 +412,16 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
         from services.diarization import render_turns
         diarization_text = render_turns(turns)
         combined_text = diarization_text
+    elif diarization_enabled:
+        # Preserve a valid empty transcription for silence without inventing speakers or words.
+        if diarization_wav is not None:
+            diarization_wav.unlink(missing_ok=True)
+        diarization = {"status": "completed", "requestedDevice": getattr(args, "diarization_device", "auto"),
+                       "effectiveDevice": None, "turns": []}
+        diarization_text = ""
+        combined_text = ""
+        emit_event(args, "stage", stage="diarization", status="completed", message="Речь не обнаружена; диаризация не требуется.")
+        emit_event(args, "stage", stage="postprocess", status="skipped", message="Нет реплик для обработки.")
     else:
         # Keep the established non-diarization recognition and postprocessing order intact.
         emit_event(args, "stage", stage="postprocess",
@@ -456,6 +480,10 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
         "effective_backend": asr_effective_backend,
     }
     result["diarization"] = diarization
+    if model.__class__.__name__ == "NewAsrModel":
+        result["model"] = model.model_id
+        result["precision"] = model.precision
+        result["diagnostics"] = model.diagnostics
     if postprocess_notice:
         result["notice"] = postprocess_notice
 
@@ -507,6 +535,33 @@ class AutoFallbackModel:
 
 def initialize(args):
     print("--------------------INITIALIZING-----------------------")
+
+    from services.asr_resources import is_new_asr
+    if is_new_asr(args.model_size):
+        from services.asr_engine import NewAsrModel
+        from services.runtime_devices import asr_gpu_candidate
+
+        device = args.device
+        if device == "auto":
+            candidate = asr_gpu_candidate(args.model_size)
+            device = candidate.get("backend") if candidate.get("canPrepare") else "cpu"
+            print(f"New ASR profile selected {device}.", flush=True)
+        try:
+            device_index = int(os.environ.get("VT_ASR_DEVICE_INDEX", "0"))
+        except ValueError:
+            device_index = 0
+        if device == "vulkan" and "VT_ASR_DEVICE_INDEX" not in os.environ:
+            try:
+                device_index = int(os.environ.get("VT_VULKAN_DEVICE_INDEX", "0"))
+            except ValueError:
+                device_index = 0
+        callback = (progress_callback(args, "recognition", "Распознавание речи.")
+                    if getattr(args, "single_source", False) else None)
+        model = NewAsrModel(args.model_size, device, threads=max(1, int(args.nproc or 8)),
+                            device_index=device_index, progress=callback)
+        if callback is None:
+            model.transcription_progress = lambda event: print(event.get("message", ""), flush=True)
+        return model
 
     if not getattr(args, "single_source", False) and isfile(audio_file):
         os.remove(audio_file)
@@ -661,7 +716,7 @@ def build_argument_parser():
     parser.add_argument("-l", "--language", help="Language to be translated from", default="ru", type=str)
     parser.add_argument("-b", "--beam_size", help="Beam size parameter or best_of equivalent from Open-AI whisper", type=int, default=5)
     parser.add_argument("-p", "--precision", help="Precision to use to create the model", type=str, default="auto")
-    parser.add_argument("-d", "--device", help="Device to use", choices=["auto", "cpu", "vulkan", "cuda"], default="auto")
+    parser.add_argument("-d", "--device", help="Device to use", choices=["auto", "cpu", "vulkan", "cuda", "directml"], default="auto")
     parser.add_argument("-s", "--model_size", help="Size of the model, default is small.", choices=sizes_supported(), nargs="?", default="small")
     parser.add_argument("--start", help="Start time in 00:00:00 format", type=AudioProcess.valid_time)
     parser.add_argument("--end", help="End time in 00:00:00 format", type=AudioProcess.valid_time)

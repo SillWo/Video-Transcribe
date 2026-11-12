@@ -1,5 +1,6 @@
 import json
 import importlib.util
+import logging
 import re
 import os
 import shutil
@@ -24,11 +25,13 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from services.transcription_history import TranscriptionHistory, STAGES, initial_checkpoints, normalize_terminal_timing
-from services import native_file_picker, simple_profiles
+from services import asr_capabilities, native_file_picker, simple_profiles
 from services.resource_preparation import PREPARATION_EVENT_PREFIX, ResourcePreparationError
 from services.job_processes import JobCancelled, JobProcessController
 from services.simple_queue import PersistentSimpleQueue, SimpleQueueDispatcher
 from services.task_errors import SYSTEMIC_ERROR_CODES, TaskFailure
+
+logger = logging.getLogger(__name__)
 
 from services.model_management import (
     ModelCacheInspectionError,
@@ -200,6 +203,8 @@ class JobState:
     results: list[dict[str, Any]] = field(default_factory=list)
     effective_device: str | None = None
     effective_backend: str | None = None
+    effective_model: str | None = None
+    precision: str | None = None
 
 
 jobs: dict[str, JobState] = {}
@@ -286,6 +291,189 @@ def _simple_dispatch_error(job_id: str, exc: Exception) -> None:
                                  error_code="internal_error")
     except Exception:
         pass
+
+
+def _resolve_simple_execution(job_id: str, job: JobState) -> dict[str, Any] | None:
+    """Resolve a queued job's profile afresh and persist the actual model/backend."""
+    persisted = history_store.get(job_id) or {}
+    profile = job.settings.get("_profile") or persisted.get("profile")
+    requested_device = job.settings.get("_requestedDevice", persisted.get("device", "cpu"))
+    if profile not in simple_profiles.PROFILES:
+        raise TaskFailure("Неизвестный профиль расшифровки.", "device_unavailable", stage="preparation")
+    model_id = simple_profiles.PROFILES[profile][1]
+    candidate = None
+    if requested_device == "gpu":
+        from services.runtime_devices import asr_gpu_candidate, invalidate_gpu_inventory_cache
+        invalidate_gpu_inventory_cache()
+        candidate = asr_gpu_candidate(model_id)
+        if not candidate.get("canPrepare") or not candidate.get("backend"):
+            raise TaskFailure(candidate.get("reason") or "Совместимая видеокарта сейчас недоступна.",
+                              "device_unavailable", stage="preparation")
+        backend = candidate["backend"]
+        device_index = candidate.get("deviceIndex")
+    else:
+        backend = "cpu"
+        device_index = None
+
+    with jobs_lock:
+        current = jobs.get(job_id)
+        if current is None:
+            raise RuntimeError("Simple job disappeared while resolving its profile.")
+        current.settings["model"] = model_id
+        current.settings["device"] = backend
+        current.settings["_gpuIndex"] = device_index
+        current.effective_model = model_id
+        current.effective_device = "cpu" if backend == "cpu" else backend
+        current.effective_backend = backend
+        current.precision = asr_capabilities.expected_precision(model_id)
+        settings = dict(current.settings)
+    history_store.update(
+        job_id,
+        model=model_id,
+        effectiveModel=model_id,
+        effectiveDevice="cpu" if backend == "cpu" else backend,
+        effectiveBackend=backend,
+        precision=asr_capabilities.expected_precision(model_id),
+        settings={key: settings.get(key) for key in (
+            "language", "model", "device", "nproc", "outputFormat", "saveAudio",
+            "useTimestamps", "restorePunctuation", "diarizationEnabled", "diarizationDevice",
+        )},
+    )
+    return candidate
+
+
+def _run_simple_gpu_smoke(job: JobState, controller: JobProcessController,
+                         candidate: dict[str, Any]) -> None:
+    """Run a pinned English smoke in an owned process before first GPU use."""
+    model_id = job.settings["model"]
+    backend = job.settings["device"]
+    if asr_capabilities.gpu_capability(model_id, candidate).get("available"):
+        return
+
+    from services.asr_resources import validation_audio_path
+
+    audio = validation_audio_path()
+    if not audio.is_file():
+        raise TaskFailure("Закреплённый аудиофайл проверки GPU не подготовлен.",
+                          "model_unavailable", stage="preparation")
+    output_path = history_store.job_dir(job.id) / "gpu-capability-smoke.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    asr_capabilities.start_gpu_check(model_id, candidate)
+    smoke_result: dict[str, Any] = {"ok": False, "error": "GPU smoke process did not produce a result."}
+    try:
+        if model_id == "small":
+            smoke_job = JobState(
+                id=f"{job.id}-gpu-smoke",
+                settings={
+                    "_outputDir": str(output_path.parent / "gpu-smoke-output"),
+                    "language": "en", "model": "small", "device": backend,
+                    "nproc": 8, "outputFormat": "txt", "saveAudio": False,
+                    "useTimestamps": False, "restorePunctuation": False,
+                    "_simple": True, "diarizationEnabled": False,
+                },
+            )
+            command = build_command(smoke_job, str(audio))
+            env = os.environ.copy()
+            if backend == "vulkan":
+                env["VT_VULKAN_DEVICE_INDEX"] = str(candidate["deviceIndex"])
+            result_events: list[dict[str, Any]] = []
+
+            def on_whisper_line(line: str) -> None:
+                if line.startswith(JSON_EVENT_PREFIX):
+                    try:
+                        event = json.loads(line[len(JSON_EVENT_PREFIX):])
+                    except json.JSONDecodeError:
+                        append_log(job.id, line)
+                        return
+                    if event.get("type") == "complete":
+                        result_events.extend(event.get("results", []))
+                    elif event.get("type") == "error":
+                        append_log(job.id, f"[GPU smoke] {event.get('message', 'runtime error')}")
+                elif line:
+                    append_log(job.id, f"[GPU smoke] {line}")
+
+            exit_code = _run_owned_process(controller, command, on_line=on_whisper_line, env=env)
+            result = result_events[-1] if result_events else {}
+            actual_device = result.get("effective_device")
+            expected_device = "vulkan" if backend == "vulkan" else "cuda"
+            smoke_result = {
+                "ok": exit_code == 0 and bool(result),
+                "text": result.get("text"),
+                "language": result.get("detected_language"),
+                "effective_device": actual_device,
+                "effective_backend": result.get("effective_backend"),
+                "precision": result.get("precision"),
+                "diagnostics": {
+                    "gpu_verified": exit_code == 0 and actual_device == expected_device,
+                    "verification_basis": (
+                        "The explicitly requested Whisper GPU backend completed real inference on the pinned fixture."
+                        if exit_code == 0 and actual_device == expected_device
+                        else "The explicit Whisper GPU smoke did not report the requested effective device."
+                    ),
+                },
+            }
+        else:
+            from services.asr_resources import runtime_python
+
+            kind = "native" if model_id == "qwen3-asr-1.7b" else "parakeet"
+            python = runtime_python(kind, backend)
+            command = [
+                str(python), "-m", "services.asr_worker", "--mode", "transcribe",
+                "--model", model_id, "--device", backend,
+                "--device-index", str(candidate["deviceIndex"]), "--audio", str(audio),
+                "--output", str(output_path), "--threads", "8", "--verify-gpu",
+            ]
+
+            def on_worker_line(line: str) -> None:
+                if line.startswith("__VT_ASR__ "):
+                    try:
+                        event = json.loads(line[len("__VT_ASR__ "):])
+                        if event.get("message"):
+                            append_log(job.id, f"[GPU smoke] {event['message']}")
+                    except json.JSONDecodeError:
+                        append_log(job.id, line)
+                elif line:
+                    append_log(job.id, f"[GPU smoke] {line}")
+
+            exit_code = _run_owned_process(controller, command, on_line=on_worker_line)
+            try:
+                smoke_result = json.loads(output_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                smoke_result = {"ok": False, "error": f"GPU worker exited with code {exit_code} without valid JSON."}
+            smoke_result["ok"] = bool(smoke_result.get("ok")) and exit_code == 0
+            if model_id == "parakeet-tdt-0.6b-v3" and smoke_result.get("ok"):
+                langid_path = output_path.with_name("gpu-capability-language-id.json")
+                native_backend = "cuda" if backend == "cuda" else "vulkan"
+                langid_command = [
+                    str(runtime_python("native", native_backend)), "-m", "services.asr_worker",
+                    "--mode", "language-id", "--model", model_id, "--device", "cpu",
+                    "--device-index", "0", "--audio", str(audio), "--output", str(langid_path), "--threads", "8",
+                ]
+                langid_code = _run_owned_process(controller, langid_command, on_line=on_worker_line)
+                try:
+                    language_result = json.loads(langid_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    language_result = {}
+                if langid_code == 0 and language_result.get("ok"):
+                    smoke_result["language"] = language_result.get("language")
+                    smoke_result["language_probability"] = language_result.get("language_probability")
+                    smoke_result.setdefault("diagnostics", {})["language_identification"] = {
+                        "language": language_result.get("language"),
+                        "backend": language_result.get("effective_backend"),
+                        "role": "auxiliary CPU language-ID; ASR GPU evidence remains from Parakeet session profiling",
+                    }
+                else:
+                    smoke_result["ok"] = False
+                    smoke_result["error"] = language_result.get("error", {}).get("message") or "Pinned English fixture language-ID failed."
+
+        record = asr_capabilities.record_gpu_probe(model_id, candidate, smoke_result)
+        if not record["verified"]:
+            reason = record.get("error") or record.get("verificationBasis") or (
+                "Проверка не подтвердила реальное выполнение распознавания на выбранной видеокарте."
+            )
+            raise TaskFailure(str(reason), "device_unavailable", stage="preparation")
+    finally:
+        asr_capabilities.finish_gpu_check(model_id, candidate)
 
 
 def _get_simple_dispatcher() -> SimpleQueueDispatcher:
@@ -483,6 +671,12 @@ def _simple_progress(job_id: str, stage: str, payload: dict[str, Any]) -> None:
         except (TypeError, ValueError):
             return None
     seconds, duration = finite(seconds), finite(duration)
+    phase = "alignment" if stage == "recognition" and payload.get("phase") == "alignment" else None
+    phase_started_at = None
+    if phase:
+        phase_started_at = (previous.get("phaseStartedAt")
+                            if same_stage and previous.get("phase") == phase
+                            else utc_now())
     safe_messages = {
         "source": "Загрузка источника", "audio": "Подготовка аудио",
         "recognition": "Распознавание речи", "postprocess": "Обработка текста",
@@ -501,19 +695,25 @@ def _simple_progress(job_id: str, stage: str, payload: dict[str, Any]) -> None:
     else:
         message = safe_messages.get(stage)
         requested_message = payload.get("message")
-        if stage == "recognition" and requested_message in {
+        if stage == "recognition" and phase == "alignment":
+            message = "Выравнивание слов"
+        elif stage == "recognition" and requested_message in {
             "Загружаем модель в память", "Загружаем модель в память."
         }:
             message = "Загружаем модель в память"
-        elif stage == "postprocess" and isinstance(requested_message, str) and re.fullmatch(
-            r"Обработано фрагментов \d+ из \d+\.?", requested_message
-        ):
-            message = requested_message
+        elif stage == "postprocess":
+            message = "Восстановление пунктуации"
+            if isinstance(requested_message, str) and re.fullmatch(
+                r"Обработано фрагментов \d+ из \d+\.?", requested_message
+            ):
+                message = requested_message
     progress = {"stage": stage, "percent": percent, "completedBytes": completed,
                 "totalBytes": total, "processedSeconds": seconds, "totalSeconds": duration,
+                "phase": phase, "phaseStartedAt": phase_started_at,
                 "message": message, "updatedAt": utc_now()}
     changed_meaningfully = (previous.get("stage") != stage or previous.get("percent") != percent
-                            or previous.get("message") != message)
+                            or previous.get("message") != message or previous.get("phase") != phase
+                            or previous.get("phaseStartedAt") != phase_started_at)
     if (not changed_meaningfully and previous.get("completedBytes") is not None and completed is not None
             and abs(completed - previous["completedBytes"]) >= 1024 * 1024):
         changed_meaningfully = True
@@ -821,11 +1021,16 @@ class OwnedProcessStopError(RuntimeError):
 def _run_owned_process(controller: JobProcessController, command: list[str], *, on_line,
                        env: dict[str, str] | None = None) -> int:
     controller.check_cancelled()
-    process = subprocess.Popen(
-        command, cwd=APP_ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace", env=env or {**os.environ,
-        "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}, bufsize=1,
-    )
+    try:
+        process = subprocess.Popen(
+            command, cwd=APP_ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", env=env or {**os.environ,
+            "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}, bufsize=1,
+        )
+    except OSError:
+        executable = command[0] if command else "<empty command>"
+        logger.exception("Could not start owned process executable=%r cwd=%s", executable, APP_ROOT)
+        raise
     registered = False
     stopped = False
     try:
@@ -875,6 +1080,18 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
         if not _mark_simple_job_started(job_id):
             controller.check_cancelled()
             return
+        source_type = job.settings.get("_sourceType")
+        if source_type == "file" and not Path(source_path).is_file():
+            raise TaskFailure(_task_failure_message("source_unavailable"), "source_unavailable", stage="source")
+        persisted = history_store.get(job_id) or {}
+        profile = job.settings.get("_profile") or persisted.get("profile")
+        requested_device = job.settings.get("_requestedDevice", persisted.get("device", "cpu"))
+        try:
+            simple_profiles.resolve(profile, requested_device)
+        except ValueError as exc:
+            raise TaskFailure(str(exc), "device_unavailable", stage="preparation") from exc
+        selected_gpu = _resolve_simple_execution(job_id, job)
+        job = get_job(job_id)
         update_job(job_id, stage="preparation")
         if job.settings.get("diarizationEnabled"):
             _set_diarization_state(job_id, "pending")
@@ -886,18 +1103,6 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
             resolved = resolve_diarization_device(job.settings.get("diarizationDevice", "auto"))
             _set_diarization_state(job_id, "pending", requestedDevice=job.settings.get("diarizationDevice", "auto"),
                                    effectiveDevice={key: resolved.get(key) for key in ("id", "name", "backend")})
-        if job.settings.get("_requestedDevice") == "gpu":
-            try:
-                resolved_model, backend_device = simple_profiles.resolve(job.settings["_profile"], "gpu")
-            except ValueError as exc:
-                raise TaskFailure(str(exc), "device_unavailable", stage="preparation") from exc
-            job.settings["model"] = resolved_model
-            job.settings["device"] = backend_device
-            selected_gpu = simple_profiles.gpu_details()
-            job.settings["_gpuIndex"] = selected_gpu.get("deviceIndex") if backend_device == "vulkan" else None
-        source_type = job.settings.get("_sourceType")
-        if source_type == "file" and not Path(source_path).is_file():
-            raise TaskFailure(_task_failure_message("source_unavailable"), "source_unavailable", stage="source")
         controller.check_cancelled()
         _checkpoint_update(job_id, "preparation", "active")
 
@@ -919,6 +1124,8 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
 
         prepare_command = [sys.executable, "-m", "services.resource_preparation",
                            "--model", job.settings["model"], "--device", job.settings["device"]]
+        if job.settings["model"] in {"qwen3-asr-1.7b", "parakeet-tdt-0.6b-v3"} and job.settings.get("diarizationEnabled"):
+            prepare_command.append("--diarization")
         if job.settings.get("restorePunctuation"):
             prepare_command.append("--restore-punctuation")
         prepare_env = os.environ.copy()
@@ -934,8 +1141,14 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
             if code not in SYSTEMIC_ERROR_CODES:
                 code = "model_unavailable"
             raise ResourcePreparationError(_task_failure_message(code, preparation_error), code=code)
+        from services.asr_resources import invalidate_runtime_cache
+
+        invalidate_runtime_cache()
         _checkpoint_update(job_id, "preparation", "completed")
         _simple_progress(job_id, "preparation", {"percent": 100, "ready": True})
+
+        if job.settings.get("_requestedDevice") == "gpu" and selected_gpu:
+            _run_simple_gpu_smoke(job, controller, selected_gpu)
 
         controller.check_cancelled()
         command = build_command(job, source_path)
@@ -946,9 +1159,14 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
         env["TRANSFORMERS_OFFLINE"] = "1"
         gpu_index = job.settings.get("_gpuIndex")
         if gpu_index is None:
+            env.pop("VT_ASR_DEVICE_INDEX", None)
             env.pop("VT_VULKAN_DEVICE_INDEX", None)
         else:
-            env["VT_VULKAN_DEVICE_INDEX"] = str(gpu_index)
+            env["VT_ASR_DEVICE_INDEX"] = str(gpu_index)
+            if job.settings.get("device") == "vulkan":
+                env["VT_VULKAN_DEVICE_INDEX"] = str(gpu_index)
+            else:
+                env.pop("VT_VULKAN_DEVICE_INDEX", None)
         update_job(job_id, status="running", stage="source")
         controller.check_cancelled()
         _simple_stage_event(job_id, "source", "active")
@@ -1016,8 +1234,8 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
         current = get_job(job_id)
         if current.output_path is None:
             raise RuntimeError("Transcription finished without an output file")
-        if not current.result_text:
-            raise RuntimeError("Расшифровка завершилась без текста.")
+        if current.result_text is None:
+            raise RuntimeError("Расшифровка завершилась без результата.")
         controller.check_cancelled()
         if not _finalize_simple_job(job_id, "completed", transcript=current.result_text):
             controller.check_cancelled()
@@ -1042,6 +1260,10 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
         with jobs_lock:
             cancellation_pending = controller.cancelled or (jobs.get(job_id) is not None
                                                               and jobs[job_id].status == "cancelling")
+            current_job = jobs.get(job_id)
+            failure_stage = current_job.stage if current_job is not None else "unknown"
+        if not cancellation_pending and not isinstance(exc, TaskFailure):
+            logger.exception("Unexpected simple job failure job_id=%s stage=%s", job_id, failure_stage)
         if cancellation_pending:
             try:
                 controller.stop_owned()
@@ -1371,6 +1593,25 @@ def apply_result(job_id: str, result: dict[str, Any]) -> None:
         job = jobs.get(job_id)
         is_simple = bool(job and job.settings.get("_simple"))
     simple_record = history_store.get(job_id) if is_simple else None
+    simple_execution_fields: dict[str, Any] = {}
+    if simple_record is not None:
+        with jobs_lock:
+            current_job = jobs.get(job_id)
+            current_settings = dict(current_job.settings) if current_job else {}
+        model_id = result.get("model") or result.get("effective_model") or current_settings.get("model") or simple_record.get("model")
+        effective_model = result.get("effective_model") or model_id
+        effective_device = result.get("effective_device") or (current_job.effective_device if current_job else None)
+        effective_backend = result.get("effective_backend") or (current_job.effective_backend if current_job else None)
+        precision = result.get("precision") or (current_job.precision if current_job else None)
+        asr_diagnostics = (result.get("diagnostics") or result.get("asr_diagnostics")
+                           or result.get("asrDiagnostics") or simple_record.get("asrDiagnostics"))
+        simple_execution_fields = {
+            "model": model_id, "effectiveModel": effective_model,
+            "effectiveDevice": effective_device, "effectiveBackend": effective_backend,
+            "precision": precision,
+            "asrDiagnostics": asr_diagnostics,
+        }
+        history_store.update(job_id, **simple_execution_fields)
     diarization_summary = None
     if is_simple and simple_record is not None:
         full_diarization = result.get("diarization")
@@ -1404,6 +1645,8 @@ def apply_result(job_id: str, result: dict[str, Any]) -> None:
         saved_audio=result.get("saved_audio"),
         effective_device=result.get("effective_device"),
         effective_backend=result.get("effective_backend"),
+        effective_model=(simple_execution_fields.get("effectiveModel") if simple_execution_fields else None),
+        precision=(simple_execution_fields.get("precision") if simple_execution_fields else None),
         **({"diarization": diarization_summary} if is_simple else {}),
     )
 
@@ -1412,19 +1655,41 @@ def apply_complete(job_id: str, results: list[dict[str, Any]]) -> None:
     if not results:
         return
 
-    combined_text = "\n\n".join(result.get("text", "").strip() for result in results if result.get("text")).strip()
+    has_text_result = any(isinstance(result.get("text"), str) for result in results)
+    combined_text = "\n\n".join(result["text"].strip() for result in results
+                                  if isinstance(result.get("text"), str) and result["text"].strip()).strip()
     rendered_chunks = []
     saved_audio = next((result.get("saved_audio") for result in reversed(results) if result.get("saved_audio")), None)
     for result in results:
-        rendered_result = read_output_text(result.get("output_path")) or result.get("rendered_result")
-        if rendered_result:
+        rendered_result = read_output_text(result.get("output_path"))
+        if rendered_result is None:
+            rendered_result = result.get("rendered_result")
+        if isinstance(rendered_result, str):
             rendered_chunks.append(rendered_result.strip())
+
+    with jobs_lock:
+        current_job = jobs.get(job_id)
+        current_settings = dict(current_job.settings) if current_job else {}
+    latest_result = results[-1]
+    existing_record = history_store.get(job_id) or {}
+    model_id = latest_result.get("model") or latest_result.get("effective_model") or current_settings.get("model")
+    effective_model = latest_result.get("effective_model") or model_id
+    effective_device = latest_result.get("effective_device") or (current_job.effective_device if current_job else None)
+    effective_backend = latest_result.get("effective_backend") or (current_job.effective_backend if current_job else None)
+    precision = latest_result.get("precision") or (current_job.precision if current_job else None)
+    history_store.update(job_id, model=model_id, effectiveModel=effective_model,
+                         effectiveDevice=effective_device, effectiveBackend=effective_backend,
+                         precision=precision,
+                         asrDiagnostics=(latest_result.get("diagnostics") or latest_result.get("asr_diagnostics")
+                                         or latest_result.get("asrDiagnostics")
+                                         or existing_record.get("asrDiagnostics")))
 
     update_job(
         job_id,
         results=results,
-        result_text=combined_text or None,
-        rendered_result="\n\n".join(rendered_chunks).strip() or None,
+        result_text=combined_text if has_text_result else None,
+        rendered_result=("\n\n".join(rendered_chunks).strip()
+                         if rendered_chunks else None),
         output_path=results[-1].get("output_path"),
         output_format=results[-1].get("output_format"),
         detected_language=results[-1].get("detected_language"),
@@ -1432,6 +1697,8 @@ def apply_complete(job_id: str, results: list[dict[str, Any]]) -> None:
         saved_audio=saved_audio,
         effective_device=results[-1].get("effective_device"),
         effective_backend=results[-1].get("effective_backend"),
+        effective_model=effective_model,
+        precision=precision,
     )
 
 
@@ -1512,9 +1779,14 @@ def run_job(job_id: str, source_path: str) -> None:
         if job.settings.get("_simple"):
             gpu_index = job.settings.get("_gpuIndex")
             if gpu_index is None:
+                env.pop("VT_ASR_DEVICE_INDEX", None)
                 env.pop("VT_VULKAN_DEVICE_INDEX", None)
             else:
-                env["VT_VULKAN_DEVICE_INDEX"] = str(gpu_index)
+                env["VT_ASR_DEVICE_INDEX"] = str(gpu_index)
+                if job.settings.get("device") == "vulkan":
+                    env["VT_VULKAN_DEVICE_INDEX"] = str(gpu_index)
+                else:
+                    env.pop("VT_VULKAN_DEVICE_INDEX", None)
         update_job(job_id, status="running", stage="source")
         if job.settings.get("_simple"):
             _simple_stage_event(job_id, "source", "active")
@@ -1724,6 +1996,12 @@ def _simple_shape(record: dict[str, Any], *, with_text: bool) -> dict[str, Any]:
     result = {
         "id": record["id"], "sourceType": record["sourceType"], "source": record["source"],
         "profile": record["profile"], "device": record["device"], "cpuThreads": record["cpuThreads"],
+        "model": record.get("model") or (record.get("settings") or {}).get("model"),
+        "effectiveModel": record.get("effectiveModel") or record.get("model"),
+        "effectiveDevice": record.get("effectiveDevice"),
+        "effectiveBackend": record.get("effectiveBackend"),
+        "precision": record.get("precision"),
+        "asrDiagnostics": record.get("asrDiagnostics"),
         "restorePunctuation": record["restorePunctuation"],
         "diarizationEnabled": enabled, "diarizationDevice": record.get("diarizationDevice", "auto"),
         "diarization": diarization, "status": record["status"],

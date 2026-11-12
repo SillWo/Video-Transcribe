@@ -10,6 +10,76 @@ from services import cuda_runtime, prepare_models
 
 
 class ModelPreparationTests(unittest.TestCase):
+    def test_setup_only_prepares_aligner_weights_and_cpu_runtime_for_each_asr_profile(self):
+        with patch.object(prepare_models, "get_simple_gpu_details", return_value={"backend": None}), \
+                patch.object(prepare_models, "enumerate_vulkan_gpus", return_value=[]), \
+                patch.object(prepare_models, "_windows_gpu_inventory", return_value=[]), \
+                patch.object(prepare_models, "get_model_status", return_value={"status": "downloaded"}), \
+                patch.object(prepare_models, "_punctuation_cached", return_value=True), \
+                patch.object(prepare_models, "asr_gpu_candidate", side_effect=lambda model: {
+                    "backend": "directml" if model == "parakeet-tdt-0.6b-v3" else "cuda",
+                    "canPrepare": True,
+                }), \
+                patch("services.asr_resources.ensure_asr_resources") as ensure:
+            result = prepare_models.prepare(setup_only=True, skip_postprocess=True, progress=lambda _message: None)
+
+        self.assertEqual(result, 0)
+        selected = [(call.args[0], call.args[1]) for call in ensure.call_args_list]
+        self.assertEqual(selected, [
+            ("parakeet-tdt-0.6b-v3", "cpu"), ("parakeet-tdt-0.6b-v3", "directml"),
+            ("qwen3-asr-1.7b", "cpu"), ("qwen3-asr-1.7b", "cuda"),
+        ])
+        self.assertTrue(all(call.kwargs["diarization"] is True for call in ensure.call_args_list))
+
+    def test_setup_only_check_validates_optional_alignment_without_downloading(self):
+        with patch.object(prepare_models, "get_simple_gpu_details", return_value={"backend": None}), \
+                patch.object(prepare_models, "enumerate_vulkan_gpus", return_value=[]), \
+                patch.object(prepare_models, "_windows_gpu_inventory", return_value=[]), \
+                patch.object(prepare_models, "get_model_status", return_value={"status": "downloaded"}), \
+                patch.object(prepare_models, "_punctuation_cached", return_value=True), \
+                patch.object(prepare_models, "asr_gpu_candidate", return_value={"backend": None, "canPrepare": False}), \
+                patch("services.asr_resources.asr_resource_status", return_value={"ready": True, "missing": []}) as status, \
+                patch("services.asr_resources.ensure_asr_resources") as ensure:
+            result = prepare_models.prepare(check_only=True, setup_only=True, skip_postprocess=True,
+                                           progress=lambda _message: None)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(status.call_count, 2)
+        self.assertTrue(all(call.kwargs["diarization"] is True for call in status.call_args_list))
+        ensure.assert_not_called()
+
+    def test_regular_lazy_check_does_not_probe_optional_asr_or_alignment_resources(self):
+        with patch.object(prepare_models, "get_simple_gpu_details", return_value={"backend": None}), \
+                patch.object(prepare_models, "enumerate_vulkan_gpus", return_value=[]), \
+                patch.object(prepare_models, "_windows_gpu_inventory", return_value=[]), \
+                patch.object(prepare_models, "get_model_status", return_value={"status": "downloaded"}) as model_status, \
+                patch.object(prepare_models, "_punctuation_cached", return_value=True), \
+                patch("services.asr_resources.asr_resource_status") as status, \
+                patch("services.asr_resources.ensure_asr_resources") as ensure:
+            result = prepare_models.prepare(check_only=True, skip_postprocess=True,
+                                           progress=lambda _message: None)
+
+        self.assertEqual(result, 0)
+        status.assert_not_called()
+        ensure.assert_not_called()
+        self.assertEqual([call.args[0] for call in model_status.call_args_list], ["small"])
+
+    def test_regular_prepare_downloads_only_small_and_leaves_new_profiles_lazy(self):
+        downloaded = []
+        with patch.object(prepare_models, "get_simple_gpu_details", return_value={"backend": None}), \
+                patch.object(prepare_models, "get_model_status", return_value={"status": "not_downloaded"}) as model_status, \
+                patch.object(prepare_models, "_report_size", return_value="offline"), \
+                patch.object(prepare_models, "download_registered_model", side_effect=lambda model, _progress: downloaded.append(model)), \
+                patch("services.asr_resources.asr_resource_status") as status, \
+                patch("services.asr_resources.ensure_asr_resources") as ensure:
+            result = prepare_models.prepare(skip_postprocess=True, progress=lambda _message: None)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(downloaded, ["small"])
+        self.assertEqual([call.args[0] for call in model_status.call_args_list], ["small"])
+        status.assert_not_called()
+        ensure.assert_not_called()
+
     def test_check_only_reports_missing_models_without_downloading(self):
         with patch.object(prepare_models, "get_simple_gpu_details", return_value={"backend": None}), \
                 patch.object(prepare_models, "get_model_status", return_value={"status": "not_downloaded"}), \

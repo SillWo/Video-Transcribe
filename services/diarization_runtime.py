@@ -206,7 +206,7 @@ def _windows_inventory() -> list[dict[str, Any]]:
     script = ("Get-CimInstance Win32_VideoController | Select-Object Name,PNPDeviceID "
               "| ConvertTo-Json -Compress")
     try:
-        result = subprocess.run(["powershell", "-NoProfile", "-Command", script], capture_output=True,
+        result = subprocess.run(["powershell", "-NoProfile", "-Command", script], stdin=subprocess.DEVNULL, capture_output=True,
                                 text=True, encoding="utf-8", errors="replace", timeout=8,
                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         rows = json.loads(result.stdout or "[]") if result.returncode == 0 else []
@@ -239,7 +239,7 @@ def _vulkan_inventory() -> list[dict[str, Any]]:
 def _cuda_inventory() -> list[dict[str, Any]]:
     try:
         result = subprocess.run(["nvidia-smi", "--query-gpu=uuid,pci.bus_id,name,index", "--format=csv,noheader,nounits"],
-                                capture_output=True, text=True, timeout=5,
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5,
                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if result.returncode:
             return []
@@ -320,7 +320,7 @@ def _doctor(executable: str, *, refresh: bool = False) -> dict[str, Any]:
     if not refresh and cached and now - cached[0] < 5:
         return cached[1]
     try:
-        result = subprocess.run([executable, "--json", "doctor"], capture_output=True, text=True,
+        result = subprocess.run([executable, "--json", "doctor"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                 encoding="utf-8", errors="replace", timeout=12,
                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         payload = json.loads(result.stdout)
