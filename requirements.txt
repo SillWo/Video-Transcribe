@@ -1,4 +1,5 @@
 # Core runtime only. The Russian punctuation model is opt-in in requirements-postprocess.txt.
+-r requirements-meetings.txt
 fastapi>=0.115,<1
 faster-whisper>=1.1.1,<2
 av>=14,<19
@@ -9,3 +10,4 @@ python-multipart>=0.0.20,<1
 uvicorn>=0.34,<1
 validators>=0.34,<1
 yt-dlp>=2025.1.15
+obsws-python>=1.7,<2

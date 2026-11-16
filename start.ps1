@@ -358,8 +358,14 @@ function Get-FileHashText([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Get-CoreRequirementsHash {
+    $primary = Get-FileHashText (Join-Path $Root 'requirements.txt')
+    $meetings = Get-FileHashText (Join-Path $Root 'requirements-meetings.txt')
+    return "$primary`:$meetings"
+}
+
 function Test-CorePackages([string]$PythonExe) {
-    & $PythonExe -c "import importlib.util,sys; names=['fastapi','faster_whisper','ffmpeg','huggingface_hub','psutil','multipart','uvicorn','validators','yt_dlp']; missing=[name for name in names if importlib.util.find_spec(name) is None]; print('Missing core packages: '+', '.join(missing)) if missing else None; sys.exit(bool(missing))" 2>$null
+    & $PythonExe -c "import importlib.util,sys; names=['fastapi','faster_whisper','ffmpeg','huggingface_hub','psutil','multipart','uvicorn','validators','yt_dlp','mcp','PIL','cv2','rapidocr','onnxruntime','tokenizers','obsws_python']; missing=[name for name in names if importlib.util.find_spec(name) is None]; print('Missing core packages: '+', '.join(missing)) if missing else None; sys.exit(bool(missing))" 2>$null
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -440,7 +446,7 @@ function Ensure-Environment {
     if ($CheckOnly) {
         if (-not (Test-Path (Join-Path $Root '.venv\Scripts\python.exe'))) { Fail 'Локальное окружение .venv ещё не создано. Запустите start.ps1 для настройки.' }
         $reqMarker = Join-Path $Runtime 'core-requirements.sha256'
-        if (-not (Test-Path $reqMarker) -or (Get-Content -Raw $reqMarker).Trim() -ne (Get-FileHashText (Join-Path $Root 'requirements.txt'))) { Fail 'Python-зависимости не установлены для текущего requirements.txt. Запустите start.ps1.' }
+        if (-not (Test-Path $reqMarker) -or (Get-Content -Raw $reqMarker).Trim() -ne (Get-CoreRequirementsHash)) { Fail 'Python-зависимости не установлены для текущих основных и meeting requirements. Запустите start.ps1.' }
         if (-not (Test-CorePackages (Join-Path $Root '.venv\Scripts\python.exe'))) { Fail 'В .venv отсутствуют основные Python-модули. Запустите start.ps1, чтобы восстановить зависимости.' }
         if ($script:IncludePostprocess) {
             if (Test-PostprocessPackages (Join-Path $Root '.venv\Scripts\python.exe')) { Write-Host 'Русская постобработка доступна.' }
@@ -477,7 +483,7 @@ function Ensure-Environment {
 
     $pythonExe = Join-Path $Root '.venv\Scripts\python.exe'
     $reqPath = Join-Path $Root 'requirements.txt'
-    $reqHash = Get-FileHashText $reqPath
+    $reqHash = Get-CoreRequirementsHash
     $markerPath = Join-Path $Runtime 'core-requirements.sha256'
     $installedHash = if (Test-Path $markerPath) { (Get-Content -Raw $markerPath).Trim() } else { '' }
     $pipCheck = $false

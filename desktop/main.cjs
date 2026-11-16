@@ -1,9 +1,10 @@
-const { app, BrowserWindow, Tray, Menu, dialog, ipcMain, nativeImage } = require('electron');
+const { app, BrowserWindow, Tray, Menu, dialog, ipcMain, nativeImage, shell } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 const { buildUiNavigationUrl } = require('./ui_entry.cjs');
+const { isAllowedEvidenceUrl } = require('./evidence_url.cjs');
 
 const PROJECT = path.resolve(__dirname, '..');
 const configuredRuntime = process.env.VT_SIMPLE_RUNTIME_DIR || path.join(PROJECT, '.runtime');
@@ -35,6 +36,10 @@ let backendChild;
 let host = null;
 let quitting = false;
 let exitInProgress = false;
+let recorderStatus = null;
+let recorderPollTimer = null;
+const minimizeNoticePath = path.join(appDataPath, 'minimize-notice-shown');
+let minimizeExplained = fs.existsSync(minimizeNoticePath);
 const pendingFlushes = new Map();
 
 function readDescriptor() {
@@ -114,6 +119,62 @@ function showWindow() {
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show(); mainWindow.focus();
 }
+async function fetchRecorderStatus() {
+  if (!host?.backendUrl) throw new Error('Локальный обработчик недоступен.');
+  const response = await fetch(`${host.backendUrl}/api/meetings/recorder`, { signal: AbortSignal.timeout(2200) });
+  if (!response.ok) throw new Error(`Не удалось получить состояние записи (код ${response.status}).`);
+  return response.json();
+}
+function updateTray() {
+  if (!tray || tray.isDestroyed()) return;
+  const state = recorderStatus?.state;
+  const label = state === 'recording' ? 'Идёт запись встречи' : state === 'starting' ? 'Запуск записи…' :
+    state === 'stopping' ? 'Сохранение записи…' : state === 'preparing' ? 'Подготовка OBS…' :
+    state === 'unavailable' ? 'Запись недоступна' : 'Запись не ведётся';
+  tray.setToolTip(`Video Transcribe — ${label}`);
+  const template = [{ label, enabled: false }, { label: 'Открыть', click: showWindow }, { type: 'separator' },
+    ...(state === 'recording' ? [{ label: 'Закончить запись и сохранить', click: stopRecordingFromTray }] : []),
+    { label: 'Выход', click: requestExit }];
+  tray.setContextMenu(Menu.buildFromTemplate(template));
+}
+async function pollRecorder() {
+  try {
+    recorderStatus = await fetchRecorderStatus();
+  } catch (error) {
+    recorderStatus = { state: 'unavailable', error: String(error?.message || error) };
+  }
+  updateTray();
+}
+function startRecorderPolling() {
+  if (recorderPollTimer) clearInterval(recorderPollTimer);
+  pollRecorder();
+  recorderPollTimer = setInterval(pollRecorder, 1200);
+}
+async function stopRecordingFromTray() {
+  try {
+    if (!recorderStatus || recorderStatus.state === 'unavailable') await pollRecorder();
+    if (recorderStatus?.state !== 'recording') return;
+    recorderStatus = { ...recorderStatus, state: 'stopping' }; updateTray();
+    const response = await fetch(`${host.backendUrl}/api/meetings/recorder/stop`, {
+      method: 'POST', signal: AbortSignal.timeout(120000),
+    });
+    if (!response.ok) {
+      let detail = 'Не удалось завершить и сохранить запись.';
+      try { detail = (await response.json()).detail || detail; } catch {}
+      throw new Error(detail);
+    }
+    const result = await response.json();
+    recorderStatus = result.recorder;
+    updateTray();
+    await dialog.showMessageBox(mainWindow || undefined, { type: 'info', title: 'Запись сохранена',
+      message: 'Встреча добавлена в архив. Транскрибация автоматически не запускалась.' });
+  } catch (error) {
+    recorderStatus = { ...(recorderStatus || {}), state: 'recording', error: String(error?.message || error) };
+    updateTray();
+    await dialog.showMessageBox(mainWindow || undefined, { type: 'error', title: 'Запись сохранена для восстановления',
+      message: String(error?.message || error), detail: 'Приложение и OBS остаются запущены; файл записи не удалён.' });
+  }
+}
 function createWindow() {
   const { width: aw, height: ah } = require('electron').screen.getPrimaryDisplay().workAreaSize;
   const width = Math.min(1440, aw), height = Math.min(900, ah);
@@ -122,11 +183,29 @@ function createWindow() {
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   mainWindow.removeMenu();
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    try { if (new URL(url).origin !== new URL(host.backendUrl).origin) event.preventDefault(); }
+    try {
+      if (new URL(url).origin !== new URL(host.backendUrl).origin) {
+        event.preventDefault();
+        if (isAllowedEvidenceUrl(url)) void shell.openExternal(url).catch(() => {});
+      }
+    }
     catch { event.preventDefault(); }
   });
-  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  mainWindow.on('close', event => { if (!quitting) { event.preventDefault(); mainWindow.hide(); } });
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (isAllowedEvidenceUrl(url)) void shell.openExternal(url).catch(() => {});
+    return { action: 'deny' };
+  });
+  mainWindow.on('close', event => {
+    if (quitting) return;
+    event.preventDefault();
+    if (!minimizeExplained) {
+      minimizeExplained = true;
+      try { fs.writeFileSync(minimizeNoticePath, 'shown\n'); } catch {}
+      dialog.showMessageBox(mainWindow, { type: 'info', buttons: ['Понятно'], title: 'Приложение продолжит работу',
+        message: 'При закрытии окна Video Transcribe останется в области уведомлений. Текущая запись продолжится.' })
+        .finally(() => mainWindow?.hide());
+    } else mainWindow.hide();
+  });
   mainWindow.on('closed', () => { mainWindow = null; });
   mainWindow.loadURL(buildUiNavigationUrl(host.backendUrl, path.join(PROJECT, 'ui', 'dist', 'index.html')), {
     extraHeaders: 'Cache-Control: no-cache\r\nPragma: no-cache\r\n',
@@ -135,8 +214,7 @@ function createWindow() {
 }
 function createTray() {
   tray = new Tray(nativeImage.createFromPath(path.join(__dirname, 'assets', 'tray.png')));
-  tray.setToolTip('Video Transcribe');
-  tray.setContextMenu(Menu.buildFromTemplate([{ label: 'Открыть', click: showWindow }, { type: 'separator' }, { label: 'Выход', click: requestExit }]));
+  updateTray();
   tray.on('double-click', showWindow);
 }
 function requestRendererFlush(timeout = 15000) {
@@ -153,14 +231,18 @@ async function requestExit() {
   exitInProgress = true;
   let inputDisabled = false;
   try {
-    if (backendChild && backendChild.exitCode !== null) {
-      if (mainWindow) { mainWindow.setEnabled(false); inputDisabled = true; }
-      const flushError = await requestRendererFlush();
-      if (flushError) throw flushError;
-      quitting = true;
-      mainWindow?.removeAllListeners('close'); mainWindow?.destroy(); tray?.destroy();
-      app.quit();
-      return;
+    if (backendChild && backendChild.exitCode !== null)
+      throw new Error('Локальный обработчик недоступен. Не удалось подтвердить, что запись остановлена; OBS и файл записи остаются запущены для восстановления.');
+    // Never shut down the host while a private OBS recording is active.
+    const liveRecorder = await fetchRecorderStatus();
+    recorderStatus = liveRecorder; updateTray();
+    if (liveRecorder.state === 'recording' || liveRecorder.state === 'stopping') {
+      const answer = await dialog.showMessageBox(mainWindow || undefined, { type: 'warning',
+        buttons: ['Завершить запись и выйти', 'Продолжить запись'], defaultId: 1, cancelId: 1,
+        title: 'Идёт запись встречи', message: 'Сначала остановить запись и сохранить встречу в архив?' });
+      if (answer.response !== 0) return;
+      await stopRecordingFromTray();
+      if (recorderStatus?.state === 'recording' || recorderStatus?.error) throw new Error(recorderStatus?.error || 'Запись не была сохранена.');
     }
     const info = await fetch(`${host.backendUrl}/api/simple/queue`, { signal: AbortSignal.timeout(2500) }).then(r => r.json());
     const busy = Boolean(info.activeJob || info.waitingCount || info.waitingJobs?.length);
@@ -221,7 +303,7 @@ async function startOrAttachHost() {
 
 app.on('second-instance', showWindow);
 app.whenReady().then(async () => {
-  try { await startOrAttachHost(); createWindow(); createTray(); }
+  try { await startOrAttachHost(); createWindow(); createTray(); startRecorderPolling(); }
   catch (error) {
     await dialog.showMessageBox({ type: 'error', title: 'Video Transcribe не запустился', message: String(error?.message || error) });
     quitting = true;

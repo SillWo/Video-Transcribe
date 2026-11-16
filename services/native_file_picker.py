@@ -91,6 +91,41 @@ def _show_windows_dialog(multiple: bool = False) -> str | list[str] | None:
     return selected
 
 
+def pick_directory() -> str | None:
+    """Open a native directory chooser in a child process so the server stays responsive."""
+    if os.name != "nt":
+        raise RuntimeError("Выбор папки доступен только в Windows.")
+    if not _dialog_lock.acquire(blocking=False):
+        raise RuntimeError("Окно выбора уже открыто.")
+    try:
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "services.native_file_picker", "--dialog-directory"],
+                cwd=Path(__file__).resolve().parents[1], stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=300,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Время ожидания выбора папки истекло.") from exc
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or "Не удалось открыть выбор папки.")
+        return result.stdout.strip() or None
+    finally:
+        _dialog_lock.release()
+
+
+def _run_tk_directory_dialog() -> str:
+    import tkinter as tk
+    from tkinter import filedialog
+    owner = tk.Tk()
+    try:
+        owner.withdraw()
+        owner.attributes("-topmost", True)
+        return filedialog.askdirectory(parent=owner, title="Выберите папку архива встреч", mustexist=False) or ""
+    finally:
+        owner.destroy()
+
+
 def pick_file() -> str | None:
     if not _dialog_lock.acquire(blocking=False):
         raise RuntimeError("Окно выбора файла уже открыто.")
@@ -110,13 +145,13 @@ def pick_files() -> list[str]:
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or sys.argv[1] not in {"--dialog", "--dialog-multiple"}:
+    if len(sys.argv) != 2 or sys.argv[1] not in {"--dialog", "--dialog-multiple", "--dialog-directory"}:
         return 2
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     try:
         multiple = sys.argv[1] == "--dialog-multiple"
-        selected = _run_tk_dialog(multiple=multiple)
+        selected = _run_tk_directory_dialog() if sys.argv[1] == "--dialog-directory" else _run_tk_dialog(multiple=multiple)
         sys.stdout.write(json.dumps(selected, ensure_ascii=False) if multiple else selected)
         sys.stdout.flush()
         return 0

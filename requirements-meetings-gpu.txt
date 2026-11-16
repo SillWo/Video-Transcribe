@@ -1,0 +1,8 @@
+# Isolated Python 3.13 environment for screen OCR on Windows DirectML.
+numpy==2.4.4
+onnxruntime-directml==1.24.4
+av==18.1.0
+rapidocr==3.10.0
+opencv-python-headless>=4.13,<5
+Pillow>=10,<13
+tokenizers>=0.20,<1

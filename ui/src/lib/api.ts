@@ -1,5 +1,5 @@
-export const API_BASE =
-  (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '') ?? ''
+const viteEnv = (import.meta as ImportMeta & { env?: { VITE_API_BASE_URL?: string } }).env
+export const API_BASE = viteEnv?.VITE_API_BASE_URL?.replace(/\/$/, '') ?? ''
 
 export type FileSelection = { files: { path: string; name: string }[]; rejected: { path: string; message: string }[] }
 export type DesktopApi = {

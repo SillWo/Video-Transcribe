@@ -6,6 +6,8 @@ import { DraftManager, SelectionGate, flushAndRead } from './lib/draftManager'
 import { defaultDiarizationPrefs, diarizationRequestFields, sanitizeDiarizationPrefs, sanitizeStoredPrefs, stageOrderFor } from './lib/diarization'
 import { canSubmitOnDevice, defaultDeviceForProfile, gpuReadinessLabel, profileDeviceCapability, type AsrDeviceCapability } from './lib/asrCapabilities'
 import { resolveTaskProgressView, type TaskStage } from './lib/taskProgress'
+import { flushPendingSaves } from './lib/pendingSaves'
+import { MeetingRecordingBanner, MeetingWorkspace } from './components/MeetingWorkspace'
 
 type Profile = 'quality' | 'balanced' | 'economy'
 type Device = 'cpu' | 'gpu'
@@ -47,6 +49,10 @@ let flushAllWorkspaceDrafts: (() => Promise<void>) | null = null
 let clearWorkspaceJob: ((jobId: string) => void) | null = null
 let openWorkspaceTask: ((jobId: string) => void) | null = null
 let clearedLatestJob: { id: string; createdAt: string } | null = null
+async function flushAllRootDrafts() {
+  await (flushAllWorkspaceDrafts ?? flushCurrentDraft)?.()
+  await flushPendingSaves()
+}
 const defaults: Prefs = { profile: 'balanced', device: 'cpu', cpuThreads: 1, restorePunctuation: true, ...defaultDiarizationPrefs }
 const stages: Record<Stage, string> = {
   preparation: 'Подготовка модели', source: 'Получение записи', audio: 'Подготовка аудио',
@@ -174,23 +180,30 @@ function stageProgressText(progress: JobProgress | null | undefined) {
 export default function App() {
   const location = useLocation()
   const navigate = useNavigate()
+  useEffect(() => window.desktopApi?.onBeforeQuit(flushAllRootDrafts), [])
   const go = async (event: React.MouseEvent<HTMLAnchorElement>, path: string) => {
     event.preventDefault()
-    try { await (flushAllWorkspaceDrafts ?? flushCurrentDraft)?.(); navigate(path) } catch { /* keep the unsaved draft visible */ }
+    try { await flushAllRootDrafts(); navigate(path) } catch { /* keep the unsaved draft visible */ }
   }
   return <div className="app-frame">
     <header className="topbar">
-      <Link className="brand" to="/" onClick={(event) => void go(event, '/')} aria-label="Video Transcribe — главная"><span className="brand-mark"><FileText size={18} strokeWidth={1.8} /></span><span>Video Transcribe</span></Link>
+      <Link className="brand" to="/meetings" onClick={(event) => void go(event, '/meetings')} aria-label="Video Transcribe — встречи"><span className="brand-mark"><FileText size={18} strokeWidth={1.8} /></span><span>Video Transcribe</span></Link>
       <nav className="topnav" aria-label="Основная навигация">
-        <Link className={location.pathname !== '/history' ? 'active' : ''} to="/" onClick={(event) => void go(event, '/')}>Транскрибация</Link>
+        <Link className={location.pathname.startsWith('/meetings') && !location.pathname.startsWith('/meetings/glossary') && !location.pathname.startsWith('/meetings/settings') ? 'active' : ''} to="/meetings" onClick={(event) => void go(event, '/meetings')}>Встречи</Link>
+        <Link className={location.pathname.startsWith('/meetings/glossary') ? 'active' : ''} to="/meetings/glossary" onClick={(event) => void go(event, '/meetings/glossary')}>Словарь</Link>
+        <Link className={location.pathname.startsWith('/meetings/settings') ? 'active' : ''} to="/meetings/settings" onClick={(event) => void go(event, '/meetings/settings')}>Настройки</Link>
+        <Link className={location.pathname === '/transcribe' ? 'active' : ''} to="/transcribe" onClick={(event) => void go(event, '/transcribe')}>Файлы</Link>
         <Link className={location.pathname === '/history' ? 'active' : ''} to="/history" onClick={(event) => void go(event, '/history')}>История</Link>
       </nav>
     </header>
-    <div className="workspace-preserver" style={{ display: location.pathname === '/history' ? 'none' : 'contents' }}><Workspace /></div>
+    <MeetingRecordingBanner />
+    <div className="workspace-preserver" style={{ display: location.pathname === '/transcribe' ? 'contents' : 'none' }}><Workspace /></div>
     <Routes>
-      <Route path="/" element={null} />
+      <Route path="/" element={<Navigate to="/meetings" replace />} />
+      <Route path="/transcribe" element={null} />
       <Route path="/history" element={<HistoryPage />} />
-      <Route path="*" element={<Navigate to="/" replace />} />
+      <Route path="/meetings/*" element={<MeetingWorkspace />} />
+      <Route path="*" element={<Navigate to="/meetings" replace />} />
     </Routes>
   </div>
 }
@@ -412,10 +425,6 @@ function Workspace() {
   }, [flushDraft])
 
   useEffect(() => {
-    const unsubscribe = window.desktopApi?.onBeforeQuit(flushAllDrafts)
-    return () => { unsubscribe?.() }
-  }, [flushAllDrafts])
-  useEffect(() => {
     flushAllWorkspaceDrafts = flushAllDrafts
     return () => { if (flushAllWorkspaceDrafts === flushAllDrafts) flushAllWorkspaceDrafts = null }
   }, [flushAllDrafts])
@@ -565,7 +574,7 @@ function Workspace() {
     openWorkspaceTask = (id) => {
       setOpenIds((ids) => ids.includes(id) ? ids : [...ids, id])
       setOrdinals((current) => assignOrdinals(current, [id]))
-      navigate('/')
+      navigate('/transcribe')
       void selectTask(id)
     }
     return () => { openWorkspaceTask = null }
@@ -983,7 +992,7 @@ function HistoryPage() {
   }, [refresh])
   const downloadHistory = async (item: HistoryItem, format: 'txt' | 'md') => {
     try {
-      await (flushAllWorkspaceDrafts ?? flushCurrentDraft)?.()
+      await flushAllRootDrafts()
       const downloadUrl = item.files.find((file) => file.format === format)?.downloadUrl ?? `/api/simple/jobs/${encodeURIComponent(item.id)}/download?format=${format}`
       const response = await fetch(`${API_BASE}${downloadUrl}`)
       if (!response.ok) throw new Error(response.status === 404 ? 'Файл больше недоступен.' : `Ошибка загрузки (${response.status}).`)
@@ -994,13 +1003,13 @@ function HistoryPage() {
     if (!deleteTarget || deleteInFlightRef.current) return
     const target = deleteTarget
     deleteInFlightRef.current = true; setBusy(true); setDeleteError('')
-    try { await (flushAllWorkspaceDrafts ?? flushCurrentDraft)?.(); const response = await fetch(`${API_BASE}/api/simple/history/${encodeURIComponent(target.id)}`, { method: 'DELETE' }); if (!response.ok) throw new Error(response.status === 409 ? 'Нельзя удалить задачу, пока она выполняется.' : `Ошибка удаления (${response.status}).`); if (latest?.id === target.id || (!latest && items[0]?.id === target.id)) { clearedLatestJob = { id: target.id, createdAt: target.createdAt }; try { localStorage.setItem('video-transcribe-cleared-latest', JSON.stringify(clearedLatestJob)) } catch { /* optional marker */ } } clearWorkspaceJob?.(target.id); setItems((current) => current.filter((item) => item.id !== target.id)); setDeleteTarget(null) }
+    try { await flushAllRootDrafts(); const response = await fetch(`${API_BASE}/api/simple/history/${encodeURIComponent(target.id)}`, { method: 'DELETE' }); if (!response.ok) throw new Error(response.status === 409 ? 'Нельзя удалить задачу, пока она выполняется.' : `Ошибка удаления (${response.status}).`); if (latest?.id === target.id || (!latest && items[0]?.id === target.id)) { clearedLatestJob = { id: target.id, createdAt: target.createdAt }; try { localStorage.setItem('video-transcribe-cleared-latest', JSON.stringify(clearedLatestJob)) } catch { /* optional marker */ } } clearWorkspaceJob?.(target.id); setItems((current) => current.filter((item) => item.id !== target.id)); setDeleteTarget(null) }
     catch (reason) { setDeleteError(`Не удалось удалить задачу. ${errorText(reason)}`) } finally { deleteInFlightRef.current = false; setBusy(false) }
   }
   return <main className="history-page">
-    <div className="history-title"><div><p className="eyebrow">Ваши задачи</p><h1>История расшифровок</h1><p>Готовые тексты и файлы можно скачать в любое время.</p></div><button ref={historyFallbackRef} className="primary-button" onClick={() => navigate('/')}><Plus size={17} />Новая расшифровка</button></div>
+    <div className="history-title"><div><p className="eyebrow">Ваши задачи</p><h1>История расшифровок</h1><p>Готовые тексты и файлы можно скачать в любое время.</p></div><button ref={historyFallbackRef} className="primary-button" onClick={() => { void flushAllRootDrafts().then(() => navigate('/transcribe')).catch(() => undefined) }}><Plus size={17} />Новая расшифровка</button></div>
     {error && <div className="inline-error" role="alert">{error}<button className="text-button" onClick={() => { setLoading(true); void refresh() }}>Повторить</button></div>}
-    {loading ? <div className="history-empty">Загружаем историю…</div> : items.length === 0 ? <div className="history-empty"><div className="welcome-icon"><FileText size={22} /></div><h2>Пока нет расшифровок</h2><p>Созданные задачи появятся здесь.</p></div> : <div className="history-table-wrap"><table className="history-table"><thead><tr><th>Источник</th><th>Дата</th><th>Статус</th><th>Файлы</th><th><span className="sr-only">Действия</span></th></tr></thead><tbody>{items.map((item) => { const activeItem = isActiveStatus(item.status); const downloadable = item.status !== 'cancelled'; const duration = terminalDurationSeconds(item); return <tr key={item.id}><td className="history-source" title={sourceLabel(item)}>{sourceLabel(item)}</td><td className="history-date"><span>{formatDate(item.createdAt)}</span>{duration !== null && <small>Длительность · {clockText(duration)}</small>}</td><td><span className={`status-badge ${item.status}`}>{statusLabels[item.status]}</span></td><td><div className="file-links">{downloadable && item.files.some((file) => file.format === 'txt') && <button className="file-link" onClick={() => void downloadHistory(item, 'txt')}>TXT</button>}{downloadable && item.files.some((file) => file.format === 'md') && <button className="file-link" onClick={() => void downloadHistory(item, 'md')}>MD</button>}</div></td><td><div className="history-action-buttons"><button className="file-link" onClick={() => { openWorkspaceTask?.(item.id); navigate('/') }}>Открыть</button><button className="icon-button" aria-label={`Удалить ${sourceLabel(item)}`} title={activeItem || item.id === activeId ? 'Нельзя удалить выполняющуюся задачу' : 'Удалить из истории'} disabled={activeItem || item.id === activeId} onClick={() => { setDeleteError(''); setDeleteTarget(item) }}><Trash2 size={17} /></button></div></td></tr> })}</tbody></table></div>}
+    {loading ? <div className="history-empty">Загружаем историю…</div> : items.length === 0 ? <div className="history-empty"><div className="welcome-icon"><FileText size={22} /></div><h2>Пока нет расшифровок</h2><p>Созданные задачи появятся здесь.</p></div> : <div className="history-table-wrap"><table className="history-table"><thead><tr><th>Источник</th><th>Дата</th><th>Статус</th><th>Файлы</th><th><span className="sr-only">Действия</span></th></tr></thead><tbody>{items.map((item) => { const activeItem = isActiveStatus(item.status); const downloadable = item.status !== 'cancelled'; const duration = terminalDurationSeconds(item); return <tr key={item.id}><td className="history-source" title={sourceLabel(item)}>{sourceLabel(item)}</td><td className="history-date"><span>{formatDate(item.createdAt)}</span>{duration !== null && <small>Длительность · {clockText(duration)}</small>}</td><td><span className={`status-badge ${item.status}`}>{statusLabels[item.status]}</span></td><td><div className="file-links">{downloadable && item.files.some((file) => file.format === 'txt') && <button className="file-link" onClick={() => void downloadHistory(item, 'txt')}>TXT</button>}{downloadable && item.files.some((file) => file.format === 'md') && <button className="file-link" onClick={() => void downloadHistory(item, 'md')}>MD</button>}</div></td><td><div className="history-action-buttons"><button className="file-link" onClick={() => { void flushAllRootDrafts().then(() => { openWorkspaceTask?.(item.id); navigate('/transcribe') }).catch(() => undefined) }}>Открыть</button><button className="icon-button" aria-label={`Удалить ${sourceLabel(item)}`} title={activeItem || item.id === activeId ? 'Нельзя удалить выполняющуюся задачу' : 'Удалить из истории'} disabled={activeItem || item.id === activeId} onClick={() => { setDeleteError(''); setDeleteTarget(item) }}><Trash2 size={17} /></button></div></td></tr> })}</tbody></table></div>}
     <ConfirmDialog open={Boolean(deleteTarget)} title="Удалить расшифровку?" description={deleteTarget ? `${sourceLabel(deleteTarget)}. Это удалит задачу из истории и файлы результата.` : ''} confirmLabel="Удалить" cancelLabel="Отмена" busyLabel="Удаляем…" busy={busy} error={deleteError} fallbackFocusRef={historyFallbackRef} onConfirm={() => void remove()} onClose={() => { setDeleteTarget(null); setDeleteError('') }} />
   </main>
 }

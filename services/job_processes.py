@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import subprocess
 import threading
 
@@ -33,6 +34,7 @@ class JobProcessController:
         self._root_create_time: float | None = None
         self._pending_descendants: list[tuple[psutil.Process, float]] = []
         self._pending_tree_incomplete = False
+        self._priority_original: dict[tuple[int, float], int] = {}
 
     @property
     def cancelled(self) -> bool:
@@ -70,6 +72,7 @@ class JobProcessController:
                 self._root_create_time = None
                 self._pending_descendants = []
                 self._pending_tree_incomplete = False
+                self._priority_original.clear()
 
     def cancel(self) -> None:
         """Cancel the job and stop its currently owned process tree."""
@@ -91,6 +94,47 @@ class JobProcessController:
             create_time = self._root_create_time
         if process is not None:
             self._stop_process_tree(process, create_time)
+
+    def set_low_priority(self, enabled: bool) -> None:
+        """Lower only this controller's verified process tree, then restore it.
+
+        Meeting recording uses this as a reversible resource preference. It does
+        not suspend or terminate children, and never targets a PID without
+        verifying that it still belongs to this controller's process tree.
+        """
+        if os.name != "nt":
+            return
+        with self._lock:
+            root = self._process
+            root_create_time = self._root_create_time
+            original = dict(self._priority_original)
+        if not enabled and not original:
+            return
+        if root is None or root_create_time is None:
+            return
+        try:
+            root_process = psutil.Process(root.pid)
+            if not self._matches_identity(root_process, root_create_time):
+                return
+            targets = [root_process, *root_process.children(recursive=True)]
+            desired = getattr(psutil, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
+            for item in targets:
+                try:
+                    create_time = float(item.create_time())
+                    identity = (item.pid, create_time)
+                    if enabled:
+                        current = item.nice()
+                        with self._lock:
+                            self._priority_original.setdefault(identity, current)
+                        item.nice(desired)
+                    elif identity in original:
+                        item.nice(original[identity])
+                        with self._lock:
+                            self._priority_original.pop(identity, None)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError, ValueError):
+                    continue
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError, ValueError):
+            return
 
     @staticmethod
     def _capture_create_time(process: subprocess.Popen) -> float | None:

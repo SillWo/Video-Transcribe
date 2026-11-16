@@ -183,7 +183,8 @@ class NewAsrModel:
                     except (TypeError, ValueError):
                         print(line, flush=True)
                         continue
-                    self._forward_worker_event(event, default_stage)
+                    phase = "language_id" if mode == "language-id" and event.get("type") == "progress" else None
+                    self._forward_worker_event(event, default_stage, phase=phase)
                 else:
                     print(line, flush=True)
             returncode = process.wait()
@@ -264,7 +265,7 @@ class NewAsrModel:
                     and item["index"] < target["index"])
         return target_backend, index, None
 
-    def _forward_worker_event(self, event: dict, default_stage: str) -> None:
+    def _forward_worker_event(self, event: dict, default_stage: str, *, phase: str | None = None) -> None:
         message = str(event.get("message") or "")
         if event.get("type") == "log":
             print(message, flush=True)
@@ -279,12 +280,14 @@ class NewAsrModel:
         except (TypeError, ValueError):
             processed = total = None
         percent = min(99.0, processed * 100.0 / total) if processed is not None and total and total > 0 else None
-        # Alignment is an internal subphase. Preserve the established public
-        # recognition stage while exposing the true phase in diagnostics.
-        phase = event.get("stage", default_stage)
+        # Alignment and language identification are internal subphases. Keep
+        # the public recognition checkpoint while exposing their real phase.
+        phase = phase or event.get("stage", default_stage)
+        worker_stage = "language-id" if phase == "language_id" else event.get("stage", default_stage)
+        public_stage = "recognition" if phase in {"alignment", "language_id"} else phase
         callback({"percent": percent, "processedSeconds": processed, "totalSeconds": total,
-                  "message": message, "stage": "recognition" if phase == "alignment" else phase,
-                  "phase": phase, "workerStage": phase})
+                  "message": message, "stage": public_stage,
+                  "phase": phase, "workerStage": worker_stage})
 
     def _language_from_observations(self, observations: list[dict], segments: list[dict]) -> tuple[str | None, float | None]:
         scores: dict[str, float] = {}
@@ -420,8 +423,11 @@ class NewAsrModel:
             if self.model_id == "parakeet-tdt-0.6b-v3" and not language:
                 nonempty_recognition = any(str(row.get("text", "")).strip() for row in rows)
                 target_device, target_index, fallback_reason = self._language_id_target(audio, workspace)
-                if fallback_reason:
-                    print(f"Language-ID GPU unavailable; using CPU: {fallback_reason}", flush=True)
+                if self.effective_device != "cpu" and target_device == "cpu":
+                    message = "Для выбранного GPU недоступно определение языка. Выберите CPU."
+                    if fallback_reason:
+                        message = f"{message} Причина: {fallback_reason}"
+                    raise TaskFailure(message, "device_unavailable", stage="recognition")
                 try:
                     lang_result = self._run_worker("language-id", audio, workspace, device=target_device,
                                                    device_index=target_index, default_stage="recognition")
@@ -453,29 +459,7 @@ class NewAsrModel:
                         print("Language identification found no speech observations in silent audio.", flush=True)
                 except TaskFailure as exc:
                     if target_device != "cpu":
-                        fallback_reason = f"{target_device} language-ID failed: {exc}"
-                        print(f"{fallback_reason}; retrying language-ID on CPU.", flush=True)
-                        try:
-                            lang_result = self._run_worker("language-id", audio, workspace, device="cpu",
-                                                           device_index=0, default_stage="recognition")
-                            observations = lang_result.get("language_observations") or []
-                            scored_observations = self._supported_language_observations(observations, rows)
-                            language_code, probability = self._language_from_observations(scored_observations, rows)
-                            diagnostics["language_identification"] = {
-                                "effective_device": lang_result.get("effective_device"),
-                                "effective_backend": lang_result.get("effective_backend"),
-                                "timing_seconds": lang_result.get("timing_seconds") or {},
-                                "worker_elapsed_seconds": lang_result.get("_worker_elapsed_seconds"),
-                                "fallback_reason": fallback_reason, "observations": observations,
-                                "supported_observations": scored_observations,
-                                "diagnostics": lang_result.get("diagnostics") or {},
-                            }
-                        except TaskFailure as cpu_exc:
-                            if nonempty_recognition:
-                                raise cpu_exc
-                            diagnostics["language_identification"] = {"error": str(cpu_exc),
-                                                                       "effective_device": "cpu",
-                                                                       "fallback_reason": fallback_reason}
+                        raise
                     elif nonempty_recognition:
                         raise
                     else:

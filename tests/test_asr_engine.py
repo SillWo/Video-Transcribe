@@ -34,6 +34,58 @@ def fake_worker_result(mode, device="cpu"):
 
 
 class AsrEngineTests(unittest.TestCase):
+    def test_language_id_worker_progress_keeps_recognition_stage_and_exposes_phase(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            audio = workspace / "audio.wav"
+            write_pcm_wav(audio)
+            callback_events = []
+            model = asr_engine.NewAsrModel("parakeet-tdt-0.6b-v3", "cpu",
+                                           progress=callback_events.append)
+
+            class FakeProcess:
+                def __init__(self, command, **_kwargs):
+                    self.stdout = io.StringIO(
+                        '__VT_ASR__ {"type":"progress","stage":"recognition",'
+                        '"message":"worker detail","processedSeconds":30,"totalSeconds":60}\n'
+                    )
+                    self.returncode = None
+                    self.output = Path(command[command.index("--output") + 1])
+                    self.output.write_text(json.dumps({
+                        "ok": True, "effective_device": "cpu", "effective_backend": "cpu",
+                        "language_observations": [],
+                    }), encoding="utf-8")
+
+                def wait(self):
+                    self.returncode = 0
+                    return self.returncode
+
+                def poll(self):
+                    return self.returncode
+
+            with patch.object(asr_engine, "runtime_python", return_value=Path("python.exe")), \
+                    patch.object(asr_engine.subprocess, "Popen", side_effect=FakeProcess):
+                model._run_worker("language-id", audio, workspace, device="cpu",
+                                  default_stage="recognition")
+
+        self.assertEqual(len(callback_events), 1)
+        self.assertEqual(callback_events[0]["stage"], "recognition")
+        self.assertEqual(callback_events[0]["phase"], "language_id")
+        self.assertEqual(callback_events[0]["workerStage"], "language-id")
+        self.assertEqual(callback_events[0]["percent"], 50.0)
+
+    def test_regular_recognition_worker_event_keeps_existing_stage(self):
+        callback_events = []
+        model = asr_engine.NewAsrModel("parakeet-tdt-0.6b-v3", "cpu",
+                                       progress=callback_events.append)
+        model._forward_worker_event(
+            {"type": "progress", "stage": "recognition", "message": "Recognizing"},
+            "recognition",
+        )
+        self.assertEqual(callback_events[0]["stage"], "recognition")
+        self.assertEqual(callback_events[0]["phase"], "recognition")
+        self.assertEqual(callback_events[0]["workerStage"], "recognition")
+
     def test_model_transcribe_runs_asr_then_aligner_after_worker_exit_and_preserves_times(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "audio.wav"
@@ -97,6 +149,130 @@ class AsrEngineTests(unittest.TestCase):
                     model.transcribe(source)
         self.assertEqual(raised.exception.code, "device_error")
         self.assertEqual(calls, ["transcribe"])
+
+    def test_gpu_language_id_failure_propagates_without_cpu_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.wav"
+            write_pcm_wav(source)
+            model = asr_engine.NewAsrModel("parakeet-tdt-0.6b-v3", "vulkan")
+            failure = TaskFailure("Vulkan device lost", "device_error", stage="recognition")
+            calls = []
+
+            def run(mode, *_args, **_kwargs):
+                calls.append(mode)
+                if mode == "transcribe":
+                    return {"ok": True, "segments": [{"start": 0, "end": 1, "text": "speech"}],
+                            "language_observations": [], "effective_device": "vulkan",
+                            "effective_backend": "Vulkan", "precision": "FP32"}
+                raise failure
+
+            with patch.object(asr_engine, "_prepare_audio", return_value=source), \
+                    patch.object(model, "_language_id_target", return_value=("vulkan", 0, None)), \
+                    patch.object(model, "_run_worker", side_effect=run):
+                with self.assertRaises(TaskFailure) as raised:
+                    model.transcribe(source)
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(calls, ["transcribe", "language-id"])
+
+    def test_gpu_language_id_cpu_preflight_is_rejected_before_worker_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.wav"
+            write_pcm_wav(source)
+            model = asr_engine.NewAsrModel("parakeet-tdt-0.6b-v3", "vulkan")
+            calls = []
+
+            def run(mode, *_args, **_kwargs):
+                calls.append(mode)
+                return {"ok": True, "segments": [{"start": 0, "end": 1, "text": "speech"}],
+                        "language_observations": [], "effective_device": "vulkan",
+                        "effective_backend": "Vulkan", "precision": "FP32"}
+
+            with patch.object(asr_engine, "_prepare_audio", return_value=source), \
+                    patch.object(model, "_language_id_target",
+                                 return_value=("cpu", 0, "Native Vulkan device inventory failed.")), \
+                    patch.object(model, "_run_worker", side_effect=run):
+                with self.assertRaises(TaskFailure) as raised:
+                    model.transcribe(source)
+
+        self.assertEqual(raised.exception.code, "device_unavailable")
+        self.assertEqual(raised.exception.stage, "recognition")
+        self.assertIn("Для выбранного GPU недоступно определение языка. Выберите CPU.",
+                      str(raised.exception))
+        self.assertIn("Native Vulkan device inventory failed.", str(raised.exception))
+        self.assertEqual(calls, ["transcribe"])
+
+    def test_cpu_default_language_id_still_runs_without_gpu_unavailable_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.wav"
+            write_pcm_wav(source)
+            model = asr_engine.NewAsrModel("parakeet-tdt-0.6b-v3", "cpu")
+            calls = []
+
+            def run(mode, *_args, **_kwargs):
+                calls.append(mode)
+                if mode == "transcribe":
+                    return {"ok": True, "segments": [{"start": 0, "end": 1, "text": "speech"}],
+                            "language_observations": [], "effective_device": "cpu",
+                            "effective_backend": "CPU", "precision": "FP32"}
+                return {"ok": True, "effective_device": "cpu", "effective_backend": "CPU",
+                        "language_observations": [{"start": 0, "end": 1, "code": "en",
+                                                    "probability": 0.9}]}
+
+            with patch.object(asr_engine, "_prepare_audio", return_value=source), \
+                    patch.object(model, "_run_worker", side_effect=run), \
+                    patch("builtins.print") as printed:
+                _segments, stats = model.transcribe(source)
+
+        self.assertEqual(stats.language, "en")
+        self.assertEqual(calls, ["transcribe", "language-id"])
+        self.assertFalse(any("Language-ID GPU unavailable" in str(call.args)
+                             for call in printed.call_args_list))
+
+    def test_explicit_language_bypasses_language_id_gpu_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.wav"
+            write_pcm_wav(source)
+            model = asr_engine.NewAsrModel("parakeet-tdt-0.6b-v3", "vulkan")
+            calls = []
+
+            def run(mode, *_args, **_kwargs):
+                calls.append(mode)
+                return {"ok": True, "segments": [{"start": 0, "end": 1, "text": "speech"}],
+                        "language_observations": [], "effective_device": "vulkan",
+                        "effective_backend": "Vulkan", "precision": "FP32"}
+
+            with patch.object(asr_engine, "_prepare_audio", return_value=source), \
+                    patch.object(model, "_language_id_target", side_effect=AssertionError("should be bypassed")), \
+                    patch.object(model, "_run_worker", side_effect=run):
+                _segments, stats = model.transcribe(source, language="en")
+
+        self.assertEqual(stats.language, "en")
+        self.assertEqual(calls, ["transcribe"])
+
+    def test_cpu_language_id_failure_on_silence_keeps_existing_nonfatal_behavior(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.wav"
+            write_pcm_wav(source)
+            model = asr_engine.NewAsrModel("parakeet-tdt-0.6b-v3", "cpu")
+            calls = []
+
+            def run(mode, *_args, **_kwargs):
+                calls.append(mode)
+                if mode == "transcribe":
+                    return {"ok": True, "segments": [], "language_observations": [],
+                            "effective_device": "cpu", "effective_backend": "CPU", "precision": "FP32"}
+                raise TaskFailure("CPU language-ID failed", "transcription_failed", stage="recognition")
+
+            with patch.object(asr_engine, "_prepare_audio", return_value=source), \
+                    patch.object(model, "_language_id_target", return_value=("cpu", 0, None)), \
+                    patch.object(model, "_run_worker", side_effect=run):
+                segments, stats = model.transcribe(source)
+
+        self.assertEqual(segments, [])
+        self.assertIsNone(stats.language)
+        self.assertEqual(calls, ["transcribe", "language-id"])
+        self.assertEqual(model.diagnostics["language_identification"]["error"], "CPU language-ID failed")
 
     def test_runtime_override_selects_cpu_aligner_and_gpu_language_id_environment(self):
         model = asr_engine.NewAsrModel("parakeet-tdt-0.6b-v3", "cuda", device_index=5)

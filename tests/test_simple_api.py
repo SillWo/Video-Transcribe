@@ -419,6 +419,36 @@ class SimpleApiTests(unittest.TestCase):
         self.assertIsNone(postprocess["totalSeconds"])
         self.assertEqual(postprocess["message"], "Восстановление пунктуации")
 
+    def test_language_id_phase_is_safe_and_normalized_in_http_progress(self):
+        job_id = "6" * 32
+        web_api.history_store.create({"id": job_id, "sourceType": "file", "source": "C:/source.wav",
+                                      "profile": "quality", "device": "cpu", "cpuThreads": 2,
+                                      "restorePunctuation": False})
+
+        web_api._simple_progress(job_id, "recognition", {
+            "phase": "language_id", "workerStage": "language-id", "percent": 52,
+            "message": "Untrusted worker detail",
+        })
+        first = self.client.get(f"/api/simple/jobs/{job_id}").json()["progress"]
+        self.assertEqual(first["stage"], "recognition")
+        self.assertEqual(first["phase"], "language_id")
+        self.assertEqual(first["message"], "Определение языка речи")
+        first_started_at = first["phaseStartedAt"]
+
+        web_api._simple_progress(job_id, "recognition", {
+            "phase": "language_id", "workerStage": "language-id", "percent": 56,
+        })
+        repeated = self.client.get(f"/api/simple/jobs/{job_id}").json()["progress"]
+        self.assertEqual(repeated["phaseStartedAt"], first_started_at)
+
+        web_api._simple_progress(job_id, "recognition", {
+            "phase": "untrusted_phase", "message": "arbitrary private text",
+        })
+        normalized = self.client.get(f"/api/simple/jobs/{job_id}").json()["progress"]
+        self.assertIsNone(normalized["phase"])
+        self.assertIsNone(normalized["phaseStartedAt"])
+        self.assertEqual(normalized["message"], "Распознавание речи")
+
     def test_worker_events_persist_success_artifacts_and_failure_without_artifacts(self):
         def make_job(job_id, status_lines, exit_code=0):
             output_dir = web_api.history_store.job_dir(job_id) / "output"

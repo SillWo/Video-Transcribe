@@ -289,6 +289,40 @@ class TranscriptionHistory:
             rows = db.execute("SELECT metadata FROM jobs ORDER BY created_at DESC, id DESC").fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def list_meeting_jobs(self, meeting_id: str | None = None) -> list[dict[str, Any]]:
+        """Return compact summaries for meeting jobs without decoding full metadata."""
+        query = """SELECT id, status, stage, created_at, updated_at,
+                    json_array(json_extract(metadata, '$.meetingId'),
+                               json_extract(metadata, '$.meetingRoot'),
+                               json_extract(metadata, '$.error'),
+                               json_extract(metadata, '$.errorCode')) AS meeting_fields
+                   FROM jobs
+                   WHERE json_extract(metadata, '$.meetingId') IS NOT NULL
+                     AND json_extract(metadata, '$.meetingId') != ''"""
+        params: tuple[str, ...] = ()
+        if meeting_id is not None:
+            query += " AND json_extract(metadata, '$.meetingId') = ?"
+            params = (meeting_id,)
+        query += " ORDER BY created_at DESC, id DESC"
+        with self._lock, self._connect() as db:
+            rows = db.execute(query, params).fetchall()
+
+        summaries = []
+        for row in rows:
+            meeting_id_value, meeting_root, error, error_code = json.loads(row["meeting_fields"])
+            summaries.append({
+                "id": row["id"],
+                "status": row["status"],
+                "stage": row["stage"],
+                "createdAt": row["created_at"],
+                "updatedAt": row["updated_at"],
+                "meetingId": meeting_id_value,
+                "meetingRoot": meeting_root,
+                "error": error,
+                "errorCode": error_code,
+            })
+        return summaries
+
     def latest(self) -> dict[str, Any] | None:
         with self._lock, self._connect() as db:
             row = db.execute("SELECT metadata FROM jobs ORDER BY created_at DESC, id DESC LIMIT 1").fetchone()

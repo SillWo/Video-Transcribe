@@ -170,6 +170,67 @@ class TranscriptionHistoryTests(unittest.TestCase):
                            "restorePunctuation": False})
         self.assertEqual(self.store.latest(), self.store.list()[0])
 
+    def test_list_meeting_jobs_projects_only_meeting_fields_and_is_read_only(self):
+        marker = "LARGE_FAKE_ASR_AND_DIARIZATION_PAYLOAD"
+        created = "2026-11-01T00:00:00+00:00"
+        updated = "2026-11-02T00:00:00+00:00"
+        rows = [
+            ("b" * 32, "m-1", "/meetings/root", "broken", "ASR_FAILED", "recognition", "failed", created),
+            ("a" * 32, "m-1", None, None, None, "result", "completed", created),
+            ("c" * 32, "m-2", "/meetings/other", None, None, "source", "queued", "2026-11-03T00:00:00+00:00"),
+            ("d" * 32, None, None, None, None, "source", "queued", "2026-11-04T00:00:00+00:00"),
+        ]
+        for job_id, meeting_id, meeting_root, error, error_code, stage, status, created_at in rows:
+            metadata = {
+                "id": job_id,
+                "meetingId": meeting_id,
+                "stage": stage,
+                "status": status,
+                "createdAt": created_at,
+                "updatedAt": updated,
+                "error": error,
+                "errorCode": error_code,
+                "asr": {"response": marker * 1000},
+                "diarization": {"segments": [marker] * 1000},
+            }
+            if meeting_root is not None:
+                metadata["meetingRoot"] = meeting_root
+            self.store.create(metadata)
+            with self.store._connect() as db:
+                db.execute("UPDATE jobs SET created_at=?, updated_at=?, status=?, stage=?, metadata=? WHERE id=?",
+                           (created_at, updated, status, stage, json.dumps(metadata), job_id))
+
+        before = self.store.db_path.read_bytes()
+        original_loads = json.loads
+        parsed_values = []
+
+        def tracked_loads(value, *args, **kwargs):
+            parsed_values.append(value)
+            self.assertNotIn(marker, value)
+            return original_loads(value, *args, **kwargs)
+
+        with patch("services.transcription_history.json.loads", side_effect=tracked_loads):
+            summaries = self.store.list_meeting_jobs("m-1")
+            all_summaries = self.store.list_meeting_jobs()
+
+        self.assertEqual(self.store.db_path.read_bytes(), before)
+        self.assertEqual(len(parsed_values), 5)
+        self.assertEqual([item["id"] for item in summaries], ["b" * 32, "a" * 32])
+        self.assertEqual([item["id"] for item in all_summaries],
+                         ["c" * 32, "b" * 32, "a" * 32])
+        self.assertEqual(summaries[0], {
+            "id": "b" * 32,
+            "status": "failed",
+            "stage": "recognition",
+            "createdAt": created,
+            "updatedAt": updated,
+            "meetingId": "m-1",
+            "meetingRoot": "/meetings/root",
+            "error": "broken",
+            "errorCode": "ASR_FAILED",
+        })
+        self.assertIsNone(summaries[1]["meetingRoot"])
+
     def test_text_revisions_keep_both_artifacts_in_sync_and_conflict(self):
         self.record()
         self.store.update("a" * 32, status="completed")

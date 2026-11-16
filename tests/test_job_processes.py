@@ -92,6 +92,40 @@ class JobProcessControllerTests(unittest.TestCase):
         return (patch.object(job_processes.psutil, "Process", side_effect=lookup),
                 patch.object(job_processes.psutil, "wait_procs", side_effect=fake_wait_procs))
 
+    def test_disabling_priority_without_saved_values_does_not_inspect_process_tree(self):
+        popen, root, _child, _grandchild, _processes, _events = self.make_fake_tree()
+        controller = job_processes.JobProcessController()
+        controller._process = popen
+        controller._root_create_time = root.create_time()
+        with patch.object(job_processes.os, "name", "nt"), \
+                patch.object(job_processes.psutil, "Process", side_effect=AssertionError("unexpected process lookup")):
+            controller.set_low_priority(False)
+
+    def test_low_priority_applies_and_restores_only_saved_verified_processes(self):
+        popen, root, child, _grandchild, processes, _events = self.make_fake_tree()
+        controller = job_processes.JobProcessController()
+        controller._process = popen
+        controller._root_create_time = root.create_time()
+        priorities = {101: 8, 202: 10, 303: 12}
+
+        def get_or_set_nice(process, value=None):
+            if value is None:
+                return priorities[process.pid]
+            priorities[process.pid] = value
+
+        for process in (root, child, processes[303]):
+            process.nice = lambda value=None, process=process: get_or_set_nice(process, value)
+
+        with patch.object(job_processes.os, "name", "nt"), \
+                patch.object(job_processes.psutil, "Process", side_effect=processes.__getitem__):
+            controller.set_low_priority(True)
+            desired = getattr(job_processes.psutil, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
+            self.assertEqual(priorities, {101: desired, 202: desired, 303: 12})
+            controller.set_low_priority(False)
+
+        self.assertEqual(priorities, {101: 8, 202: 10, 303: 12})
+        self.assertEqual(controller._priority_original, {})
+
     def test_cancel_stops_only_owned_process_tree_deepest_first(self):
         popen, root, child, grandchild, processes, events = self.make_fake_tree()
         unrelated = FakePsutilProcess(404, 40.4, events=events, name="unrelated")

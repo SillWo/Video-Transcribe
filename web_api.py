@@ -3,14 +3,17 @@ import importlib.util
 import logging
 import re
 import os
+import queue
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import ipaddress
 import socket
 import unicodedata
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,7 +69,76 @@ def get_history_store() -> TranscriptionHistory:
             if _history_store is None:
                 configured = os.environ.get("VT_SIMPLE_RUNTIME_DIR")
                 _history_store = TranscriptionHistory(Path(configured) if configured else SIMPLE_RUNTIME_DIR)
+                _restore_meeting_job_statuses(_history_store)
     return _history_store
+
+
+def _restore_meeting_job_statuses(store: TranscriptionHistory) -> None:
+    """Reflect recovered terminal queue rows in meeting metadata after app restart."""
+    try:
+        from services.meeting_archive import MeetingArchive
+        from services.meeting_settings import load_settings
+        rows = [row for row in store.list() if row.get("meetingId")]
+        if not rows:
+            return
+        root = Path(load_settings(APP_ROOT)["archive_root"]).expanduser().resolve()
+        meeting_rows: dict[str, tuple[tuple[datetime, str], dict[str, Any]]] = {}
+        for row in rows:
+            meeting_id = row.get("meetingId")
+            row_root = row.get("meetingRoot")
+            if row_root:
+                try:
+                    if Path(row_root).expanduser().resolve() != root:
+                        continue
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    continue
+            created_at = row.get("createdAt")
+            try:
+                timestamp = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                timestamp = timestamp.astimezone(timezone.utc)
+            except (TypeError, ValueError, OverflowError):
+                timestamp = datetime.min.replace(tzinfo=timezone.utc)
+            key = (timestamp, str(row.get("id") or ""))
+            previous = meeting_rows.get(str(meeting_id))
+            if previous is None or key > previous[0]:
+                meeting_rows[str(meeting_id)] = (key, row)
+        if not meeting_rows:
+            return
+        archive = MeetingArchive(root)
+        for meeting_id, (_key, row) in meeting_rows.items():
+            if row.get("status") not in {"completed", "failed", "cancelled", "interrupted"}:
+                continue
+            try:
+                meta = archive.get_meeting(meeting_id)
+            except (KeyError, ValueError):
+                continue
+            desired_status = meta.get("status")
+            if row["status"] in {"failed", "cancelled", "interrupted"}:
+                desired_status = row["status"]
+            elif desired_status in {"failed", "cancelled", "interrupted"}:
+                # A completed retry supersedes an older terminal failure. Reuse
+                # finalized readiness already recorded in the archive manifest;
+                # finalize once below only if meeting metadata needs repair.
+                try:
+                    manifest_path = archive.meeting_dir(meeting_id) / "manifest.json"
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    readiness = manifest.get("status", {}).get("overall")
+                    if readiness in {"ready", "partial"}:
+                        desired_status = readiness
+                except (OSError, ValueError, TypeError, AttributeError):
+                    pass
+            if (meta.get("job_id") == row["id"] and meta.get("job_status") == row["status"]
+                    and meta.get("status") == desired_status):
+                continue
+            changes = {"job_id": row["id"], "job_status": row["status"]}
+            if desired_status != meta.get("status"):
+                changes["status"] = desired_status
+            archive.update_meeting(meeting_id, **changes)
+            archive.finalize(meeting_id)
+    except Exception:
+        logger.exception("Could not restore meeting job statuses from persistent history")
 
 
 def get_simple_queue() -> PersistentSimpleQueue:
@@ -241,6 +313,12 @@ def _hydrate_simple_job(record: dict[str, Any]) -> JobState:
                     _sourceType=record.get("sourceType"), _profile=record.get("profile"),
                     _requestedDevice=record.get("device"),
                     _outputDir=str(history_store.job_dir(job_id) / "output"))
+    if record.get("meetingId"):
+        settings.update(_meetingId=record.get("meetingId"),
+                        _meetingRoot=record.get("meetingRoot"),
+                        _meetingStages=record.get("meetingStages") or ["speech"],
+                        _executionMode=record.get("executionMode", "auto"),
+                        useTimestamps=True)
     settings["diarizationEnabled"] = bool(record.get("diarizationEnabled", False))
     settings["diarizationDevice"] = record.get("diarizationDevice", "auto")
     job = JobState(id=job_id, settings=settings, status=record.get("status", "queued"),
@@ -267,11 +345,125 @@ def _mark_simple_job_started(job_id: str) -> bool:
         return True
 
 
+def _meeting_job(job_id: str) -> tuple[str, str, list[str]] | None:
+    job = get_job(job_id)
+    meeting_id = job.settings.get("_meetingId")
+    root = job.settings.get("_meetingRoot")
+    if not meeting_id or not root:
+        return None
+    return meeting_id, root, list(job.settings.get("_meetingStages") or ["speech"])
+
+
+def _persist_meeting_result(job_id: str, result: dict[str, Any]) -> None:
+    meeting = _meeting_job(job_id)
+    if not meeting:
+        return
+    from services.meeting_pipeline import persist_speech
+    meeting_id, root, _stages = meeting
+    persist_speech(root, meeting_id, result)
+
+
+def _run_meeting_post_stages(job_id: str, source_path: str) -> dict | None:
+    meeting = _meeting_job(job_id)
+    if not meeting:
+        return None
+    meeting_id, root, stages = meeting
+    selected = [stage for stage in stages if stage != "speech"]
+    def report(stage: str, status: str, details: dict) -> None:
+        update_job(job_id, stage=stage)
+        if stage in STAGES:
+            _simple_stage_event(job_id, stage, status)
+        progress = dict(details)
+        if stage == "screen" and progress.get("duration") and progress.get("time") is not None:
+            progress["percent"] = min(99, int(float(progress["time"]) * 100 / max(0.1, float(progress["duration"]))))
+        if status in {"ready", "completed"}:
+            progress["percent"] = 100
+        progress["message"] = progress.get("message") or f"Meeting {stage}: {status}"
+        _simple_progress(job_id, stage, progress)
+    from services.meeting_pipeline import run_stages
+    job = get_job(job_id)
+    device = "directml" if job.settings.get("_requestedDevice") == "gpu" else "cpu"
+    return run_stages(root, meeting_id, source_path, selected, progress=report,
+                      cancel=lambda: _simple_controller(job_id).cancelled,
+                      runner=lambda stage, staging, on_progress: _run_meeting_stage_worker(
+                          job_id, stage, root, meeting_id, source_path, staging, device, on_progress),
+                      device=device)
+
+
+def _run_meeting_stage_worker(job_id: str, stage: str, root: str, meeting_id: str,
+                              source_path: str, staging: Path, device: str, on_progress) -> dict:
+    result_path = staging / "result.json"
+    runtime_python = sys.executable
+    env = os.environ.copy()
+    job = get_job(job_id)
+    requested_device = str(job.settings.get("_requestedDevice", "cpu"))
+    execution_mode = str(job.settings.get("_executionMode", "auto"))
+    profile = str(job.settings.get("_profile", "balanced"))
+    try:
+        from services.meeting_hardware import plan_stage
+    except ImportError:
+        runtime = {"device": device, "python": runtime_python, "env": {}}
+    else:
+        runtime = plan_stage(stage, execution_mode=execution_mode,
+                             requested_device=requested_device, profile=profile)
+        if runtime.get("error"):
+            raise TaskFailure(str(runtime.get("reason") or runtime["error"]),
+                              str(runtime["error"]), stage=stage)
+        runtime_python = str(runtime.get("python") or runtime_python)
+        worker_device = str(runtime.get("device") or "cpu")
+        if worker_device not in {"cpu", "directml"}:
+            raise RuntimeError(f"Unsupported meeting worker device: {worker_device}")
+        device = worker_device
+        env.update(runtime.get("env") or {})
+    command = [runtime_python, "-m", "services.meeting_worker", "--stage", stage,
+               "--root", root, "--meeting-id", meeting_id,
+               "--source", str(source_path or ""), "--result-path", str(result_path),
+               "--device", device]
+    command.extend(["--runtime-root", os.environ.get("VT_SIMPLE_RUNTIME_DIR") or str(APP_ROOT / ".runtime")])
+    worker_error: dict[str, Any] = {}
+
+    def on_line(line: str) -> None:
+        if line.startswith("__VT_MEETING__ "):
+            try:
+                event = json.loads(line[len("__VT_MEETING__ "):])
+            except json.JSONDecodeError:
+                append_log(job_id, line)
+                return
+            if event.get("type") == "progress":
+                payload = event.get("progress") or {}
+                if on_progress:
+                    on_progress(payload)
+            elif event.get("type") == "error":
+                worker_error.update(event)
+            return
+        if line:
+            append_log(job_id, line)
+
+    timeouts = {"screen": 8 * 60 * 60, "audio": 2 * 60 * 60, "index": 2 * 60 * 60}
+    exit_code = _run_owned_process(_simple_controller(job_id), command, on_line=on_line,
+                                   env={**env, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
+                                   timeout_seconds=timeouts.get(stage, 3600))
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(worker_error.get("error") or f"{stage} worker returned no valid result: {exc}") from exc
+    if exit_code != 0 or not result.get("ok"):
+        raise RuntimeError(result.get("error") or worker_error.get("error") or f"{stage} worker failed with exit code {exit_code}")
+    return result
+
+
 def _simple_dispatch_paused() -> bool:
     if get_simple_queue().state()["paused"]:
         return True
     with jobs_lock:
-        return any(job.status == "cancelling" for job in jobs.values() if job.settings.get("_simple"))
+        cancelling = any(job.status == "cancelling" for job in jobs.values() if job.settings.get("_simple"))
+    if cancelling:
+        return True
+    try:
+        from services.meeting_recorder import recording_session_active
+        return recording_session_active()
+    except Exception:
+        return False
 
 
 def _simple_jobs_cancelling() -> bool:
@@ -489,7 +681,33 @@ def _get_simple_dispatcher() -> SimpleQueueDispatcher:
                 )
     return simple_dispatcher
 
-app = FastAPI(title="Video Transcribe Local API", version="1.1.0")
+def _meeting_cleanup_activity() -> dict[str, bool]:
+    try:
+        snapshot = get_simple_queue_snapshot()
+        queue_active = bool(snapshot.get("activeJob") or snapshot.get("waitingCount"))
+    except Exception:
+        queue_active = True
+    try:
+        from services.meeting_recorder import recording_session_active
+        runtime_root = Path(os.environ.get("VT_SIMPLE_RUNTIME_DIR", SIMPLE_RUNTIME_DIR))
+        recording = recording_session_active(runtime_root)
+    except Exception:
+        recording = True
+    return {"queue_active": queue_active, "recording": recording}
+
+
+@asynccontextmanager
+async def _lifespan(_app):
+    from services.meeting_backup_api import start_cleanup_maintenance
+    controller = start_cleanup_maintenance(activity_probe=_meeting_cleanup_activity)
+    try:
+        yield
+    finally:
+        if controller is not None:
+            controller.stop()
+
+
+app = FastAPI(title="Video Transcribe Local API", version="1.1.0", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -497,6 +715,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def block_cross_site_meeting_mutations(request, call_next):
+    """Protect local meeting mutations from cross-site form/fetch POSTs."""
+    if request.url.path.startswith("/api/meetings/") and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        origin = request.headers.get("origin")
+        if origin:
+            try:
+                parsed = urlsplit(origin)
+                if (parsed.scheme != "http" or not parsed.hostname or parsed.username or parsed.password or
+                        parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
+                    raise ValueError("invalid origin")
+                hostname = parsed.hostname.casefold().rstrip(".")
+                if hostname not in {"localhost", "127.0.0.1", "::1"}:
+                    raise ValueError("non-loopback origin")
+                origin_port = parsed.port or 80
+                host = request.url.hostname.casefold().rstrip(".") if request.url.hostname else ""
+                request_port = request.url.port or (443 if request.url.scheme == "https" else 80)
+                same_backend = hostname == host and origin_port == request_port
+                known_dev = origin_port == 5173 and hostname in {"localhost", "127.0.0.1"}
+                if not (same_backend or known_dev):
+                    raise ValueError("origin mismatch")
+            except (ValueError, UnicodeError):
+                from fastapi.responses import JSONResponse
+                return JSONResponse({"detail": "Cross-site meeting mutation rejected"}, status_code=403)
+    return await call_next(request)
 
 model_management_router = APIRouter(prefix="/api/models", tags=["model-management"])
 
@@ -671,7 +916,9 @@ def _simple_progress(job_id: str, stage: str, payload: dict[str, Any]) -> None:
         except (TypeError, ValueError):
             return None
     seconds, duration = finite(seconds), finite(duration)
-    phase = "alignment" if stage == "recognition" and payload.get("phase") == "alignment" else None
+    phase = (payload.get("phase")
+             if stage == "recognition" and payload.get("phase") in {"alignment", "language_id"}
+             else None)
     phase_started_at = None
     if phase:
         phase_started_at = (previous.get("phaseStartedAt")
@@ -697,6 +944,8 @@ def _simple_progress(job_id: str, stage: str, payload: dict[str, Any]) -> None:
         requested_message = payload.get("message")
         if stage == "recognition" and phase == "alignment":
             message = "Выравнивание слов"
+        elif stage == "recognition" and phase == "language_id":
+            message = "Определение языка речи"
         elif stage == "recognition" and requested_message in {
             "Загружаем модель в память", "Загружаем модель в память."
         }:
@@ -786,7 +1035,8 @@ def _finalize_simple_job(job_id: str, status: str, *, error: str | None = None,
             return False
         if status == "cancelled" and job.status != "cancelling" and not (controller and controller.cancelled):
             return False
-        final_stage = "result" if status == "completed" else job.stage
+        terminal_stage = job.stage
+        final_stage = "result" if status == "completed" else terminal_stage
         final_error = None if status in {"completed", "cancelled"} else concise_simple_error(error)
         record = history_store.get(job_id)
         if record is None:
@@ -877,7 +1127,27 @@ def _finalize_simple_job(job_id: str, status: str, *, error: str | None = None,
         job.stage = final_stage
         job.error = final_error
         job.updated_at = utc_now()
-        return True
+        meeting_id = job.settings.get("_meetingId")
+        meeting_root = job.settings.get("_meetingRoot")
+    if meeting_id and meeting_root:
+        try:
+            from services.meeting_archive import MeetingArchive
+            archive = MeetingArchive(meeting_root)
+            archive.get_meeting(meeting_id)
+            changes = {"job_id": job_id, "job_status": status}
+            if status in {"failed", "interrupted", "cancelled"}:
+                changes["status"] = status
+                selected_stages = job.settings.get("_meetingStages")
+                speech_selected = not selected_stages or "speech" in selected_stages
+                if speech_selected and terminal_stage in {
+                    "preparation", "source", "recognition", "diarization", "postprocess", "result"
+                }:
+                    changes["speech_status"] = status
+            archive.update_meeting(meeting_id, **changes)
+            archive.finalize(meeting_id)
+        except Exception:
+            logger.exception("Could not synchronize meeting archive job status job_id=%s", job_id)
+    return True
 
 
 def _leave_simple_job_cancelling(job_id: str) -> None:
@@ -955,9 +1225,16 @@ def _set_diarization_state(job_id: str, status: str, **values) -> None:
     history_store.update(job_id, diarization=current)
 
 
-def _pause_simple_queue_for_error(code: str) -> None:
-    if code in SYSTEMIC_ERROR_CODES:
-        get_simple_queue().set_state(True, {"code": code, "message": _task_failure_message(code)})
+def _pause_simple_queue_for_error(code: str, message: str | None = None, *, force: bool = False) -> None:
+    if force or code in SYSTEMIC_ERROR_CODES:
+        if force and message:
+            # Keep the meeting-stage failure visible so a user can choose how
+            # to continue. Never hide an explicit GPU/runtime error behind the
+            # generic legacy queue message.
+            queue_message = " ".join(str(message).split())[:400]
+        else:
+            queue_message = _task_failure_message(code)
+        get_simple_queue().set_state(True, {"code": code, "message": queue_message})
         _get_simple_dispatcher().wake()
 
 
@@ -1019,7 +1296,7 @@ class OwnedProcessStopError(RuntimeError):
 
 
 def _run_owned_process(controller: JobProcessController, command: list[str], *, on_line,
-                       env: dict[str, str] | None = None) -> int:
+                       env: dict[str, str] | None = None, timeout_seconds: float | None = None) -> int:
     controller.check_cancelled()
     try:
         process = subprocess.Popen(
@@ -1033,13 +1310,62 @@ def _run_owned_process(controller: JobProcessController, command: list[str], *, 
         raise
     registered = False
     stopped = False
+    priority_monitor_stop = threading.Event()
+    priority_monitor = None
     try:
         controller.register(process)
         registered = True
+        def prioritize_for_recording() -> None:
+            while not priority_monitor_stop.wait(0.5):
+                if process.poll() is not None:
+                    return
+                try:
+                    from services.meeting_recorder import recording_session_active
+                    controller.set_low_priority(recording_session_active())
+                except Exception:
+                    continue
+        priority_monitor = threading.Thread(target=prioritize_for_recording,
+            name="recording-resource-priority", daemon=True)
+        priority_monitor.start()
         assert process.stdout is not None
-        for raw_line in process.stdout:
-            controller.check_cancelled()
-            on_line(raw_line.rstrip())
+        if timeout_seconds is None:
+            for raw_line in process.stdout:
+                controller.check_cancelled()
+                on_line(raw_line.rstrip())
+        else:
+            lines: queue.Queue[str | None] = queue.Queue()
+            def read_stdout() -> None:
+                try:
+                    for raw_line in process.stdout:
+                        lines.put(raw_line.rstrip())
+                finally:
+                    lines.put(None)
+            reader = threading.Thread(target=read_stdout, name="owned-process-output", daemon=True)
+            reader.start()
+            deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+            output_ended = False
+            last_check = time.monotonic()
+            while not output_ended:
+                controller.check_cancelled()
+                now = time.monotonic()
+                try:
+                    from services.meeting_recorder import recording_session_active
+                    if recording_session_active():
+                        deadline += max(0.0, now - last_check)
+                except Exception:
+                    pass
+                last_check = now
+                if now >= deadline:
+                    raise TimeoutError(f"Owned process timed out after {timeout_seconds:g} seconds.")
+                try:
+                    line = lines.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    output_ended = True
+                else:
+                    on_line(line)
+            reader.join(timeout=1)
         result = process.wait()
         stopped = True
         return result
@@ -1052,6 +1378,13 @@ def _run_owned_process(controller: JobProcessController, command: list[str], *, 
             raise OwnedProcessStopError("The owned process tree could not be stopped.") from stop_error
         raise
     finally:
+        priority_monitor_stop.set()
+        if priority_monitor is not None:
+            priority_monitor.join(timeout=1)
+        try:
+            controller.set_low_priority(False)
+        except Exception:
+            pass
         if process.stdout is not None and hasattr(process.stdout, "close"):
             process.stdout.close()
         if registered and (stopped or process.poll() is not None):
@@ -1060,6 +1393,8 @@ def _run_owned_process(controller: JobProcessController, command: list[str], *, 
 
 def _run_simple_job(job_id: str, source_path: str) -> None:
     acquired = False
+    activity_held = False
+    meeting_speech_started = None
     with jobs_lock:
         job = jobs.get(job_id)
         if job is None or job.status in {"completed", "failed", "cancelled", "interrupted"}:
@@ -1080,6 +1415,18 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
         if not _mark_simple_job_started(job_id):
             controller.check_cancelled()
             return
+        from services.meeting_activity import hold_activity
+        hold_activity(f"simple-job:{job_id}")
+        activity_held = True
+        meeting = _meeting_job(job_id)
+        if meeting and "speech" not in meeting[2]:
+            controller.check_cancelled()
+            _run_meeting_post_stages(job_id, source_path)
+            controller.check_cancelled()
+            _finalize_simple_job(job_id, "completed")
+            return
+        if meeting:
+            meeting_speech_started = time.monotonic()
         source_type = job.settings.get("_sourceType")
         if source_type == "file" and not Path(source_path).is_file():
             raise TaskFailure(_task_failure_message("source_unavailable"), "source_unavailable", stage="source")
@@ -1237,6 +1584,16 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
         if current.result_text is None:
             raise RuntimeError("Расшифровка завершилась без результата.")
         controller.check_cancelled()
+        if meeting:
+            from services.meeting_archive import MeetingArchive
+            meeting_id, root, _stages = meeting
+            archive = MeetingArchive(root)
+            meta = archive.get_meeting(meeting_id)
+            stage_state = dict(meta.get("stage_state", {}))
+            stage_state["speech"] = {"status": "ready", "elapsed_seconds": round(time.monotonic() - meeting_speech_started, 3)}
+            archive.update_meeting(meeting_id, stage_state=stage_state, status="partial")
+            _run_meeting_post_stages(job_id, source_path)
+            controller.check_cancelled()
         if not _finalize_simple_job(job_id, "completed", transcript=current.result_text):
             controller.check_cancelled()
             raise JobCancelled("This job was cancelled before results were published.")
@@ -1257,12 +1614,21 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
     except OwnedProcessStopError:
         _leave_simple_job_cancelling(job_id)
     except Exception as exc:
+        nested_task_failure = None
+        cause = exc.__cause__
+        while cause is not None:
+            if isinstance(cause, TaskFailure):
+                nested_task_failure = cause
+                break
+            cause = cause.__cause__
         with jobs_lock:
             cancellation_pending = controller.cancelled or (jobs.get(job_id) is not None
                                                               and jobs[job_id].status == "cancelling")
             current_job = jobs.get(job_id)
             failure_stage = current_job.stage if current_job is not None else "unknown"
-        if not cancellation_pending and not isinstance(exc, TaskFailure):
+            meeting_failure = bool(current_job is not None and current_job.settings.get("_meetingId")
+                                   and current_job.settings.get("_meetingRoot"))
+        if not cancellation_pending and not isinstance(exc, TaskFailure) and nested_task_failure is None:
             logger.exception("Unexpected simple job failure job_id=%s stage=%s", job_id, failure_stage)
         if cancellation_pending:
             try:
@@ -1279,11 +1645,13 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
                 else:
                     _finalize_simple_job(job_id, "cancelled")
         else:
-            if isinstance(exc, TaskFailure):
-                code = exc.code
-                stage = exc.stage or get_job(job_id).stage
-                message = (_diarization_failure_message(code) if stage == "diarization"
-                           else _task_failure_message(code, str(exc)))
+            task_failure = exc if isinstance(exc, TaskFailure) else nested_task_failure
+            if task_failure is not None:
+                code = task_failure.code
+                stage = task_failure.stage or get_job(job_id).stage
+                message = (str(task_failure) if meeting_failure else
+                           (_diarization_failure_message(code) if stage == "diarization"
+                            else _task_failure_message(code, str(task_failure))))
                 if stage == "diarization":
                     _set_diarization_state(job_id, "failed")
                 update_job(job_id, stage=stage, error=message, errorCode=code)
@@ -1296,8 +1664,11 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
                 code = "internal_error"
                 message = str(exc)
             _finalize_simple_job(job_id, "failed", error=message, error_code=code)
-            _pause_simple_queue_for_error(code)
+            _pause_simple_queue_for_error(code, message if meeting_failure else None, force=meeting_failure)
     finally:
+        if activity_held:
+            from services.meeting_activity import release_activity
+            release_activity(f"simple-job:{job_id}")
         if acquired:
             transcription_semaphore.release()
         with jobs_lock:
@@ -1588,6 +1959,7 @@ def read_output_text(output_path: str | None) -> str | None:
 
 
 def apply_result(job_id: str, result: dict[str, Any]) -> None:
+    _persist_meeting_result(job_id, result)
     rendered_result = read_output_text(result.get("output_path")) or result.get("rendered_result")
     with jobs_lock:
         job = jobs.get(job_id)
@@ -1654,6 +2026,7 @@ def apply_result(job_id: str, result: dict[str, Any]) -> None:
 def apply_complete(job_id: str, results: list[dict[str, Any]]) -> None:
     if not results:
         return
+    _persist_meeting_result(job_id, results[-1])
 
     has_text_result = any(isinstance(result.get("text"), str) for result in results)
     combined_text = "\n\n".join(result["text"].strip() for result in results
@@ -2124,19 +2497,32 @@ def _simple_metadata(job_id: str, source: str, source_type: str, profile: str,
 
 def _enqueue_simple_jobs(items: list[tuple[str, str]], profile: str, device: str,
                          cpu_threads: int, restore_punctuation: bool,
-                         diarization_enabled: bool = False, diarization_device: str = "auto") -> list[dict]:
+                         diarization_enabled: bool = False, diarization_device: str = "auto",
+                         meeting_ids: list[str] | None = None, stages: list[str] | None = None,
+                         meeting_root: str | None = None, execution_mode: str = "auto") -> list[dict]:
     _validate_simple_common(profile, device, cpu_threads)
     diarization_device = _validate_diarization_device(diarization_device)
     with jobs_lock:
         if any(job.status == "cancelling" for job in jobs.values() if job.settings.get("_simple")):
             raise HTTPException(status_code=409, detail="Дождитесь остановки текущей обработки.")
         queue = get_simple_queue()
+        if meeting_ids is not None and len(meeting_ids) != len(items):
+            raise HTTPException(status_code=400, detail="meeting_ids must match the number of job sources")
         records_metadata, prepared = [], []
-        for source, source_type in items:
+        for index, (source, source_type) in enumerate(items):
             job_id = uuid.uuid4().hex
             metadata, settings = _simple_metadata(job_id, source, source_type, profile, device,
                                                   cpu_threads, restore_punctuation,
                                                   diarization_enabled, diarization_device)
+            if meeting_ids is not None:
+                meeting_id = meeting_ids[index]
+                selected_stages = list(stages or ["speech"])
+                settings.update(_meetingId=meeting_id, _meetingRoot=meeting_root,
+                                _meetingStages=selected_stages, _executionMode=execution_mode,
+                                useTimestamps=True)
+                metadata.update(meetingId=meeting_id, meetingRoot=meeting_root,
+                                meetingStages=selected_stages, executionMode=execution_mode)
+                metadata["settings"].update(useTimestamps=True)
             records_metadata.append(metadata)
             prepared.append((job_id, source, settings))
         records = queue.enqueue_many(records_metadata)
@@ -2641,6 +3027,16 @@ def download_result(job_id: str):
 
 
 app.include_router(model_management_router)
+from services.meeting_recording_api import router as meeting_recording_api_router
+app.include_router(meeting_recording_api_router)
+from services.meeting_hardware_api import router as meeting_hardware_api_router
+app.include_router(meeting_hardware_api_router)
+from services.meeting_assets_api import router as meeting_assets_api_router
+app.include_router(meeting_assets_api_router)
+from services.meeting_backup_api import router as meeting_backup_api_router
+app.include_router(meeting_backup_api_router)
+from services.meeting_api import router as meeting_api_router
+app.include_router(meeting_api_router)
 
 
 UI_DIST = APP_ROOT / "ui" / "dist"
