@@ -102,12 +102,27 @@ class DiarizationApiTests(unittest.TestCase):
         response = self.client.post("/api/simple/jobs", json=self.payload(
             diarizationEnabled=True, diarizationDevice="vanished-gpu"))
         job_id = response.json()["id"]
+        audio = Path(self.temp.name) / "downloaded-audio.wav"
+        audio.write_bytes(b"stubbed local audio")
         with patch("services.diarization_runtime.resolve_diarization_device",
                    side_effect=TaskFailure("missing", "device_unavailable", stage="diarization")), \
+             patch.object(web_api, "_download_simple_media", return_value=str(audio)) as download, \
+             patch("services.manual_video.probe_local_media", return_value={
+                 "isVideo": False,
+                 "hasAudio": True,
+                 "decodedAudioStreams": [{"index": 1}],
+                 "decodedVideoStreams": [],
+             }) as classify, \
              patch.object(web_api, "_run_owned_process") as owned_process:
             web_api._run_simple_job(job_id, "https://example.org/recording")
+        download.assert_called_once()
+        classify.assert_called_once()
+        self.assertEqual(classify.call_args.args[0], str(audio))
+        self.assertIsNotNone(classify.call_args.kwargs.get("controller"))
         owned_process.assert_not_called()
         record = web_api.history_store.get(job_id)
+        self.assertEqual(record["mediaClassification"], "audio")
+        self.assertEqual(record["archiveKind"], "audio")
         self.assertEqual(record["status"], "failed")
         self.assertEqual(record["stage"], "diarization")
         self.assertEqual(record["diarization"]["status"], "failed")

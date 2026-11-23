@@ -116,7 +116,9 @@ class BatchApiTests(unittest.TestCase):
         source.touch()
         gpu = self.client.post("/api/simple/jobs", json={**self.payload(device="gpu"),
                                                           "sourceType": "file", "path": str(source)}).json()
-        with patch.object(web_api.simple_profiles, "resolve", side_effect=ValueError("runtime unavailable")):
+        with patch("services.manual_video.probe_local_media", return_value={
+                "isVideo": False, "hasAudio": True, "video": [], "audio": [{}], "streams": [{}]}), \
+                patch.object(web_api.simple_profiles, "resolve", side_effect=ValueError("runtime unavailable")):
             web_api.run_job(gpu["id"], str(source))
         failed = web_api.history_store.get(gpu["id"])
         self.assertEqual(failed["status"], "failed")

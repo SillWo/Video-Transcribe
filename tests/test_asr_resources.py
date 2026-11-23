@@ -13,7 +13,8 @@ from services.task_errors import TaskFailure
 
 class AsrResourceTests(unittest.TestCase):
     def test_new_model_contract_and_canonical_paths(self):
-        self.assertEqual(resources.NEW_MODELS, {"parakeet-tdt-0.6b-v3", "qwen3-asr-1.7b"})
+        self.assertEqual(resources.NEW_MODELS, {"qwen3-asr-1.7b"})
+        self.assertFalse(resources.is_new_asr("parakeet-tdt-0.6b-v3"))
         self.assertTrue(resources.is_new_asr("qwen3-asr-1.7b"))
         self.assertFalse(resources.is_new_asr("small"))
         self.assertEqual(resources.model_paths("qwen3-asr-1.7b")["model"],
@@ -235,16 +236,21 @@ class AsrResourceTests(unittest.TestCase):
         self.assertEqual(called[0]["device"], "directml")
 
     def test_new_profile_routing_keeps_legacy_path_untouched(self):
-        with patch.object(resources, "ensure_asr_resources") as ensure:
-            from services import resource_preparation
-            resource_preparation.ensure_selected_resources({"model": "parakeet-tdt-0.6b-v3", "device": "vulkan",
-                                                             "restorePunctuation": False})
-        ensure.assert_called_once()
-        self.assertEqual(ensure.call_args.args[:2], ("parakeet-tdt-0.6b-v3", "directml"))
+        from services import resource_preparation
+        with patch.object(resources, "ensure_asr_resources") as ensure, \
+                patch.object(resource_preparation, "download_registered_model") as download:
+            with self.assertRaises(resource_preparation.ResourcePreparationError) as raised:
+                resource_preparation.ensure_selected_resources({
+                    "model": "parakeet-tdt-0.6b-v3", "device": "vulkan",
+                    "restorePunctuation": False,
+                })
+        self.assertEqual(raised.exception.code, "retired_model")
+        ensure.assert_not_called()
+        download.assert_not_called()
         with patch.object(resources, "ensure_asr_resources") as ensure:
             with patch("services.resource_preparation.get_model_status", return_value={"status": "downloaded"}):
-                from services.resource_preparation import ensure_selected_resources
-                ensure_selected_resources({"model": "small", "device": "cpu", "restorePunctuation": False})
+                resource_preparation.ensure_selected_resources(
+                    {"model": "small", "device": "cpu", "restorePunctuation": False})
         ensure.assert_not_called()
 
     def test_legacy_gpu_preparation_downloads_only_validation_fixture(self):
@@ -270,10 +276,10 @@ class AsrResourceTests(unittest.TestCase):
             output = []
             result = prepare_models.prepare(check_only=True, skip_postprocess=True, setup_only=True, progress=output.append)
         self.assertEqual(result, 1)
-        self.assertEqual(status.call_count, 2)
+        self.assertEqual(status.call_count, 1)
         ensure.assert_not_called()
         self.assertTrue(any("faster-whisper small" in line for line in output))
-        self.assertFalse(any("large-v3" in line for line in output))
+        self.assertFalse(any("parakeet" in line.casefold() for line in output))
 
 
 if __name__ == "__main__":

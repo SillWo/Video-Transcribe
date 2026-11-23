@@ -31,15 +31,15 @@ def shutil_which(name: str) -> str | None:
 def test_fresh_fastapi_host_runs_screen_worker_and_cancels_then_retries(tmp_path):
     video = tmp_path / "synthetic-screen.mp4"
     assert _synthetic_video(video)
-    stubs = tmp_path / "worker-stubs"
+    stubs = tmp_path / "worker-guards"
     stubs.mkdir()
-    (stubs / "rapidocr.py").write_text(textwrap.dedent("""
-        class LangRec: CYRILLIC = 'cyrillic'
-        class ModelType: MOBILE = 'mobile'
-        class OCRVersion: PPOCRV5 = 'v5'
-        class RapidOCR:
-            def __init__(self, *args, **kwargs): pass
-            def __call__(self, image): return []
+    (stubs / "sitecustomize.py").write_text(textwrap.dedent("""
+        import sys
+        class BlockRapidOCR:
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == 'rapidocr' or fullname.startswith('rapidocr.'):
+                    raise RuntimeError('production frame extraction must not import RapidOCR')
+        sys.meta_path.insert(0, BlockRapidOCR())
     """), encoding="utf-8")
     script = tmp_path / "fresh_host_smoke.py"
     script.write_text(textwrap.dedent("""
@@ -48,13 +48,12 @@ def test_fresh_fastapi_host_runs_screen_worker_and_cancels_then_retries(tmp_path
         import web_api
         assert 'cv2' not in sys.modules, 'FastAPI host imported OpenCV during startup'
         assert 'numpy' not in sys.modules, 'FastAPI host imported NumPy during startup'
-        from fastapi.testclient import TestClient
         from services.meeting_archive import MeetingArchive
         video = Path(sys.argv[1])
+        archive = MeetingArchive(os.environ['VT_MEETING_ROOT'])
+        mid = archive.import_file(video, title='Legacy screen-only rerun')['meeting_id']
+        from fastapi.testclient import TestClient
         client = TestClient(web_api.app)
-        imported = client.post('/api/meetings/import', json={'paths':[str(video)]})
-        assert imported.status_code == 200, imported.text
-        mid = imported.json()['items'][0]['meeting_id']
         first = client.post('/api/meetings/process', json={
             'meeting_ids':[mid], 'stages':['screen'], 'profile':'balanced',
             'device':'cpu', 'cpu_threads':2, 'diarization':False})

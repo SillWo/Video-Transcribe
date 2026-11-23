@@ -139,6 +139,7 @@ class NewAsrModel:
 
     def _run_worker(self, mode: str, audio: Path, workspace: Path, *, language: str | None = None,
                     segments_path: Path | None = None, device: str | None = None,
+                    dictionary_file: Path | None = None,
                     device_index: int | None = None, default_stage: str = "recognition") -> dict:
         if mode == "align":
             aligner_runtime = "cuda" if device == "cuda" else "cpu"
@@ -165,6 +166,8 @@ class NewAsrModel:
             command += ["--language", language]
         if segments_path is not None:
             command += ["--segments-json", str(segments_path)]
+        if dictionary_file is not None:
+            command += ["--dictionary-file", str(dictionary_file)]
         tail: deque[str] = deque(maxlen=40)
         process = None
         started = time.monotonic()
@@ -395,13 +398,20 @@ class NewAsrModel:
             result.append(WorkerSegment(start, end, text, words))
         return result
 
-    def transcribe(self, path, beam_size=5, language=None, word_timestamps=False):
+    def transcribe(self, path, beam_size=5, language=None, word_timestamps=False,
+                   vocabulary=(), dictionary_snapshot=None):
         source = Path(path).expanduser().resolve()
         MODEL_TEMP_DIR.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="vt-asr-", dir=MODEL_TEMP_DIR) as directory:
             workspace = Path(directory)
             audio = _prepare_audio(source, workspace)
-            asr = self._run_worker("transcribe", audio, workspace, language=language)
+            snapshot = dictionary_snapshot if isinstance(dictionary_snapshot, dict) else {"version": 0}
+            terms = [str(term).strip() for term in vocabulary if isinstance(term, str) and term.strip()]
+            dictionary_path = workspace / "dictionary-snapshot.json"
+            dictionary_path.write_text(json.dumps({"version": snapshot.get("version", 0), "terms": terms},
+                                                   ensure_ascii=False), encoding="utf-8")
+            asr = self._run_worker("transcribe", audio, workspace, language=language,
+                                   dictionary_file=dictionary_path)
             rows = asr.get("segments")
             if not isinstance(rows, list):
                 raise TaskFailure("ASR worker result contains no segments.", "transcription_failed", stage="recognition")
@@ -413,6 +423,10 @@ class NewAsrModel:
                                     "timing_seconds": asr.get("timing_seconds") or {},
                                     "worker_elapsed_seconds": asr.get("_worker_elapsed_seconds"),
                                     "diagnostics": asr.get("diagnostics") or {}}}
+            diagnostics["dictionary"] = (asr.get("diagnostics") or {}).get("dictionary") or {
+                "version": snapshot.get("version", 0), "usedTerms": [], "omittedTerms": terms,
+                "usedCount": 0, "omittedCount": len(terms), "truncated": bool(terms),
+                "integration": "transcribe.cpp vocabulary"}
             if self.model_id == "qwen3-asr-1.7b" and not language:
                 observations = asr.get("language_observations") or []
                 observed_language, observed_probability = self._language_from_observations(observations, rows)

@@ -33,7 +33,8 @@ from services.meeting_activity import hold_activity, release_activity
 OBS_VERSION = "33.0.1"
 OBS_ZIP_SIZE = 223786669
 OBS_ZIP_SHA256 = "0d9436451c2d772b33428e3fdae9776f071895c335de17283176306fb72651d3"
-OBS_ZIP_URL = "https://github.com/obsproject/obs-studio/releases/download/33.0.1/OBS-Studio-33.0.1-Windows.zip"
+OBS_ZIP_FILENAME = f"OBS-Studio-{OBS_VERSION}-Windows-x64.zip"
+OBS_ZIP_URL = f"https://github.com/obsproject/obs-studio/releases/download/{OBS_VERSION}/{OBS_ZIP_FILENAME}"
 _BROWSER_EXES = {"msedge.exe", "chrome.exe", "firefox.exe"}
 OBS_RECORD_PROFILE = "Video Transcribe Meeting"
 _VALID_SOURCE_KINDS = {"monitor_capture", "wasapi_process_output_capture", "wasapi_input_capture"}
@@ -158,7 +159,7 @@ def _file_sha256(path: Path) -> str:
 
 
 class MeetingRecorder:
-    """Own one isolated OBS process and import completed MKV recordings."""
+    """Own one isolated OBS process and queue completed capture conversions."""
 
     def __init__(self, project_root: str | Path | None = None, archive: MeetingArchive | None = None,
                  *, client_factory=None, process_factory=None, runtime_root: str | Path | None = None,
@@ -173,7 +174,7 @@ class MeetingRecorder:
             if not self.obs_root.is_relative_to(private_boundary):
                 raise ValueError("VT_MEETING_OBS_ROOT must point inside the project's private .runtime directory")
         self.exe = self.obs_root / "bin" / "64bit" / "obs64.exe"
-        self.download_path = self.runtime_root / "downloads" / f"OBS-Studio-{OBS_VERSION}-Windows.zip"
+        self.download_path = self.runtime_root / "downloads" / OBS_ZIP_FILENAME
         if archive is not None:
             self.archive = archive
         else:
@@ -192,6 +193,9 @@ class MeetingRecorder:
         self._error: str | None = None
         self._state = "idle"
         self._prepared = False
+        self._preparing = threading.Event()
+        self._prepare_request_lock = threading.Lock()
+        self._prepare_requests = 0
 
     def _read_session(self) -> dict[str, Any]:
         try:
@@ -788,13 +792,39 @@ class MeetingRecorder:
         except Exception as exc:
             self._error = f"Индикаторы уровня недоступны: {exc}"
 
-    def _status_from_obs(self) -> dict[str, Any]:
-        status = {"available": self.exe.is_file(), "connected": False, "state": self._state,
+    def _status_template(self, *, state: str | None = None) -> dict[str, Any]:
+        return {"available": self.exe.is_file(), "connected": False, "state": state or self._state,
                   "duration_seconds": None, "monitors": [], "browsers": [], "microphones": [],
                   "title": self._session.get("title"),
                   "selection": {key: self._selection.get(key) for key in ("monitor_id", "browser_id", "microphone_id")},
                   "preview_url": "/api/meetings/recorder/preview",
                   "levels": {"browser": None, "microphone": None, "stale": True}, "error": self._error}
+
+    def _status_during_prepare(self) -> dict[str, Any]:
+        status = self._status_template()
+        if self._session.get("recording_path") or self._state == "recording":
+            status["state"] = "recording"
+            status["error"] = "Найдена незавершённая запись; остановите её, чтобы проверить файл и сохранить встречу."
+        elif self._state == "stopping":
+            status["state"] = "stopping"
+        else:
+            status["state"] = "preparing"
+            status["error"] = None
+        return status
+
+    def _begin_prepare_request(self) -> None:
+        with self._prepare_request_lock:
+            self._prepare_requests += 1
+            self._preparing.set()
+
+    def _end_prepare_request(self) -> None:
+        with self._prepare_request_lock:
+            self._prepare_requests -= 1
+            if self._prepare_requests == 0:
+                self._preparing.clear()
+
+    def _status_from_obs(self) -> dict[str, Any]:
+        status = self._status_template()
         try:
             client = self._connect(attempts=1)
             status["connected"] = True
@@ -847,33 +877,50 @@ class MeetingRecorder:
 
     def status(self) -> dict[str, Any]:
         """Return UI-safe status. May reconnect only to a previously owned OBS PID."""
-        with _LOCK:
-            return self._status_from_obs()
+        while True:
+            if self._preparing.is_set():
+                return self._status_during_prepare()
+            if _LOCK.acquire(timeout=0.05):
+                try:
+                    if self._preparing.is_set():
+                        return self._status_during_prepare()
+                    return self._status_from_obs()
+                finally:
+                    _LOCK.release()
 
     def prepare(self) -> dict[str, Any]:
         """Install pinned official OBS if needed, launch our private copy, and connect."""
-        with _LOCK:
-            self._state = "preparing"
-            try:
-                if not self.exe.is_file():
-                    self._download_and_install()
-                if not self._is_owned_process():
-                    self._reset_clients()
-                self._launch()
-                self._state = "starting"
-                client = self._connect()
-                scenes_response = self._wait_for_frontend_ready(client)
-                self._save_session(monitors=self._enumerate_monitors(client, scenes_response),
-                                   browsers=self._enumerate_windows(client),
-                                   microphones=self._enumerate_microphones(client))
-                self._prepared = True
+        if self._state == "recording" or self._session.get("recording_path"):
+            raise RecorderError("Нельзя подготовить OBS, пока есть незавершённая запись. Сначала остановите или сохраните её.")
+        self._begin_prepare_request()
+        try:
+            with _LOCK:
+                if self._state == "recording" or self._session.get("recording_path"):
+                    raise RecorderError("Нельзя подготовить OBS, пока есть незавершённая запись. Сначала остановите или сохраните её.")
+                self._state = "preparing"
                 self._error = None
-                self._state = "idle"
-                return self._status_from_obs()
-            except Exception as exc:
-                self._error = str(exc)
-                self._state = "unavailable" if not self.exe.is_file() else "idle"
-                raise RecorderError(self._error) from exc
+                try:
+                    if not self.exe.is_file():
+                        self._download_and_install()
+                    if not self._is_owned_process():
+                        self._reset_clients()
+                    self._launch()
+                    self._state = "starting"
+                    client = self._connect()
+                    scenes_response = self._wait_for_frontend_ready(client)
+                    self._save_session(monitors=self._enumerate_monitors(client, scenes_response),
+                                       browsers=self._enumerate_windows(client),
+                                       microphones=self._enumerate_microphones(client))
+                    self._prepared = True
+                    self._error = None
+                    self._state = "idle"
+                    return self._status_from_obs()
+                except Exception as exc:
+                    self._error = str(exc)
+                    self._state = "unavailable" if not self.exe.is_file() else "idle"
+                    raise RecorderError(self._error) from exc
+        finally:
+            self._end_prepare_request()
 
     def configure(self, selection: dict[str, Any]) -> dict[str, Any]:
         """Configure the selected monitor/browser/mic, refusing changes during recording."""
@@ -960,7 +1007,7 @@ class MeetingRecorder:
             raise RecorderError("OBS не подтвердил начало записи.")
 
     def stop(self) -> dict[str, Any]:
-        """Stop, probe, and import a recording. Does not schedule transcription."""
+        """Stop the capture and queue its validated media conversion."""
         with _LOCK:
             self._state = "stopping"
             path = Path(str(self._session.get("recording_path", ""))).resolve()
@@ -992,37 +1039,24 @@ class MeetingRecorder:
                 else:
                     release_activity("meeting-recorder")
                 # If our process has ended, this is an interrupted but recoverable recording.
-                # Probe it before importing and leave the MKV untouched on any validation error.
+                # Keep the staged MKV until its conversion is durably published.
                 if not path.is_file() or not path.is_relative_to(capture_root):
                     raise RecorderError("Не найден собственный MKV файл; он не удалён и сохранён для восстановления.")
-                if self._ffprobe:
-                    probe = self._ffprobe(path)
-                else:
-                    from services.meeting_images import probe_media
-                    probe = probe_media(path)
-                audio_streams = probe.get("audio", []) if isinstance(probe, dict) else []
-                if len(audio_streams) < 3:
-                    raise RecorderError(f"В записи найдено {len(audio_streams)} аудиодорожки вместо трёх; MKV сохранён для восстановления.")
-                if not probe.get("video"):
-                    raise RecorderError("В MKV не найдена видеодорожка; файл сохранён для восстановления.")
-                meeting = self.archive.import_file(path, title=self._session.get("title") or path.stem,
-                                                   started_at=self._session.get("started_at"))
-                meeting_id = meeting["meeting_id"]
-                meeting = self.archive.update_meeting(meeting_id,
-                    audio_track_roles={"1": "mix", "2": "browser", "3": "microphone"},
-                    recording_status="ready", recording_source="obs-private", recording_sha256=meeting.get("sha256"))
-                self.archive.finalize(meeting_id)
-                # The archive copy is verified against the MKV digest before removing only our staged source.
-                archived = self.archive.original_path(meeting_id)
-                if archived and archived.is_file() and _file_sha256(archived) == _file_sha256(path):
-                    path.unlink(missing_ok=True)
+                title = self._session.get("title") or path.stem
+                started_at = self._session.get("started_at")
+                track_roles = {"1": "mix", "2": "browser", "3": "microphone"}
+                import web_api
+                job = web_api.enqueue_recording_conversion(str(path), title=title,
+                                                           started_at=started_at,
+                                                           track_roles=track_roles,
+                                                           cleanup_root=str(capture_root))
                 self._session.pop("recording_path", None)
                 self._session.pop("started_at", None)
                 self._session.pop("title", None)
-                self._save_session(recording_path=None, started_at=None, title=None, meeting_id=meeting_id)
+                self._save_session(recording_path=None, started_at=None, title=None)
                 self._state = "idle"
                 self._error = None
-                return {"meeting": self.archive.get_meeting(meeting_id), "recorder": self._status_from_obs()}
+                return {"job": job, "recorder": self._status_from_obs()}
             except Exception as exc:
                 self._state = "recording" if path.exists() else "idle"
                 self._error = str(exc)

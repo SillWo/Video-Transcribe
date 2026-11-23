@@ -111,42 +111,49 @@ function Get-PythonLauncher {
     return $null
 }
 
+function Test-PythonCommand([string]$Executable, [string[]]$Arguments) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $Executable @Arguments *> $null
+        $exitCode = $LASTEXITCODE
+        return ($exitCode -eq 0)
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
 function Select-Python {
     $venvPython = Join-Path $Root '.venv\Scripts\python.exe'
     if (Test-Path $venvPython) {
-        & $venvPython -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)' 2>$null
-        if ($LASTEXITCODE -ne 0) { Fail 'Локальное .venv создано на Python старше или младше поддерживаемого диапазона. Переместите .venv и повторите запуск с Python 3.12+.' }
+        if (-not (Test-PythonCommand -Executable $venvPython -Arguments @('-c', 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)'))) { Fail 'Локальное .venv создано на Python старше или младше поддерживаемого диапазона. Переместите .venv и повторите запуск с Python 3.12+.' }
         return $venvPython
     }
 
     $py = Get-PythonLauncher
     if ($py) {
-        & $py -3.12 -c 'import sys; print(sys.executable)' 2>$null | Out-Null
-        if ($LASTEXITCODE -eq 0) { return ,@($py, '-3.12') }
-        & $py -3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)' 2>$null
-        if ($LASTEXITCODE -eq 0) { return ,@($py, '-3') }
+        if (Test-PythonCommand -Executable $py -Arguments @('-3.12', '-c', 'import sys; print(sys.executable)')) { return ,@($py, '-3.12') }
+        if (Test-PythonCommand -Executable $py -Arguments @('-3', '-c', 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)')) { return ,@($py, '-3') }
     }
     $python = Find-CommandPath 'python.exe'
     if ($python) {
-        & $python -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)' 2>$null
-        if ($LASTEXITCODE -eq 0) { return $python }
+        if (Test-PythonCommand -Executable $python -Arguments @('-c', 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)')) { return $python }
     }
     if (-not $CheckOnly) { Invoke-WingetUserInstall 'Python.Python.3.12' 'Python 3.12' }
     Refresh-ProcessPath
     $py = Get-PythonLauncher
     if ($py) {
-        & $py -3.12 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)' 2>$null
-        if ($LASTEXITCODE -eq 0) { return ,@($py, '-3.12') }
+        if (Test-PythonCommand -Executable $py -Arguments @('-3.12', '-c', 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)')) { return ,@($py, '-3.12') }
     }
     $python = Find-CommandPath 'python.exe'
     if ($python) {
-        & $python -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)' 2>$null
-        if ($LASTEXITCODE -eq 0) { return $python }
+        if (Test-PythonCommand -Executable $python -Arguments @('-c', 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)')) { return $python }
     }
     $localPython = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'
     if (Test-Path $localPython) {
-        & $localPython -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)' 2>$null
-        if ($LASTEXITCODE -eq 0) { return $localPython }
+        if (Test-PythonCommand -Executable $localPython -Arguments @('-c', 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)')) { return $localPython }
     }
     Fail 'Python 3.12+ не найден после установки. Перезапустите Windows Terminal или установите Python с python.org для текущего пользователя.'
 }
@@ -365,7 +372,7 @@ function Get-CoreRequirementsHash {
 }
 
 function Test-CorePackages([string]$PythonExe) {
-    & $PythonExe -c "import importlib.util,sys; names=['fastapi','faster_whisper','ffmpeg','huggingface_hub','psutil','multipart','uvicorn','validators','yt_dlp','mcp','PIL','cv2','rapidocr','onnxruntime','tokenizers','obsws_python']; missing=[name for name in names if importlib.util.find_spec(name) is None]; print('Missing core packages: '+', '.join(missing)) if missing else None; sys.exit(bool(missing))" 2>$null
+    & $PythonExe -c "import importlib.util,sys; names=['fastapi','faster_whisper','ffmpeg','huggingface_hub','psutil','multipart','uvicorn','validators','yt_dlp','mcp','PIL','cv2','tokenizers','obsws_python']; missing=[name for name in names if importlib.util.find_spec(name) is None]; print('Missing core packages: '+', '.join(missing)) if missing else None; sys.exit(bool(missing))" 2>$null
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -395,8 +402,7 @@ sys.exit(0 if matches else 1)
 '@
     Set-Content -LiteralPath $checkPath -Value $checkScript -Encoding ascii
     try {
-        & $PythonExe $checkPath *> $null
-        return ($LASTEXITCODE -eq 0)
+        return (Test-PythonCommand -Executable $PythonExe -Arguments @($checkPath))
     } finally {
         Remove-Item -LiteralPath $checkPath -Force -ErrorAction SilentlyContinue
     }

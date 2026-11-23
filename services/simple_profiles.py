@@ -7,7 +7,7 @@ from services.runtime_devices import asr_gpu_candidate, get_simple_gpu_details
 
 PROFILES = {
     "quality": ("Качество", "qwen3-asr-1.7b"),
-    "balanced": ("Баланс", "parakeet-tdt-0.6b-v3"),
+    "balanced": ("Баланс", "large-v3"),
     "economy": ("Экономный", "small"),
 }
 
@@ -46,6 +46,6 @@ def resolve(profile: str, device: str) -> tuple[str, str]:
     if candidate.get("canPrepare") and candidate.get("backend"):
         return model, candidate["backend"]
     gpu = gpu_details()
-    if model == "small" and gpu.get("backend") in {"cuda", "vulkan"}:
+    if model in {"small", "large-v3"} and gpu.get("backend") in {"cuda", "vulkan"}:
         return model, gpu["backend"]
     raise ValueError(_public_gpu_reason(gpu) or "Совместимый GPU сейчас недоступен.")

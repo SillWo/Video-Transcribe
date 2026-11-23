@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -74,6 +75,84 @@ def test_prepare_waits_for_obs_frontend_and_only_enumerates_sources(tmp_path, mo
     assert enumerated[0][1] == {"scenes": [{"sceneName": "VT Meeting Capture"}]}
     assert client.record_calls == 0
     assert recorder._prepared is True
+
+
+def test_status_is_fast_and_complete_while_obs_install_is_in_progress(tmp_path):
+    recorder = MeetingRecorder(runtime_root=tmp_path)
+    install_entered = threading.Event()
+    release_install = threading.Event()
+    failures = []
+    prepared = []
+
+    class Client:
+        def get_record_status(self):
+            return {"outputActive": False}
+
+    client = Client()
+    def stalled_install():
+        install_entered.set()
+        if not release_install.wait(timeout=5):
+            raise TimeoutError("test did not release the simulated OBS download")
+        recorder.exe.parent.mkdir(parents=True, exist_ok=True)
+        recorder.exe.touch()
+
+    recorder._download_and_install = stalled_install
+    recorder._is_owned_process = lambda: False
+    recorder._launch = lambda: None
+    recorder._connect = lambda attempts=16: client
+    recorder._wait_for_frontend_ready = lambda _client: {"scenes": []}
+    recorder._enumerate_monitors = lambda _client, _scenes: [{"id": "monitor"}]
+    recorder._enumerate_windows = lambda _client: [{"id": "browser"}]
+    recorder._enumerate_microphones = lambda _client: [{"id": "microphone"}]
+    recorder._start_event_client = lambda: None
+
+    def prepare():
+        try:
+            prepared.append(recorder.prepare())
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=prepare)
+    worker.start()
+    try:
+        assert install_entered.wait(timeout=2)
+        expected_keys = {
+            "available", "connected", "state", "duration_seconds", "monitors", "browsers",
+            "microphones", "title", "selection", "preview_url", "levels", "error",
+        }
+        for _ in range(4):
+            status = recorder.status()
+            assert set(status) == expected_keys
+            assert status["state"] == "preparing"
+            assert status["connected"] is False
+            assert status["error"] is None
+        assert worker.is_alive()
+    finally:
+        release_install.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert len(prepared) == 1
+    assert prepared[0]["state"] == "idle"
+    assert prepared[0]["connected"] is True
+    assert prepared[0]["monitors"] == [{"id": "monitor"}]
+
+
+def test_prepare_refuses_to_hide_an_unfinished_recording(tmp_path):
+    recorder = MeetingRecorder(runtime_root=tmp_path)
+    recording = tmp_path / "meeting-recorder" / "recordings" / "unfinished.mkv"
+    recorder._session["recording_path"] = str(recording)
+    recorder._state = "recording"
+    downloads = []
+    recorder._download_and_install = lambda: downloads.append(True)
+
+    with pytest.raises(RecorderError, match="незавершённая запись"):
+        recorder.prepare()
+
+    assert recorder._preparing.is_set() is False
+    assert recorder._session["recording_path"] == str(recording)
+    assert downloads == []
 
 
 def test_frontend_readiness_propagates_non_207_without_retry(tmp_path, monkeypatch):
@@ -283,7 +362,7 @@ def test_volume_meter_event_contains_multiple_active_inputs():
     assert meter_value(recorder._meters["VT Meeting Microphone"], "VT Meeting Microphone") == pytest.approx(0.31)
 
 
-def test_stop_imports_recording_without_scheduling_processing(tmp_path, monkeypatch):
+def test_stop_queues_recording_conversion_and_preserves_capture_until_publication(tmp_path, monkeypatch):
     archive = MeetingArchive(tmp_path / "archive")
     capture_dir = tmp_path / "meeting-recorder" / "recordings"
     capture_dir.mkdir(parents=True)
@@ -297,18 +376,29 @@ def test_stop_imports_recording_without_scheduling_processing(tmp_path, monkeypa
         def get_record_status(self): return {"outputActive": False, "outputPath": str(capture)}
     recorder._connect = lambda attempts=1: Client()
     monkeypatch.setattr(recorder, "_status_from_obs", lambda: {"state": "idle", "connected": True})
+    observed = {}
+    def enqueue(path, *, title, started_at, track_roles, cleanup_root):
+        observed.update(path=path, title=title, started_at=started_at,
+                        track_roles=track_roles, cleanup_root=cleanup_root)
+        return {"id": "queued-conversion", "status": "queued"}
+    monkeypatch.setattr("web_api.enqueue_recording_conversion", enqueue)
 
-    # A successful stop imports/finalizes an archive record; it never calls the queue.
     result = recorder.stop()
-    meeting = result["meeting"]
-    assert meeting["title"] == "Тестовая встреча"
-    assert meeting["audio_track_roles"] == {"1": "mix", "2": "browser", "3": "microphone"}
-    assert archive.original_path(meeting["meeting_id"]).exists()
-    assert not capture.exists()
+    assert result["job"] == {"id": "queued-conversion", "status": "queued"}
+    assert result["recorder"]["state"] == "idle"
+    assert observed == {
+        "path": str(capture.resolve()),
+        "title": "Тестовая встреча",
+        "started_at": "2026-11-14T10:00:00+00:00",
+        "track_roles": {"1": "mix", "2": "browser", "3": "microphone"},
+        "cleanup_root": str(capture_dir.resolve()),
+    }
+    assert capture.read_bytes() == b"test mkv with three logical audio streams"
+    assert archive.list_meetings() == []
     assert not (tmp_path / "archive" / "meeting-recorder").exists()
 
 
-def test_failed_probe_keeps_owned_mkv_for_recovery(tmp_path):
+def test_stop_defers_media_probe_and_keeps_owned_mkv_for_worker(tmp_path, monkeypatch):
     archive = MeetingArchive(tmp_path / "archive")
     capture_dir = tmp_path / "meeting-recorder" / "recordings"
     capture_dir.mkdir(parents=True)
@@ -320,8 +410,21 @@ def test_failed_probe_keeps_owned_mkv_for_recovery(tmp_path):
     class Client:
         def get_record_status(self): return {"outputActive": False, "outputPath": str(capture)}
     recorder._connect = lambda attempts=1: Client()
-    with pytest.raises(RecorderError, match="вместо трёх"):
-        recorder.stop()
+    queued = []
+    def enqueue(path, **metadata):
+        queued.append((path, metadata))
+        return {"id": "queued-conversion", "status": "queued"}
+    monkeypatch.setattr("web_api.enqueue_recording_conversion", enqueue)
+
+    result = recorder.stop()
+
+    assert result["job"]["id"] == "queued-conversion"
+    assert queued == [(str(capture.resolve()), {
+        "title": capture.stem,
+        "started_at": None,
+        "track_roles": {"1": "mix", "2": "browser", "3": "microphone"},
+        "cleanup_root": str(capture_dir.resolve()),
+    })]
     assert capture.read_bytes() == b"incomplete"
     assert archive.list_meetings() == []
 
@@ -344,6 +447,9 @@ def test_private_obs_download_is_pinned_and_not_reported_as_installed(tmp_path):
     assert expected["version"] == "33.0.1"
     assert expected["size_bytes"] == 223786669
     assert len(expected["sha256"]) == 64
+    assert expected["url"] == "https://github.com/obsproject/obs-studio/releases/download/33.0.1/OBS-Studio-33.0.1-Windows-x64.zip"
+    assert recorder.download_path.name == "OBS-Studio-33.0.1-Windows-x64.zip"
+    assert recorder.download_path.name == expected["url"].rsplit("/", 1)[-1]
     status = recorder.status()
     assert status["state"] == "unavailable"
     assert status["available"] is False

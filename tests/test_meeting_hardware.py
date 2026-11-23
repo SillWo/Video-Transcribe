@@ -38,7 +38,8 @@ class MeetingHardwareTests(unittest.TestCase):
         self.assertEqual(identity["name"], "AMD Radeon")
         self.assertEqual(identity["device_index"], 1)
         self.assertTrue(identity["driver_identity_verified"])
-        self.assertEqual(plan["env"]["VT_MEETING_DML_DEVICE_ID"], "1")
+        self.assertEqual(plan["device"], "cpu")
+        self.assertTrue(plan["verified"])
 
     def test_vulkan_ordinal_never_replaces_dxgi_directml_ordinal(self):
         with patch.object(runtime_devices, "_dxgi_gpu_inventory", return_value=[
@@ -65,8 +66,8 @@ class MeetingHardwareTests(unittest.TestCase):
                 calibration = hardware.calibrate_screen_runtime()
         self.assertEqual(auto["device"], "cpu")
         self.assertTrue(auto["verified"])
-        self.assertEqual(manual["error"], "gpu_device_index_unavailable")
-        self.assertIn("индекс", manual["reason"])
+        self.assertIsNone(manual["error"])
+        self.assertEqual(manual["device"], "cpu")
         self.assertFalse(calibration["verified"])
         write_receipt.assert_not_called()
 
@@ -95,25 +96,22 @@ class MeetingHardwareTests(unittest.TestCase):
         self.assertTrue(hardware._has_dml_target(identity))
         self.assertEqual(identity["device_index"], 0)
 
-    def test_auto_stays_on_cpu_without_an_exact_verified_receipt(self):
+    def test_screen_extraction_stays_on_cpu_without_ocr_receipts(self):
         with patch.object(hardware, "_receipt_matches", return_value=False), \
                 patch.object(hardware, "_identity", return_value={"name": "Radeon 780M"}):
             plan = hardware.plan_stage("screen", "auto", "gpu")
         self.assertEqual(plan["device"], "cpu")
         self.assertTrue(plan["verified"])
         self.assertEqual(plan["python"], hardware.sys.executable)
-        self.assertEqual(plan["env"]["VT_MEETING_OCR_REC_PRECISION"], "fp32")
-        self.assertEqual(plan["env"]["VT_MEETING_OCR_BATCHING"], "stock")
-        self.assertEqual(plan["env"]["VT_MEETING_OCR_REC_MODEL_PATH"], "")
-        self.assertEqual(plan["env"]["VT_MEETING_OCR_REC_MODEL_SHA256"], "")
+        self.assertNotIn("VT_MEETING_OCR_REC_PRECISION", plan["env"])
 
-    def test_manual_gpu_keeps_requested_device_and_reports_missing_runtime(self):
+    def test_manual_gpu_selection_does_not_gate_screen_extraction(self):
         with patch.object(hardware, "GPU_PYTHON", Path("missing-directml-python.exe")), \
                 patch.object(hardware, "_identity", return_value={"name": "Radeon 780M", "vendor_id": 0x1002,
                                                                     "device_index": 0}):
             plan = hardware.plan_stage("screen", "manual", "gpu")
-        self.assertEqual(plan["device"], "directml")
-        self.assertEqual(plan["error"], "gpu_runtime_missing")
+        self.assertEqual(plan["device"], "cpu")
+        self.assertIsNone(plan["error"])
 
     def test_missing_av_is_incomplete_runtime_and_manual_gpu_reports_reason(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -143,9 +141,8 @@ class MeetingHardwareTests(unittest.TestCase):
             "auto_device": "cpu",
             "reason": "Нет сохранённого сопоставимого замера скорости и качества диаризации.",
         })
-        self.assertEqual(manual["error"], "gpu_runtime_missing")
-        self.assertEqual(manual["reason"],
-                         "Не подготовлен компонент чтения видео. Подготовьте среду GPU в настройках.")
+        self.assertEqual(manual["device"], "cpu")
+        self.assertIsNone(manual["error"])
 
     def test_av_dist_info_is_sufficient_for_prepared_component_check(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -164,7 +161,7 @@ class MeetingHardwareTests(unittest.TestCase):
         self.assertTrue(prepared)
         self.assertEqual(missing, [])
 
-    def test_manual_gpu_allows_prepared_runtime_without_an_auto_receipt(self):
+    def test_manual_gpu_screen_request_stays_on_cpu_even_with_prepared_ocr(self):
         with tempfile.TemporaryDirectory() as temp:
             python = Path(temp) / "python.exe"
             python.write_bytes(b"python")
@@ -174,12 +171,10 @@ class MeetingHardwareTests(unittest.TestCase):
                                                                         "device_index": 0}), \
                     patch.object(hardware, "_receipt_matches", return_value=False):
                 plan = hardware.plan_stage("screen", "manual", "gpu")
-        self.assertEqual(plan["device"], "directml")
-        self.assertFalse(plan["verified"])
+        self.assertEqual(plan["device"], "cpu")
+        self.assertTrue(plan["verified"])
         self.assertIsNone(plan["error"])
-        self.assertEqual(plan["env"]["VT_MEETING_OCR_REC_PRECISION"], "fp32")
-        self.assertEqual(plan["env"]["VT_MEETING_OCR_BATCHING"], "stock")
-        self.assertIn("экспериментальным", plan["reason"])
+        self.assertNotIn("VT_MEETING_OCR_REC_PRECISION", plan["env"])
 
     def test_verified_fp32_receipt_passes_selected_variant_to_worker_environment(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -200,10 +195,8 @@ class MeetingHardwareTests(unittest.TestCase):
                     patch.object(hardware, "_receipt_matches", return_value=True):
                 plan = hardware.plan_stage("screen", "auto", "gpu")
 
-        self.assertEqual(plan["device"], "directml")
-        self.assertEqual(plan["env"]["VT_MEETING_OCR_REC_PRECISION"], "fp32")
-        self.assertEqual(plan["env"]["VT_MEETING_OCR_BATCHING"], "equal-width")
-        self.assertEqual(plan["env"]["VT_MEETING_OCR_REC_MODEL_SHA256"], "")
+        self.assertEqual(plan["device"], "cpu")
+        self.assertNotIn("VT_MEETING_OCR_REC_PRECISION", plan["env"])
 
     def test_fp16_hardware_receipt_is_not_auto_verified(self):
         import hashlib
@@ -370,7 +363,7 @@ class MeetingHardwareTests(unittest.TestCase):
         self.assertIsNone(plan["error"])
         self.assertIn("Opus", plan["reason"])
 
-    def test_manual_directml_targets_the_discovered_adapter_id(self):
+    def test_manual_gpu_does_not_select_screen_directml(self):
         with tempfile.TemporaryDirectory() as temp:
             python = Path(temp) / "python.exe"
             python.write_bytes(b"python")
@@ -380,8 +373,8 @@ class MeetingHardwareTests(unittest.TestCase):
                                                                         "device_index": 2}), \
                     patch.object(hardware, "_receipt_matches", return_value=False):
                 plan = hardware.plan_stage("screen", "manual", "gpu")
-        self.assertEqual(plan["device"], "directml")
-        self.assertEqual(plan["env"]["VT_MEETING_DML_DEVICE_ID"], "2")
+        self.assertEqual(plan["device"], "cpu")
+        self.assertNotIn("VT_MEETING_DML_DEVICE_ID", plan["env"])
 
     def test_hardware_api_import_does_not_load_numpy_or_onnxruntime(self):
         probe = subprocess.run(

@@ -1,12 +1,19 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { canApplyMeetingEditResult, confirmedMeetingDate, isPendingMeetingValueCurrent, latestFailedMeetingJob, meetingsApi, parseMeetingCompositeKey, readMeetingSnapshot, readMeetingTimeline } from '../src/lib/meetingsApi.ts'
+import { canApplyMeetingEditResult, confirmedMeetingDate, isPendingMeetingValueCurrent, latestFailedMeetingJob, meetingsApi, parseMeetingCompositeKey, preserveMeetingSettingsDraft, readMeetingSnapshot, readMeetingTimeline } from '../src/lib/meetingsApi.ts'
 
 function withFetch(handler: (url: string, init?: RequestInit) => Response | Promise<Response>) {
   const original = globalThis.fetch
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => handler(String(input), init)) as typeof fetch
   return () => { globalThis.fetch = original }
 }
+
+test('settings refresh keeps unsaved profile, device, folder, and retention drafts', () => {
+  const draft = { archive_root: 'D:/local-draft', backup_root: 'D:/backup-draft', auto_cleanup: false, profile: 'quality' as const, execution_mode: 'manual' as const, device: 'gpu' as const, original_retention_days: 91 }
+  const server = { ...draft, archive_root: 'D:/server', profile: 'balanced' as const, execution_mode: 'auto' as const, device: 'cpu' as const, original_retention_days: 30 }
+  assert.equal(preserveMeetingSettingsDraft(draft, server), draft)
+  assert.equal(preserveMeetingSettingsDraft(null, server), server)
+})
 
 test('timeline reader follows every offset page and keeps the complete tail', async () => {
   const requests: string[] = []
@@ -179,7 +186,7 @@ test('settings, import rejection and recorder start match backend response envel
   const restore = withFetch((url, init) => {
     calls.push({ url, init })
     if (url.endsWith('/settings')) return Response.json({ settings })
-    if (url.endsWith('/import')) return Response.json({ items: [], rejected: [{ path: 'bad.bin', reason: 'unsupported_format' }] })
+    if (url.endsWith('/import')) return Response.json({ jobs: [{ id: 'queued-import', status: 'queued' }], rejected: [{ path: 'bad.bin', reason: 'unsupported_format' }] })
     if (url.endsWith('/recorder/start')) return Response.json(recorder)
     throw new Error(`Unexpected API request: ${url}`)
   })
@@ -187,6 +194,7 @@ test('settings, import rejection and recorder start match backend response envel
     assert.deepEqual(await meetingsApi.settings(), settings)
     assert.deepEqual(await meetingsApi.saveSettings(settings), settings)
     const imported = await meetingsApi.importFiles(['bad.bin'])
+    assert.deepEqual(imported.jobs, [{ id: 'queued-import', status: 'queued' }])
     assert.deepEqual(imported.rejected, [{ path: 'bad.bin', reason: 'unsupported_format' }])
     assert.deepEqual(await meetingsApi.startRecording('Planning call'), recorder)
     assert.equal(calls.length, 4)

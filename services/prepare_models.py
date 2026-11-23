@@ -9,11 +9,12 @@ from pathlib import Path
 from services.model_management import _build_download_plan, download_registered_model, get_model_status
 from services.model_paths import HF_HUB_CACHE
 from services.runtime_devices import APP_ROOT, _windows_gpu_inventory, asr_gpu_candidate, enumerate_vulkan_gpus, get_simple_gpu_details
-from services.whisper_cpp import MODEL_REPO, model_filename, resolve_model_path
+from services.whisper_cpp import (MODEL_REPO, cached_tokenizer_path, model_filename,
+                                  resolve_model_path, resolve_tokenizer_path)
 from utils.text_postprocess import HF_HOME
 
-FASTER_MODELS = ("small",)
-VULKAN_MODELS = ("small",)
+FASTER_MODELS = ("small", "large-v3")
+VULKAN_MODELS = ("small", "large-v3")
 
 
 def _report_size(model_id: str) -> str:
@@ -84,19 +85,23 @@ def prepare(*, check_only: bool = False, skip_postprocess: bool = False,
                    or any(item.get("vendorId") == 0x1002 for item in enumerate_vulkan_gpus())
                    or any(item.get("vendorId") == 0x1002 for item in _windows_gpu_inventory()))
     missing: list[str] = []
-    faster_models = ("small",) if setup_only else FASTER_MODELS
-    vulkan_models = ("small",) if setup_only else VULKAN_MODELS
+    faster_models = FASTER_MODELS
+    vulkan_models = VULKAN_MODELS
     tasks = [("faster-whisper", model_id, lambda model_id=model_id: get_model_status(model_id).get("status") == "downloaded",
               lambda model_id=model_id: download_registered_model(model_id, lambda _p, text: progress(f"{model_id}: {text}")))
              for model_id in faster_models]
     if need_vulkan:
-        tasks.extend(("whisper.cpp", model_id, lambda model_id=model_id: _vulkan_cached(model_id),
-                      lambda model_id=model_id: resolve_model_path(model_id, progress=progress)) for model_id in vulkan_models)
+        tasks.extend(("whisper.cpp", model_id,
+                      lambda model_id=model_id: (_vulkan_cached(model_id)
+                                                 and cached_tokenizer_path(model_id) is not None),
+                      lambda model_id=model_id: _prepare_vulkan_model(model_id, progress))
+                     for model_id in vulkan_models)
 
     if setup_only:
         from services.asr_resources import asr_resource_status, ensure_asr_resources
         selected_profiles = []
-        for profile_id in ("parakeet-tdt-0.6b-v3", "qwen3-asr-1.7b"):
+        from services.asr_resources import NEW_MODELS
+        for profile_id in sorted(NEW_MODELS):
             candidate = asr_gpu_candidate(profile_id)
             gpu_backend = candidate.get("backend") if candidate.get("canPrepare") else None
             profile_backends = ["cpu"]
@@ -151,6 +156,11 @@ def prepare(*, check_only: bool = False, skip_postprocess: bool = False,
         return 1
     progress("All required models are ready.")
     return 0
+
+
+def _prepare_vulkan_model(model_id: str, progress=print) -> None:
+    resolve_model_path(model_id, progress=progress)
+    resolve_tokenizer_path(model_id, progress=progress)
 
 
 def main() -> int:

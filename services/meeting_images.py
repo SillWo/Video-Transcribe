@@ -78,7 +78,9 @@ def probe_media(source: str | Path) -> dict[str, Any]:
         if duration is None:
             duration = max((value for value in (number(stream.get("duration")) for stream in streams) if value is not None), default=None)
         return {"duration": duration,
-                "video": [brief(stream, i) for i, stream in enumerate(streams) if stream.get("codec_type") == "video"],
+                "video": [brief(stream, i) for i, stream in enumerate(streams)
+                          if stream.get("codec_type") == "video"
+                          and not (stream.get("disposition") or {}).get("attached_pic")],
                 "audio": [brief(stream, i) for i, stream in enumerate(streams) if stream.get("codec_type") == "audio"]}
     except (OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError) as exc:
         return {"duration": None, "video": [], "audio": [], "error": str(exc)}
@@ -100,7 +102,10 @@ def extract_episode_frames(source: str | Path, start: float, end: float, *,
     results: list[dict[str, Any]] = []
     second = start
     while second < end and len(results) < limit:
-        command = [ffmpeg, "-v", "error", "-ss", f"{second:.3f}", "-i", str(source), "-map", "0:v:0", "-frames:v", "1",
+        videos = probe_media(source).get("video", [])
+        video_index = videos[0].get("index") if videos else None
+        command = [ffmpeg, "-v", "error", "-ss", f"{second:.3f}", "-i", str(source),
+                   "-map", f"0:{video_index}" if video_index is not None else "0:v:0", "-frames:v", "1",
                    "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
         try:
             decoded = subprocess.run(command, capture_output=True, check=False, timeout=30, shell=False)

@@ -1,6 +1,7 @@
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import types
@@ -23,6 +24,9 @@ class FakeArchive:
 
     def get_meeting(self, meeting_id):
         return {"id": meeting_id, "title": "Звонок"}
+
+    def effective_text(self, meeting_id):
+        return getattr(self, "_effective_text", "")
 
     def meeting_dir(self, meeting_id):
         return self.root / meeting_id
@@ -87,7 +91,157 @@ def test_read_tools_delegate_to_archive_and_index_read_only(tmp_path, monkeypatc
     assert json.loads(tools.search_evidence("hello"))["results"][0]["query"] == "hello"
     assert json.loads(tools.read_timeline("one"))["total"] == 1
     assert json.loads(tools.glossary("one"))["items"][0]["term"] == "API"
+    meeting_read = json.loads(tools.read_archive_item("one", kind="meeting"))
+    assert meeting_read["text"] == ""
+    assert meeting_read["complete"] is True
     assert tools.archive_status()["read_only"] is True
+
+
+def test_conversion_contract_requires_absolute_path_and_request_id_without_starting_host_for_status(tmp_path, monkeypatch):
+    tools = meeting_mcp.ArchiveTools(tmp_path / "archive", project_root=tmp_path)
+    monkeypatch.setenv("VT_SIMPLE_RUNTIME_DIR", str(tmp_path / "isolated-runtime"))
+    called = []
+    monkeypatch.setattr("services.app_host.ensure_headless_host", lambda **kwargs: called.append(kwargs))
+    with pytest.raises(ValueError, match="absolute"):
+        tools.convert_media_file("relative.mp4", "stable-req")
+    with pytest.raises(ValueError, match="idempotency"):
+        tools.convert_media_file(str((tmp_path / "source.mp4").resolve()), "")
+    result = json.loads(tools.get_media_conversion_status("job-unknown"))
+    assert result == {"job_id": "job-unknown", "status": "unavailable", "reason": "history_unavailable"}
+    assert called == []
+    assert not (tmp_path / "isolated-runtime").exists()
+
+
+def test_stopped_host_status_reads_completed_audio_readonly_and_hides_foreign_archive(tmp_path, monkeypatch):
+    from services.transcription_history import TranscriptionHistory
+
+    archive = tmp_path / "configured-archive"
+    runtime = tmp_path / "isolated-runtime"
+    runtime.mkdir()
+    database = runtime / "history.sqlite3"
+    records = [
+        {"id": "audio-job", "requestId": "request-audio", "sourceType": "file",
+         "source": "audio.wav", "archiveRoot": str(archive), "status": "completed",
+         "stage": "result", "error": None, "errorCode": None,
+         "archivePublication": "published", "archiveKind": "audio",
+         "archiveItemId": "audio-job", "speechAvailability": "available"},
+        {"id": "foreign-job", "requestId": "request-foreign", "sourceType": "file",
+         "source": "other.wav", "archiveRoot": str(tmp_path / "foreign-archive"),
+         "status": "completed", "stage": "result", "archivePublication": "published",
+         "archiveKind": "audio", "archiveItemId": "foreign-job"},
+    ]
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, status TEXT NOT NULL, stage TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0, metadata TEXT NOT NULL)")
+        for record in records:
+            connection.execute("INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?)",
+                               (record["id"], "2026-11-20", "2026-11-20", record["status"],
+                                record["stage"], 0, json.dumps(record)))
+    before_mtime = database.stat().st_mtime_ns
+    monkeypatch.setenv("VT_SIMPLE_RUNTIME_DIR", str(runtime))
+    monkeypatch.setattr("services.app_host.ensure_headless_host", lambda **_kwargs: pytest.fail("status must not start a host"))
+    monkeypatch.setattr(TranscriptionHistory, "__init__", lambda *_args, **_kwargs: pytest.fail("status must not initialize TranscriptionHistory"))
+    tools = meeting_mcp.ArchiveTools(archive, project_root=tmp_path)
+
+    status = json.loads(tools.get_media_conversion_status("audio-job"))
+    assert status == {"job_id": "audio-job", "status": "completed", "stage": "result",
+                      "error": None, "errorCode": None, "item_id": "audio-job", "kind": "audio",
+                      "speechAvailability": "available"}
+    assert json.loads(tools.get_media_conversion_status("foreign-job")) == {
+        "job_id": "foreign-job", "status": "not_found"}
+    assert database.stat().st_mtime_ns == before_mtime
+
+
+def test_mcp_search_output_uses_audio_video_kinds_and_hides_pending(tmp_path, monkeypatch):
+    fake_core(monkeypatch)
+    import services.meeting_search as index_module
+
+    class MixedIndex:
+        def __init__(self, root):
+            self.root = root
+
+        def search(self, *_args, **_kwargs):
+            return {"results": [
+                {"kind": "transcription", "id": "a1", "job_id": "a1", "title": "Audio"},
+                {"kind": "meeting", "id": "v1", "meeting_id": "v1", "title": "Video"},
+                {"kind": "transcription", "id": "pending", "job_id": "pending", "archivePublication": "pending"},
+            ], "total": 3}
+
+    monkeypatch.setattr(index_module, "ReadIndexProxy", MixedIndex)
+    result = json.loads(meeting_mcp.ArchiveTools(tmp_path).search_archive("query"))
+    assert [item["kind"] for item in result["items"]] == ["audio", "video"]
+    assert {item["id"] for item in result["items"]} == {"a1", "v1"}
+
+
+def test_create_server_discovers_conversion_tools_and_marks_only_submit_mutating(tmp_path):
+    server = meeting_mcp.create_server(root=tmp_path)
+    names = {tool.name for tool in server._tool_manager.list_tools()}
+    assert "convert_media_file" in names
+    assert "get_media_conversion_status" in names
+
+
+def test_read_meeting_archive_item_returns_current_effective_transcript(tmp_path):
+    from services.meeting_archive import MeetingArchive
+
+    source = tmp_path / "meeting.wav"
+    source.write_bytes(b"meeting")
+    archive = MeetingArchive(tmp_path / "archive")
+    meeting = archive.import_file(source)
+    meeting_id = meeting["meeting_id"]
+    archive.write_transcript(meeting_id, [
+        {"id": "s1", "start": 1.0, "end": 2.0, "text": "raw words"},
+        {"id": "s2", "start": 2.0, "end": 3.0, "text": "more raw words"},
+    ], raw_text="raw words\nmore raw words")
+    archive.edit_segment(meeting_id, "s1", "corrected current words")
+
+    result = json.loads(meeting_mcp.ArchiveTools(archive.root).read_archive_item(
+        meeting_id, kind="meeting"))
+
+    assert result["kind"] == "video"
+    assert result["item"]["meeting_id"] == meeting_id
+    assert result["text"] == "corrected current words\nmore raw words"
+    assert result["complete"] is True
+
+
+def test_read_meeting_archive_item_paginates_long_transcript_without_inventing_timestamps(tmp_path):
+    from services.meeting_archive import MeetingArchive
+
+    source = tmp_path / "long.wav"
+    source.write_bytes(b"long meeting")
+    archive = MeetingArchive(tmp_path / "archive")
+    meeting_id = archive.import_file(source)["meeting_id"]
+    text = "transcript text " * 2000
+    archive.write_transcript(meeting_id, [], raw_text=text)
+    tools = meeting_mcp.ArchiveTools(archive.root)
+
+    first = json.loads(tools.read_archive_item(meeting_id, kind="meeting", limit=25000))
+    second = json.loads(tools.read_archive_item(meeting_id, kind="meeting",
+                                                offset=first["next_offset"], limit=24000))
+
+    assert len(first["text"]) == 24000
+    assert first["offset"] == 0
+    assert first["next_offset"] == 24000
+    assert first["complete"] is False
+    assert second["text"] == text[24000:]
+    assert second["next_offset"] is None
+    assert second["complete"] is True
+    assert "timestamps" not in first
+
+
+def test_read_empty_meeting_transcript_is_valid_empty_text(tmp_path):
+    from services.meeting_archive import MeetingArchive
+
+    source = tmp_path / "empty.wav"
+    source.write_bytes(b"empty meeting transcript")
+    archive = MeetingArchive(tmp_path / "archive")
+    meeting_id = archive.import_file(source)["meeting_id"]
+
+    result = json.loads(meeting_mcp.ArchiveTools(archive.root).read_archive_item(
+        meeting_id, kind="meeting"))
+
+    assert result["text"] == ""
+    assert result["offset"] == 0
+    assert result["next_offset"] is None
+    assert result["complete"] is True
 
 
 def test_archive_status_detects_default_and_override_model_files_without_loading_runtime(tmp_path, monkeypatch):
@@ -146,6 +300,47 @@ def test_get_frames_returns_bounded_image_bytes_and_continuation(tmp_path, monke
     assert images[0] == b"jpeg-bytes"
     assert decoded["items"][0]["source"] == "stored"
     assert decoded["complete"] is True
+
+
+def test_stored_frame_metadata_associates_only_existing_jpegs_and_paginates(tmp_path, monkeypatch):
+    from PIL import Image
+    from types import SimpleNamespace
+
+    meeting_dir = tmp_path / "one"
+    frames = meeting_dir / "frames"
+    frames.mkdir(parents=True)
+    Image.new("RGB", (12, 8), "red").save(frames / "first.jpg", "JPEG")
+    Image.new("RGB", (12, 8), "blue").save(frames / "third.jpg", "JPEG")
+    events = [
+        {"id": "first", "start": 0.0, "end": 1.0, "frame": "frames/first.jpg",
+         "sample_interval_seconds": 0.5, "time_uncertainty_seconds": 0.25},
+        {"id": "missing", "start": 1.0, "end": 2.0, "frame": "frames/missing.jpg"},
+        {"id": "third", "start": 2.0, "end": 3.0, "frame": "frames/third.jpg"},
+    ]
+    archive = SimpleNamespace(meeting_dir=lambda _meeting_id: meeting_dir,
+                              read_screen_events=lambda _meeting_id: {"events": events})
+    tools = meeting_mcp.ArchiveTools(tmp_path)
+    monkeypatch.setattr(tools, "archive", lambda: archive)
+
+    first_info, first_images = tools.get_frames("one", limit=2)
+    first = json.loads(first_info)
+    assert [item["event_id"] for item in first["items"]] == ["first", "missing"]
+    assert first["items"][0]["frame"] == "frames/first.jpg"
+    assert first["items"][0]["sample_interval_seconds"] == 0.5
+    assert first["items"][0]["time_uncertainty_seconds"] == 0.25
+    assert first["items"][0]["image_index"] == 0
+    assert "image_error" in first["items"][1]
+    assert "image_index" not in first["items"][1]
+    assert len(first_images) == 1
+    assert first["next_offset"] == 2
+
+    second_info, second_images = tools.get_frames("one", limit=2, offset=first["next_offset"])
+    second = json.loads(second_info)
+    assert second["items"][0]["event_id"] == "third"
+    assert second["items"][0]["image_index"] == 0
+    assert second["items"][0]["frame"] == "frames/third.jpg"
+    assert len(second_images) == 1
+    assert second["next_offset"] is None
 
 
 def test_stored_frames_use_half_open_ranges_before_pagination(tmp_path, monkeypatch):
@@ -395,23 +590,45 @@ def test_real_mcp_sdk_stdio_call_delivers_imagecontent_and_readonly_annotations(
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
                     listing = await session.list_tools()
-                    expected_names = {"get_archive_status", "find_meetings", "search_evidence", "read_timeline",
-                                      "get_frames", "get_glossary", "get_source_status", "open_evidence"}
+                    expected_names = {"get_archive_status", "find_meetings", "find_archive_items", "read_archive_item",
+                                      "search_archive", "search_evidence", "read_timeline", "get_frames",
+                                      "get_glossary", "get_source_status", "open_evidence",
+                                      "convert_media_file", "get_media_conversion_status"}
                     by_name = {item.name: item for item in listing.tools}
                     assert expected_names <= set(by_name)
                     for name in expected_names:
+                        if name == "convert_media_file":
+                            continue
                         ann = by_name[name].annotations
                         assert ann.readOnlyHint is True
                         assert ann.destructiveHint is False
                         assert ann.idempotentHint is True
                         assert ann.openWorldHint is False
-                        assert by_name[name].outputSchema is None
+                    conversion_ann = by_name["convert_media_file"].annotations
+                    assert conversion_ann.readOnlyHint is False
+                    assert conversion_ann.destructiveHint is False
+                    assert by_name["get_media_conversion_status"].annotations.readOnlyHint is True
+                    assert all(item.outputSchema is None for item in listing.tools)
+                    prompts = await session.list_prompts()
+                    assert "inspect_video_frames" in {prompt.name for prompt in prompts.prompts}
+                    prompt_result = await session.get_prompt(
+                        "inspect_video_frames", {"meeting_id": meeting_id, "question": "What is visible?"}
+                    )
+                    prompt_text = "\n".join(message.content.text for message in prompt_result.messages
+                                             if hasattr(message.content, "text"))
+                    assert "ImageContent" in prompt_text
+                    assert "image_error" in prompt_text
+                    assert "open_evidence" in prompt_text
                     status_result = await session.call_tool("get_archive_status", {})
                     assert status_result.isError is False
                     result = await session.call_tool("get_frames", {"meeting_id": meeting_id, "limit": 8})
                     assert result.isError is False
                     images = [item for item in result.content if isinstance(item, ImageContent)]
                     assert len(images) == 1
+                    metadata_block = next(item for item in result.content if hasattr(item, "text"))
+                    frame_metadata = json.loads(metadata_block.text)
+                    assert frame_metadata["items"][0]["frame"] == "frames/screen.jpg"
+                    assert frame_metadata["items"][0]["image_index"] == 0
                     decoded = b64decode(images[0].data, validate=True)
                     assert decoded.startswith(b"\xff\xd8") and decoded.endswith(b"\xff\xd9")
                     delivered = Image.open(BytesIO(decoded)).convert("RGB")
@@ -454,7 +671,11 @@ def test_open_evidence_viewer_serves_escaped_html_media_ranges_and_missing_sourc
             assert response.status == 206
             assert response.headers["Content-Range"] == "bytes 2-5/10"
             assert response.read() == b"2345"
-        source.unlink()
+        state["source"] = tmp_path / "missing-source.mp4"
+        assert not state["source"].exists()
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(media_url)
+        assert error.value.code == 404
         state["source"] = None
         with pytest.raises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(media_url)
@@ -524,6 +745,7 @@ def test_viewer_rejects_non_loopback_host(tmp_path):
 
 
 def test_detached_viewer_persists_and_uses_retained_audio_frame(tmp_path, monkeypatch):
+    monkeypatch.delenv("VT_MEETING_ROOT", raising=False)
     from PIL import Image
     from services.meeting_archive import MeetingArchive
     from services import meeting_links
@@ -563,7 +785,11 @@ def test_detached_viewer_persists_and_uses_retained_audio_frame(tmp_path, monkey
         with urllib.request.urlopen(url, timeout=3) as response:
             page = response.read().decode("utf-8")
         assert "<audio" in page
-        assert "Saved screen evidence" in page
+        assert "Сохранённый кадр экрана" in page
+        assert "Материал на отметке 10.25 секунды" in page
+        assert "color-scheme: dark" in page
+        assert "#13111c" in page
+        assert "@media (max-width: 600px)" in page
         audio_url = url.split("/evidence/", 1)[0] + f"/audio/{meeting_id}"
         with urllib.request.urlopen(audio_url, timeout=3) as response:
             assert response.read() == b"retained-audio"
@@ -595,6 +821,72 @@ def test_detached_viewer_persists_and_uses_retained_audio_frame(tmp_path, monkey
             os.kill(int(state["pid"]), signal.SIGTERM)
         except (OSError, ProcessLookupError):
             pass
+
+
+def test_viewer_ui_version_refreshes_discovery_without_stopping_old_viewer(
+    tmp_path, monkeypatch
+):
+    from services import meeting_links
+
+    root = tmp_path / "archive"
+    root.mkdir()
+    settings = tmp_path / "settings" / "meetings-settings.json"
+    settings.parent.mkdir(parents=True)
+    descriptor = settings.parent / "read-viewer.json"
+    old = meeting_links.Viewer(root, token="old-viewer-token")
+    root_key = str(root.resolve())
+    old_state = {
+        "root": root_key,
+        "port": old.server.server_port,
+        "token": old.token,
+        "pid": 10,
+        "launch_mode": "detached",
+        "viewer_ui_version": meeting_links.VIEWER_UI_VERSION - 1,
+    }
+    descriptor.write_text(
+        json.dumps({**old_state, "viewers": {root_key: old_state}}),
+        encoding="utf-8",
+    )
+    started = []
+
+    class _Process:
+        pid = 11
+
+        def poll(self):
+            return None
+
+    def start_process(command, **_kwargs):
+        port = int(command[command.index("--port") + 1])
+        token = next(
+            value.split("=", 1)[1]
+            for value in command
+            if value.startswith("--token=")
+        )
+        viewer = meeting_links.Viewer(root, port=port, token=token)
+        started.append(viewer)
+        return _Process()
+
+    monkeypatch.setattr(meeting_links.subprocess, "Popen", start_process)
+    try:
+        current = meeting_links._start_detached_viewer(root, settings)
+        assert current.port != old.server.server_port
+        assert len(started) == 1
+        with urllib.request.urlopen(old.base_url + "health", timeout=2) as response:
+            assert response.status == 200
+        state = json.loads(descriptor.read_text(encoding="utf-8"))
+        assert state["viewer_ui_version"] == meeting_links.VIEWER_UI_VERSION
+        assert (
+            state["viewers"][root_key]["viewer_ui_version"]
+            == meeting_links.VIEWER_UI_VERSION
+        )
+
+        reused = meeting_links._start_detached_viewer(root, settings)
+        assert reused.port == current.port
+        assert len(started) == 1
+    finally:
+        for viewer in started:
+            viewer.close()
+        old.close()
 
 
 def test_viewer_survives_the_process_that_issued_its_url(tmp_path):

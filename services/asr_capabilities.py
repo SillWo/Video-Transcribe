@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import threading
@@ -14,30 +15,41 @@ from services.runtime_devices import APP_ROOT, asr_gpu_candidate, get_device_det
 
 
 CAPABILITY_PATH = APP_ROOT / ".runtime" / "asr" / "capabilities.json"
+ASR_BENCHMARK_RECEIPT = APP_ROOT / ".runtime" / "asr" / "whisper-large-v3-auto-receipt.json"
+ASR_BENCHMARK_WORDS_RECEIPT = APP_ROOT / ".runtime" / "asr" / "whisper-large-v3-auto-receipt-words.json"
+ASR_BENCHMARK_VERSION = 1
 _lock = threading.RLock()
 _checking: set[tuple[Any, ...]] = set()
 
 
-def expected_precision(model_id: str) -> str:
+def expected_precision(model_id: str, backend: str | None = None) -> str:
     if model_id == "parakeet-tdt-0.6b-v3":
         return "FP32"
     if model_id == "qwen3-asr-1.7b":
         return "F16"
+    if model_id == "large-v3":
+        return {"cuda": "float16", "vulkan": "F16"}.get(backend, "int8")
     return "model-default"
 
 
 def _runtime_version(model_id: str, backend: str) -> str:
-    if model_id == "small":
+    if model_id in {"small", "large-v3"}:
         from services.runtime_devices import find_whisper_cpp_executable
-        executable = find_whisper_cpp_executable()
-        if not executable:
-            return "whisper.cpp:missing"
-        path = Path(executable)
+        if backend == "vulkan":
+            executable = find_whisper_cpp_executable()
+            if not executable:
+                return "whisper.cpp:missing"
+            path = Path(executable)
+            try:
+                stat = path.stat()
+                return f"whisper.cpp:{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+            except OSError:
+                return f"whisper.cpp:{path.resolve()}:unavailable"
         try:
-            stat = path.stat()
-            return f"whisper.cpp:{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
-        except OSError:
-            return f"whisper.cpp:{path.resolve()}:unavailable"
+            import faster_whisper
+            return f"faster-whisper:{getattr(faster_whisper, '__version__', 'unknown')}"
+        except ImportError:
+            return "faster-whisper:missing"
     kind = "native" if model_id == "qwen3-asr-1.7b" else "parakeet"
     versions = asr_resources.PACKAGE_VERSIONS.get((kind, backend), {})
     return json.dumps(versions, sort_keys=True, separators=(",", ":"))
@@ -45,9 +57,9 @@ def _runtime_version(model_id: str, backend: str) -> str:
 
 def resource_fingerprint(model_id: str, backend: str, diarization: bool = False) -> str:
     """Return manifest/runtime fingerprint without hashing large local weights."""
-    if model_id == "small":
+    if model_id in {"small", "large-v3"} and backend == "vulkan":
         from services.whisper_cpp import MODEL_CACHE, model_filename
-        filename = model_filename("small")
+        filename = model_filename(model_id)
         artifacts = []
         try:
             for path in MODEL_CACHE.rglob(filename):
@@ -61,6 +73,22 @@ def resource_fingerprint(model_id: str, backend: str, diarization: bool = False)
         from hashlib import sha256
         raw = json.dumps({"model": model_id, "backend": backend, "artifacts": sorted(artifacts)}, sort_keys=True)
         return sha256(raw.encode("utf-8")).hexdigest()
+    if model_id in {"small", "large-v3"}:
+        from services.model_management import get_model_status
+        from hashlib import sha256
+        try:
+            location = get_model_status(model_id).get("cacheLocation")
+            root = Path(location) if location else None
+            artifacts = []
+            if root and root.exists():
+                for path in root.rglob("*"):
+                    if path.is_file():
+                        stat = path.stat()
+                        artifacts.append((str(path.resolve()), stat.st_size, stat.st_mtime_ns))
+            raw = json.dumps({"model": model_id, "backend": backend, "artifacts": sorted(artifacts)}, sort_keys=True)
+            return sha256(raw.encode("utf-8")).hexdigest()
+        except OSError:
+            pass
     return asr_resources._fingerprint(model_id, backend, diarization)
 
 
@@ -86,7 +114,7 @@ def _identity(model_id: str, candidate: dict[str, Any], fingerprint: str | None 
         "driverVersion": candidate.get("driverVersion"),
         "runtimeVersion": _runtime_version(model_id, backend),
         "resourceFingerprint": fingerprint or resource_fingerprint(model_id, backend),
-        "precision": expected_precision(model_id),
+        "precision": expected_precision(model_id, backend),
     }
 
 
@@ -126,17 +154,25 @@ def _matching_record(model_id: str, candidate: dict[str, Any]) -> dict[str, Any]
 
 
 def _resources_ready(model_id: str, backend: str) -> tuple[bool, str | None]:
-    if model_id == "small":
+    if model_id in {"small", "large-v3"}:
         from services.model_management import get_model_status
-        from services.runtime_devices import find_whisper_cpp_executable
-        if not find_whisper_cpp_executable():
-            return False, "Vulkan Whisper runtime is missing."
-        try:
-            status = get_model_status("small")
-        except Exception as exc:
-            return False, f"Whisper model readiness could not be checked: {exc}"
-        if status.get("status") != "downloaded":
-            return False, "Whisper small model is not prepared yet."
+        if backend == "vulkan":
+            from services.prepare_models import _vulkan_cached
+            from services.runtime_devices import find_whisper_cpp_executable
+            from services.whisper_cpp import cached_tokenizer_path
+            if not find_whisper_cpp_executable():
+                return False, "Vulkan Whisper runtime is missing."
+            if not _vulkan_cached(model_id):
+                return False, f"Whisper {model_id} Vulkan model is not prepared yet."
+            if not cached_tokenizer_path(model_id):
+                return False, f"Whisper {model_id} tokenizer for dictionary hints is not prepared yet."
+        else:
+            try:
+                status = get_model_status(model_id)
+            except Exception as exc:
+                return False, f"Whisper model readiness could not be checked: {exc}"
+            if status.get("status") != "downloaded":
+                return False, f"Whisper {model_id} model is not prepared yet."
         return True, None
     try:
         status = asr_resources.asr_resource_status(model_id, backend)
@@ -268,6 +304,66 @@ def gpu_capability(model_id: str, candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def asr_benchmark_identity(model_id: str, candidate: dict[str, Any], *, word_timestamps: bool = False) -> dict[str, Any]:
+    """Identity for paired Whisper speed/quality evidence; OCR receipts remain separate."""
+    backend = str(candidate.get("backend") or "")
+    precision = expected_precision(model_id, backend)
+    return {
+        "benchmarkVersion": ASR_BENCHMARK_VERSION,
+        "model": model_id,
+        "backend": backend,
+        "gpuIdentity": str(candidate.get("identity") or candidate.get("name") or "unknown"),
+        "deviceIndex": int(candidate.get("deviceIndex") if candidate.get("deviceIndex") is not None else -1),
+        "driverVersion": candidate.get("driverVersion"),
+        "runtimeVersion": _runtime_version(model_id, backend),
+        "resourceFingerprint": resource_fingerprint(model_id, backend),
+        "computePrecision": precision,
+        "wordTimestamps": bool(word_timestamps),
+        "hintAdapterVersion": 1,
+    }
+
+
+def _qualified_asr_receipt(identity: dict[str, Any], receipt_path: Path = ASR_BENCHMARK_RECEIPT) -> dict[str, Any] | None:
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    assessment = receipt.get("assessment") if isinstance(receipt.get("assessment"), dict) else {}
+    try:
+        speedup = float(assessment.get("speedup", 0))
+        agreement = float(assessment.get("qualityAgreement", 0))
+        mismatches = int(assessment.get("numericIdMismatches", 1))
+    except (TypeError, ValueError):
+        return None
+    if (receipt.get("verified") is not True or receipt.get("identity") != identity
+            or not math.isfinite(speedup) or not math.isfinite(agreement)
+            or speedup < 1.5 or agreement < .95 or mismatches != 0):
+        return None
+    if (assessment.get("actualGpuVerified") is not True
+            or assessment.get("criticalIdsPresent") is not True
+            or assessment.get("gatesPassed") is not True
+            or assessment.get("timedRunsPerBackend") != 3
+            or assessment.get("warmupRunsPerBackend") != 1
+            or assessment.get("quickRun") is True):
+        return None
+    return receipt
+
+
+def auto_whisper_candidate(model_id: str, *, word_timestamps: bool = False) -> dict[str, Any] | None:
+    """Return GPU only when a current paired ASR receipt clears all automatic gates."""
+    if model_id != "large-v3":
+        return None
+    candidate = asr_gpu_candidate(model_id)
+    if not candidate.get("canPrepare") or candidate.get("backend") not in {"cuda", "vulkan"}:
+        return None
+    identity = asr_benchmark_identity(model_id, candidate, word_timestamps=word_timestamps)
+    receipt_path = ASR_BENCHMARK_WORDS_RECEIPT if word_timestamps else ASR_BENCHMARK_RECEIPT
+    if _qualified_asr_receipt(identity, receipt_path) is None:
+        return None
+    ready, _reason = _resources_ready(model_id, candidate["backend"])
+    return candidate if ready else None
+
+
 def profile_device_options(profiles: dict[str, tuple[str, str]], max_cpu_threads: int) -> dict[str, Any]:
     cpu_rows = {item["id"]: item for item in get_device_details()}
     rows = []
@@ -278,9 +374,18 @@ def profile_device_options(profiles: dict[str, tuple[str, str]], max_cpu_threads
                     "reason": None, "backend": "cpu", "state": "ready", "canPrepare": True},
             "gpu": gpu_capability(model_id, candidate),
         }
+        auto_candidate = auto_whisper_candidate(model_id)
+        devices["auto"] = {
+            "available": auto_candidate is not None,
+            "name": auto_candidate.get("name") if auto_candidate else "CPU",
+            "backend": auto_candidate.get("backend") if auto_candidate else "cpu",
+            "device": "gpu" if auto_candidate else "cpu",
+            "state": "verified" if auto_candidate else "unverified_cpu",
+            "reason": None if auto_candidate else "Автоматический режим использует CPU: сопоставимый замер GPU скорости и качества отсутствует.",
+        }
         rows.append({"id": profile_id, "label": label, "model": model_id,
                      "devices": devices,
-                     "defaultDevice": "gpu" if devices["gpu"]["available"] or devices["gpu"]["canPrepare"] else "cpu"})
+                     "defaultDevice": devices["auto"]["device"], "defaultExecutionMode": "auto"})
     default = next((row for row in rows if row["id"] == "balanced"), rows[0] if rows else None)
     top_devices = default["devices"] if default else {
         "cpu": {"available": True, "name": "CPU"},

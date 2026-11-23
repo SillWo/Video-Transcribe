@@ -64,7 +64,9 @@ def probe_media(source: str | Path) -> dict[str, Any]:
                     "sample_rate": stream.get("sample_rate"), "channels": stream.get("channels"),
                     "language": stream.get("tags", {}).get("language")}
         return {"duration": duration,
-                "video": [brief(s, i) for i, s in enumerate(streams) if s.get("codec_type") == "video"],
+                "video": [brief(s, i) for i, s in enumerate(streams)
+                          if s.get("codec_type") == "video"
+                          and not (s.get("disposition") or {}).get("attached_pic")],
                 "audio": [brief(s, i) for i, s in enumerate(streams) if s.get("codec_type") == "audio"]}
     except (OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError) as exc:
         return {"duration": None, "video": [], "audio": [], "error": str(exc)}
@@ -79,12 +81,20 @@ def _number(value: Any) -> float | None:
 
 
 def _decode_frame(source: str | Path, second: float, *, max_width: int | None = None,
-                  max_height: int = 1080) -> np.ndarray | None:
+                  max_height: int = 1080,
+                  video_stream_index: int | None = None) -> np.ndarray | None:
     ffmpeg = _exe("ffmpeg")
     if not ffmpeg:
         return None
+    video_stream = video_stream_index
+    if video_stream is None:
+        try:
+            videos = probe_media(source).get("video", [])
+            video_stream = videos[0].get("index") if videos else None
+        except Exception:
+            video_stream = None
     args = [ffmpeg, "-v", "error", "-ss", f"{max(0.0, second):.3f}", "-i", str(source),
-            "-map", "0:v:0", "-frames:v", "1"]
+            "-map", f"0:{video_stream}" if video_stream is not None else "0:v:0", "-frames:v", "1"]
     if max_width:
         args += ["-vf", (f"scale='min({int(max_width)},iw)':'min({int(max_height)},ih)':"
                           "force_original_aspect_ratio=decrease")]
@@ -98,7 +108,7 @@ def _decode_frame(source: str | Path, second: float, *, max_width: int | None = 
         return None
 
 
-def _iter_video_frames(source: str | Path, sample_seconds: float):
+def _iter_video_frames(source: str | Path, sample_seconds: float, stream_index: int | None = None):
     """Yield nearest native-size frames on a media-zero sampling grid.
 
     PyAV is imported only when this worker is consumed, keeping the public
@@ -127,7 +137,10 @@ def _iter_video_frames(source: str | Path, sample_seconds: float):
             return
 
         container = av.open(str(source))
-        stream = next((item for item in container.streams if item.type == "video"), None)
+        stream = next((item for item in container.streams if item.type == "video"
+                       and (stream_index is None or item.index == int(stream_index))), None)
+        if stream is None and stream_index is not None:
+            stream = next((item for item in container.streams if item.type == "video"), None)
         if stream is None:
             metadata.update({"decode_error": True, "error": "No video stream"})
             yield None, metadata
@@ -1151,11 +1164,16 @@ def _incremental_regions(image: np.ndarray, previous_regions: list[dict[str, Any
 def extract_screen(source: str | Path, output_dir: str | Path, *, sample_seconds: float = 1.0,
                    checkpoint_seconds: float = 30.0, progress: Progress | None = None,
                    cancel: Callable[[], bool] | None = None, device: str = "cpu",
-                   prefetch_frames: int = 0) -> dict[str, Any]:
+                   prefetch_frames: int = 0,
+                   video_stream_index: int | None = None,
+                   mode: str = "legacy_ocr") -> dict[str, Any]:
     """Sample a video in one decode pass, OCR selected states, and save event JPEGs."""
     prefetch_frames = int(prefetch_frames)
     if prefetch_frames not in (0, 2):
         raise ValueError("prefetch_frames must be 0 or 2")
+    if mode not in {"legacy_ocr", "frames_only"}:
+        raise ValueError("mode must be 'legacy_ocr' or 'frames_only'")
+    frames_only = mode == "frames_only"
     started_at = time.perf_counter()
     out = Path(output_dir)
     frames_dir = out / "frames"
@@ -1164,12 +1182,13 @@ def extract_screen(source: str | Path, output_dir: str | Path, *, sample_seconds
     checkpoint_seconds = max(sample_seconds, float(checkpoint_seconds))
     media = probe_media(source)
     limitations: list[str] = []
-    stats: dict[str, Any] = {"sampled_frames": 0, "ocr_frames": 0, "duration": media.get("duration"),
-                             "decode_seconds": 0.0, "ocr_seconds": 0.0, "decoder": "pyav-native",
-                             "duplicate_candidates": 0, "full_ocr_frames": 0,
-                             "roi_ocr_frames": 0, "roi_count": 0, "skipped_ocr_candidates": 0,
-                             "ocr_equivalent_events": 0, "anchored_rec_frames": 0,
-                             "anchored_rec_regions": 0}
+    stats: dict[str, Any] = {"sampled_frames": 0, "duration": media.get("duration"),
+                             "decode_seconds": 0.0, "decoder": "pyav-native"}
+    if not frames_only:
+        stats.update({"ocr_frames": 0, "ocr_seconds": 0.0, "duplicate_candidates": 0,
+                      "full_ocr_frames": 0, "roi_ocr_frames": 0, "roi_count": 0,
+                      "skipped_ocr_candidates": 0, "ocr_equivalent_events": 0,
+                      "anchored_rec_frames": 0, "anchored_rec_regions": 0})
     if not media.get("video") or not _exe("ffprobe"):
         return {"events": [], "status": "unavailable", "limitations": ["ffprobe or a video stream is unavailable."], "stats": stats}
     duration = media.get("duration") or 0.0
@@ -1181,11 +1200,14 @@ def extract_screen(source: str | Path, output_dir: str | Path, *, sample_seconds
     ocr_failed = False
     cancelled = False
     decoder_started = time.perf_counter()
-    frames = _iter_video_frames(source, sample_seconds)
+    if video_stream_index is None and media.get("video"):
+        video_stream_index = media["video"][0].get("index")
+    frames = _iter_video_frames(source, sample_seconds, video_stream_index)
     if prefetch_frames == 2:
         frames = _PrefetchedFrames(frames, capacity=2)
     decode_info: dict[str, Any] = {}
     last_sample_time: float | None = None
+    encode_failed = False
     try:
         for second, image in frames:
             if second is None and isinstance(image, dict):
@@ -1200,18 +1222,21 @@ def extract_screen(source: str | Path, output_dir: str | Path, *, sample_seconds
             last_sample_time = second
             reason = "initial" if not events else None
             changed_rois: list[list[int]] = []
-            if (reason is None and last_full_ocr_time is not None
+            if (reason is None and not frames_only and last_full_ocr_time is not None
                     and second - last_full_ocr_time >= checkpoint_seconds):
                 reason = "checkpoint"
             elif reason is None and reference is not None:
                 changed_rois = _changed_rois(reference, image)
                 if changed_rois:
                     reason = "region_change"
+            if reason is None and frames_only and events \
+                    and second - float(events[-1]["start"]) >= checkpoint_seconds:
+                reason = "checkpoint"
             if reason:
                 regions = []
                 ocr_equivalent_to_previous = False
                 full_ocr_completed = False
-                if not ocr_unavailable:
+                if not frames_only and not ocr_unavailable:
                     try:
                         ocr_started = time.perf_counter()
                         if ocr is None:
@@ -1260,7 +1285,7 @@ def extract_screen(source: str | Path, output_dir: str | Path, *, sample_seconds
                         if "ocr_started" in locals():
                             stats["ocr_seconds"] += time.perf_counter() - ocr_started
                             del ocr_started
-                if (reason == "region_change" and events and
+                if (not frames_only and reason == "region_change" and events and
                         _same_screen_regions(regions, events[-1]["regions"], image.shape[1], image.shape[0])):
                     stats["duplicate_candidates"] += 1
                     stats["ocr_equivalent_events"] = stats.get("ocr_equivalent_events", 0) + 1
@@ -1273,17 +1298,26 @@ def extract_screen(source: str | Path, output_dir: str | Path, *, sample_seconds
                 ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 88])
                 if ok:
                     name = f"screen-{len(events)+1:04d}-{uuid.uuid4().hex[:8]}.jpg"
-                    (frames_dir / name).write_bytes(encoded.tobytes())
+                    try:
+                        (frames_dir / name).write_bytes(encoded.tobytes())
+                    except OSError:
+                        encode_failed = True
+                        break
                     event = {"id": f"screen-{len(events)+1:04d}", "start": round(second, 3),
                              "end": None, "frame": f"frames/{name}",
-                             "text": "\n".join(r["text"] for r in regions), "regions": regions,
-                             "tables": _regions_to_tables(regions), "reason": reason,
+                             "reason": reason,
                              "width": int(image.shape[1]), "height": int(image.shape[0]),
                              "sample_interval_seconds": sample_seconds}
+                    if not frames_only:
+                        event.update(text="\n".join(r["text"] for r in regions), regions=regions,
+                                     tables=_regions_to_tables(regions))
                     if ocr_equivalent_to_previous:
                         event["ocr_equivalent_to_previous"] = True
                     events.append(event)
                     reference = image
+                else:
+                    encode_failed = True
+                    break
             if progress:
                 progress({"stage": "screen", "time": round(second, 3), "duration": duration,
                           "sampled_frames": stats["sampled_frames"], "events": len(events)})
@@ -1294,8 +1328,30 @@ def extract_screen(source: str | Path, output_dir: str | Path, *, sample_seconds
     finally:
         if prefetch_frames == 2:
             frames.close()
-    stats["decode_seconds"] = round(max(0.0, time.perf_counter() - decoder_started - stats["ocr_seconds"]), 3)
-    sampled_coverage = max(0.0, (last_sample_time + sample_seconds) if last_sample_time is not None else 0.0)
+    if not events and not frames_only:
+        # PyAV/OCR may be unavailable while FFmpeg can still persist a decoded
+        # evidence frame from the already validated real video stream.
+        fallback = _decode_frame(source, 0.0, max_width=1920,
+                                 video_stream_index=video_stream_index)
+        if fallback is not None:
+            ok, encoded = cv2.imencode(".jpg", fallback, [cv2.IMWRITE_JPEG_QUALITY, 88])
+            if ok:
+                name = f"screen-0001-{uuid.uuid4().hex[:8]}.jpg"
+                (frames_dir / name).write_bytes(encoded.tobytes())
+                fallback_event = {"id": "screen-0001", "start": 0.0,
+                               "end": round(max(0.0, _number(decode_info.get("coverage_seconds")) or 0.0), 3),
+                               "frame": f"frames/{name}",
+                               "reason": "decoded_fallback", "width": int(fallback.shape[1]),
+                               "height": int(fallback.shape[0]),
+                               "sample_interval_seconds": sample_seconds}
+                if not frames_only:
+                    fallback_event.update(text="", regions=[], tables=[])
+                events.append(fallback_event)
+                stats["fallback_frames"] = 1
+    stats["decode_seconds"] = round(max(0.0, time.perf_counter() - decoder_started - stats.get("ocr_seconds", 0.0)), 3)
+    sampled_end = (last_sample_time if encode_failed else last_sample_time + sample_seconds) \
+        if last_sample_time is not None else 0.0
+    sampled_coverage = max(0.0, sampled_end)
     decoded_coverage = _number(decode_info.get("coverage_seconds"))
     coverage = decoded_coverage if decoded_coverage is not None else sampled_coverage
     coverage = min(duration, max(0.0, coverage)) if duration else max(0.0, coverage)
@@ -1313,9 +1369,11 @@ def extract_screen(source: str | Path, output_dir: str | Path, *, sample_seconds
     for i, event in enumerate(events):
         event["end"] = round(events[i+1]["start"] if i + 1 < len(events) else coverage, 3)
         event["time_uncertainty_seconds"] = sample_seconds
-    if any(event["tables"] for event in events):
+    if not frames_only and any(event.get("tables") for event in events):
         limitations.append("Tables, row links, and header candidates are inferred from geometry; overlays can make these associations ambiguous.")
     limitations.append(f"Frame timestamps are sampling points with about {sample_seconds:g} s uncertainty; visibility boundaries are approximate.")
+    if frames_only:
+        limitations.append("Screen events contain captured frames only; text recognition was not run.")
     if decode_info.get("timing_limitation"):
         limitations.append(str(decode_info["timing_limitation"]))
     if decode_info.get("sampling_gaps"):
@@ -1326,16 +1384,37 @@ def extract_screen(source: str | Path, output_dir: str | Path, *, sample_seconds
         limitations.append(f"Video decoding stopped with an error ({decode_info['error']}).")
     if cancelled:
         limitations.append("Extraction was cancelled before the source ended.")
+    if encode_failed:
+        limitations.append("A sampled frame could not be encoded or written as JPEG.")
     if not decode_complete:
         limitations.append(f"Decoded coverage ended at {coverage:.2f}s of {duration:.2f}s; the screen extraction is incomplete.")
-    if not events and not decode_info.get("decode_error") and not decode_info.get("decoder_unavailable"):
+    if frames_only and not events:
         status = "unavailable"
-    elif cancelled or not decode_complete or ocr_failed or stats["ocr_frames"] == 0:
+    elif not events and not decode_info.get("decode_error") and not decode_info.get("decoder_unavailable"):
+        status = "unavailable"
+    elif cancelled or not decode_complete or encode_failed or (not frames_only and (ocr_failed or stats["ocr_frames"] == 0)):
         status = "partial"
     else:
         status = "ready"
     stats["elapsed_seconds"] = round(time.perf_counter() - started_at, 3)
-    return {"events": events, "status": status, "limitations": limitations, "stats": stats}
+    result = {"events": events, "status": status, "limitations": limitations, "stats": stats}
+    if frames_only:
+        result.update(schema_version=2, mode="frames_only")
+    return result
+
+
+def extract_frames(source: str | Path, output_dir: str | Path, *, sample_seconds: float = 1.0,
+                   checkpoint_seconds: float = 30.0, progress: Progress | None = None,
+                   cancel: Callable[[], bool] | None = None,
+                   video_stream_index: int | None = None) -> dict[str, Any]:
+    """Production CPU-only frame extraction, separate from diagnostic OCR."""
+    result = extract_screen(source, output_dir, sample_seconds=sample_seconds,
+                            checkpoint_seconds=checkpoint_seconds, progress=progress,
+                            cancel=cancel, video_stream_index=video_stream_index,
+                            mode="frames_only")
+    result.pop("schema_version", None)
+    result.pop("mode", None)
+    return result
 
 
 def _safe_event_frame(meeting_dir: str | Path, event: dict[str, Any]) -> Path:

@@ -113,7 +113,8 @@ class MeetingConnector:
         params = StdioServerParameters(command=self.python, args=[str(script), "--settings", str(self.settings), "--project-root", str(self.project_root)])
         progress: dict[str, Any] = {"initialized": False, "tools_discovered": False,
                                     "get_frames_call": False, "actual_image_content_count": 0,
-                                    "jpeg_payloads_valid": False}
+                                    "jpeg_payloads_valid": False,
+                                    "conversion_tool_discovered": False}
         try:
             import anyio
             async def check() -> dict[str, Any]:
@@ -125,7 +126,11 @@ class MeetingConnector:
                             tools = await session.list_tools()
                             names = {tool.name for tool in tools.tools}
                             progress["tools_discovered"] = True
-                            required = {"get_archive_status", "find_meetings", "search_evidence", "read_timeline", "get_frames", "get_glossary", "get_source_status", "open_evidence"}
+                            progress["conversion_tool_discovered"] = "convert_media_file" in names and "get_media_conversion_status" in names
+                            required = {"get_archive_status", "find_meetings", "find_archive_items", "read_archive_item",
+                                        "search_archive", "search_evidence", "read_timeline", "get_frames",
+                                        "get_glossary", "get_source_status", "open_evidence",
+                                        "convert_media_file", "get_media_conversion_status"}
                             missing = sorted(required - names)
                             if missing:
                                 raise RuntimeError("MCP server is missing tools: " + ", ".join(missing))
@@ -162,7 +167,7 @@ class MeetingConnector:
                     "client_verified": False, **progress, "error": str(exc)}
         return {"server": SERVER_NAME, "registered": self._get()[0], "protocol_checked": True,
                 "client_verified": False, **checked,
-                "message": "The MCP Python SDK STDIO handshake, tool discovery, and image call were checked. This is not a real Codex-client verification."}
+                "message": "The MCP Python SDK STDIO handshake, tool discovery, and image call were checked. Conversion was discovered but not run. This is not a real Codex-client verification."}
 
 
 def register(project_root: str | Path | None = None, settings: str | Path | None = None) -> dict[str, Any]:

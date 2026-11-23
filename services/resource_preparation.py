@@ -98,10 +98,15 @@ def _download_punctuation(progress: Progress | None) -> None:
 def ensure_selected_resources(settings: dict, on_progress: Progress | None = None) -> None:
     """Validate and fetch only the model and optional punctuation chosen for a job."""
     model_id = settings["model"]
+    if model_id == "parakeet-tdt-0.6b-v3":
+        raise ResourcePreparationError(
+            "Модель Parakeet больше не доступна для новых задач. Выберите активный профиль распознавания.",
+            code="retired_model",
+        )
     device = settings["device"]
-    from services.asr_resources import ensure_asr_resources, is_new_asr
+    from services.asr_resources import ensure_asr_resources, is_asr_adapter
 
-    if is_new_asr(model_id):
+    if is_asr_adapter(model_id):
         backend = device
         if model_id == "parakeet-tdt-0.6b-v3" and device == "vulkan":
             backend = "directml"
@@ -113,7 +118,7 @@ def ensure_selected_resources(settings: dict, on_progress: Progress | None = Non
             _download_punctuation(on_progress)
         _emit(on_progress, message="Подготовка завершена")
         return
-    if model_id == "small" and device != "cpu":
+    if model_id in {"small", "large-v3"} and device != "cpu":
         from services.asr_resources import ensure_validation_audio
         ensure_validation_audio(on_progress)
     if device == "vulkan":
@@ -140,6 +145,14 @@ def ensure_selected_resources(settings: dict, on_progress: Progress | None = Non
                 raise ResourcePreparationError(
                     "Не удалось загрузить модель. Проверьте подключение к интернету и повторите попытку."
                 ) from exc
+        try:
+            from services.whisper_cpp import resolve_tokenizer_path
+            resolve_tokenizer_path(model_id, progress=lambda message: _emit(on_progress, message=message))
+        except TaskFailure as exc:
+            raise ResourcePreparationError(
+                "Не удалось подготовить токенизатор Whisper для словаря. Проверьте подключение и повторите попытку.",
+                code="dictionary_tokenizer_unavailable",
+            ) from exc
     else:
         try:
             ready = get_model_status(model_id).get("status") == "downloaded"

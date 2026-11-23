@@ -20,6 +20,38 @@ def test_unicode_import_dedup_and_stable_id(tmp_path):
     assert first["sha256"] == hashlib.sha256(b"audio bytes").hexdigest()
 
 
+def test_relative_archive_root_import_is_normalized(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "relative.wav"
+    source.write_bytes(b"relative audio")
+    archive = MeetingArchive(Path("relative-archive"))
+
+    meeting = archive.import_file(source)
+
+    assert Path(meeting["original_rel"]).is_relative_to(Path("originals"))
+    assert archive.original_path(meeting["meeting_id"]).read_bytes() == b"relative audio"
+
+
+def test_failed_artifact_initialization_does_not_publish_meeting(tmp_path, monkeypatch):
+    source = tmp_path / "recording.wav"
+    source.write_bytes(b"publish atomically")
+    archive = MeetingArchive(tmp_path / "archive")
+    original_write = __import__("services.meeting_archive", fromlist=["_json_write"])._json_write
+
+    def fail_glossary(path, value):
+        if Path(path).name == "glossary.json":
+            raise OSError("simulated artifact failure")
+        return original_write(path, value)
+
+    monkeypatch.setattr("services.meeting_archive._json_write", fail_glossary)
+    with pytest.raises(OSError, match="simulated artifact failure"):
+        archive.import_file(source)
+
+    assert archive.list_meetings() == []
+    assert list((tmp_path / "archive" / "meetings").glob("*")) == []
+    assert list((tmp_path / "archive" / "originals").glob("*")) == []
+
+
 def test_raw_rerun_preserves_edits_and_speaker_confirmation(tmp_path):
     source = tmp_path / "recording.wav"
     source.write_bytes(b"recording")

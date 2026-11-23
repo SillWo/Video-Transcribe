@@ -274,6 +274,11 @@ def _verify_snapshot_contents(snapshot: Path, *, snapshot_id: str | None = None)
     fingerprint = _entries_fingerprint(manifest["files"])
     if manifest.get("content_hash") != fingerprint:
         raise BackupError("manifest_hash_mismatch", "Контрольная сумма манифеста не совпадает.")
+    dictionary = manifest.get("personal_dictionary")
+    if dictionary is not None:
+        digest = hashlib.sha256(_json_bytes(dictionary)).hexdigest()
+        if digest != manifest.get("personal_dictionary_sha256"):
+            raise BackupError("dictionary_hash_mismatch", "Снимок персонального словаря повреждён.")
     return {"manifest": manifest, "content_hash": fingerprint,
             "file_count": len(expected), "total_bytes": sum(int(row["size"]) for row in expected.values())}
 
@@ -306,6 +311,7 @@ def create_backup(archive_root: str | Path, backup_root: str | Path, *,
     if final.exists():
         raise BackupError("snapshot_collision", "Не удалось зарезервировать уникальный снимок.")
     staging.mkdir(parents=True, exist_ok=False)
+    (staging / "data").mkdir(parents=True, exist_ok=True)
     entries = []
     total_bytes = 0
     reused_files = 0
@@ -353,9 +359,13 @@ def create_backup(archive_root: str | Path, backup_root: str | Path, *,
                           bytes_completed=bytes_completed, bytes_total=total_bytes,
                           reused_files=reused_files, copied_files=copied_files)
         content_hash = _entries_fingerprint(entries)
+        from services.personal_dictionary import get_dictionary
+        dictionary_snapshot = get_dictionary().export_state()
         manifest = {"schema": SCHEMA, "snapshot_id": snapshot_id,
                     "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    "files": entries, "content_hash": content_hash}
+                    "files": entries, "content_hash": content_hash,
+                    "personal_dictionary": dictionary_snapshot,
+                    "personal_dictionary_sha256": hashlib.sha256(_json_bytes(dictionary_snapshot)).hexdigest()}
         _atomic_json(staging / "manifest.json", manifest)
         checked = _verify_snapshot_contents(staging, snapshot_id=snapshot_id)
         if checked["content_hash"] != content_hash:
@@ -490,7 +500,13 @@ def restore_backup(archive_root: str | Path, backup_root: str | Path, snapshot_i
         raise BackupError("backup_verification_failed", "Снимок не прошёл проверку; восстановление остановлено.")
     snapshot, _ = _snapshot_paths(backup, snapshot_id)
     result = _copy_snapshot_to(snapshot, destination, checked["manifest"], progress)
-    return {"snapshot_id": snapshot_id, "target": str(destination), **result}
+    dictionary_merge = None
+    dictionary_snapshot = checked["manifest"].get("personal_dictionary")
+    if dictionary_snapshot is not None:
+        from services.personal_dictionary import get_dictionary
+        dictionary_merge = get_dictionary().merge_snapshot(dictionary_snapshot)
+    return {"snapshot_id": snapshot_id, "target": str(destination),
+            "dictionary_merge": dictionary_merge, **result}
 
 
 def restore_test(archive_root: str | Path, backup_root: str | Path, snapshot_id: str,

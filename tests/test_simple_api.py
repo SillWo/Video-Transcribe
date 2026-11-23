@@ -114,6 +114,8 @@ class SimpleApiTests(unittest.TestCase):
     def setUp(self):
         web_api.reset_simple_queue_for_tests()
         self.temp = tempfile.TemporaryDirectory()
+        self.url_media = Path(self.temp.name) / "downloaded-source.wav"
+        self.url_media.write_bytes(b"fixture media for URL jobs")
         self.previous_store = web_api.history_store
         self.previous_cached_store = web_api._history_store
         self.previous_runtime_dir = os.environ.get("VT_SIMPLE_RUNTIME_DIR")
@@ -147,6 +149,23 @@ class SimpleApiTests(unittest.TestCase):
                 "device": "cpu", "cpuThreads": 2, "restorePunctuation": False}
         data.update(changes)
         return data
+
+    @contextlib.contextmanager
+    def mock_url_media(self, *, video=False, audio=True, source=None):
+        """Keep URL worker tests local while exercising the normal media classifier."""
+        source = Path(source or self.url_media).resolve()
+        media = {
+            "isVideo": video,
+            "hasAudio": audio,
+            "video": [{"index": 0}] if video else [],
+            "audio": [{"index": 1 if video else 0}] if audio else [],
+            "streams": [],
+            "decodedVideoStreams": [{"index": 0}] if video else [],
+            "decodedAudioStreams": [{"index": 1 if video else 0}] if audio else [],
+        }
+        with (patch.object(web_api, "_download_simple_media", return_value=str(source)),
+              patch("services.manual_video.probe_local_media", return_value=media)):
+            yield source
 
     def test_picker_cancellation_and_canonical_path(self):
         with patch.object(web_api.native_file_picker, "pick_file", return_value=None):
@@ -259,9 +278,182 @@ class SimpleApiTests(unittest.TestCase):
         self.assertNotIn(b"transcript text", web_api.history_store.db_path.read_bytes())
         self.assertEqual(self.client.delete(f"/api/simple/history/{body['id']}").status_code, 409)
 
+    def test_new_job_publishes_only_under_isolated_archive_root(self):
+        from services.archive_catalog import read_record
+
+        isolated_root = Path(os.environ["VT_MEETING_ROOT"]).resolve()
+        project_root = Path(self.temp.name) / "project-root"
+        project_archive = project_root / ".runtime" / "meetings"
+        with patch.object(web_api, "APP_ROOT", project_root), \
+             patch.object(web_api.simple_profiles, "resolve", return_value=("large-v3-turbo", "cpu")), \
+             patch.object(web_api, "run_job", return_value=None):
+            response = self.client.post("/api/simple/jobs", json=self.payload())
+
+        self.assertEqual(response.status_code, 202, response.text)
+        job_id = response.json()["id"]
+        self.assertEqual(Path(response.json()["archiveRoot"]).resolve(), isolated_root)
+        self.assertIsNone(read_record(isolated_root, job_id))
+        self.assertIsNone(read_record(project_archive, job_id))
+        self.assertEqual(web_api.history_store.get(job_id)["archivePublication"], "pending")
+
+    def test_url_download_resume_reuses_the_persisted_local_media(self):
+        from services.job_processes import JobProcessController
+
+        body = self._create_controlled_job()
+        target = web_api.history_store.job_dir(body["id"]) / "download" / "source.mp4"
+
+        class DownloadProcess:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"downloaded media")
+                return str(target).encode("utf-8"), b""
+
+            def poll(self):
+                return self.returncode
+
+        process = DownloadProcess()
+        with patch.object(web_api.subprocess, "Popen", return_value=process) as popen:
+            first = web_api._download_simple_media(
+                body["id"], "https://example.org/watch/123", JobProcessController())
+            second = web_api._download_simple_media(
+                body["id"], "https://example.org/watch/123", JobProcessController())
+
+        self.assertEqual(first, str(target.resolve()))
+        self.assertEqual(second, first)
+        self.assertEqual(popen.call_count, 1)
+        record = web_api.history_store.get(body["id"])
+        self.assertEqual(record["settings"]["_resolvedSource"], first)
+        self.assertEqual(record["downloadedSource"], first)
+
+    def test_legacy_meeting_job_preview_uses_its_meeting_root_without_archive_root(self):
+        from services.meeting_archive import MeetingArchive
+
+        archive = MeetingArchive(Path(os.environ["VT_MEETING_ROOT"]).resolve())
+        source = Path(self.temp.name) / "legacy-meeting.wav"
+        source.write_bytes(b"legacy meeting source")
+        meeting = archive.import_file(source)
+        archive.write_transcript(meeting["meeting_id"], [
+            {"id": "segment-1", "start": 0, "end": 1, "text": "archive corrected text"}
+        ], raw_text="old raw text")
+        archive.edit_segment(meeting["meeting_id"], "segment-1", "current edited text")
+
+        text, error = web_api._meeting_effective_text({
+            "meetingId": meeting["meeting_id"],
+            "meetingRoot": str(archive.root),
+            # Historical linked jobs have no archiveRoot field.
+        })
+
+        self.assertIsNone(error)
+        self.assertEqual(text, "current edited text")
+
+    def test_manual_video_is_linked_to_job_bound_meeting_before_asr(self):
+        from services.archive_catalog import read_record
+        from services.job_processes import JobProcessController
+        from services.meeting_archive import MeetingArchive
+
+        job_id = "9" * 32
+        media = Path(self.temp.name) / "manual-video.mp4"
+        media.write_bytes(b"video with audio")
+        metadata, settings = web_api._simple_metadata(
+            job_id, str(media), "file", "balanced", "cpu", 2, False)
+        web_api.history_store.create(metadata)
+        with web_api.jobs_lock:
+            web_api.jobs[job_id] = JobState(id=job_id, settings=settings)
+
+        with patch("services.manual_video.probe_local_media", return_value={
+                "isVideo": True, "hasAudio": True, "video": [{"index": 0}],
+                "audio": [{"index": 1}], "streams": [],
+                "decodedVideoStreams": [{"index": 0}], "decodedAudioStreams": [{"index": 1}]}):
+            managed_source, has_audio = web_api._classify_manual_file(
+                job_id, str(media), JobProcessController())
+
+        record = web_api.history_store.get(job_id)
+        archive = MeetingArchive(record["meetingRoot"], read_only=True)
+        self.assertTrue(has_audio)
+        self.assertTrue(Path(managed_source).is_file())
+        self.assertEqual(record["mediaClassification"], "video")
+        self.assertEqual(record["meetingRoot"], record["archiveRoot"])
+        self.assertEqual(record["meetingStages"], ["speech", "screen", "audio", "index"])
+        self.assertTrue(record["settings"]["useTimestamps"])
+        self.assertIsNone(read_record(record["archiveRoot"], job_id))
+        provisional = archive.get_meeting(record["meetingId"])
+        self.assertTrue(provisional["provisional"])
+        self.assertEqual(provisional["archivePublication"], "pending")
+        self.assertEqual(archive.list_meetings(), [])
+
+    def test_manual_file_without_audio_or_real_video_fails_classification(self):
+        from services.job_processes import JobProcessController
+        from services.task_errors import TaskFailure
+
+        job_id = "a" * 32
+        media = Path(self.temp.name) / "unsupported.bin"
+        media.write_bytes(b"no media streams")
+        metadata, settings = web_api._simple_metadata(
+            job_id, str(media), "file", "balanced", "cpu", 2, False)
+        web_api.history_store.create(metadata)
+        with web_api.jobs_lock:
+            web_api.jobs[job_id] = JobState(id=job_id, settings=settings)
+
+        with patch("services.manual_video.probe_local_media", side_effect=TaskFailure(
+                "probe failed", "media_probe_failed", stage="source")):
+            with self.assertRaises(TaskFailure) as exc:
+                web_api._classify_manual_file(job_id, str(media), JobProcessController())
+
+        self.assertEqual(exc.exception.code, "media_probe_failed")
+        self.assertEqual(web_api.history_store.get(job_id)["mediaClassification"], "pending")
+
+    def test_url_video_is_provisional_before_asr_and_published_after_completion(self):
+        from services.archive_catalog import read_record
+        from services.meeting_archive import MeetingArchive
+
+        media = Path(self.temp.name) / "downloaded-video.mp4"
+        media.write_bytes(b"local downloaded video fixture")
+        with (patch.object(web_api.simple_profiles, "resolve", return_value=("small", "cpu")),
+              patch.object(web_api, "run_job", return_value=None)):
+            body = self.client.post("/api/simple/jobs", json=self.payload()).json()
+
+        events = [
+            {"type": "result", "stage": "result", "result": {
+                "text": "video speech transcript", "output_path": "unused.txt", "output_format": "txt"}},
+            {"type": "complete", "results": []},
+        ]
+        asr_lines = [web_api.JSON_EVENT_PREFIX + json.dumps(event) + "\n" for event in events]
+        observed_pending = []
+
+        def process_factory(command, **_kwargs):
+            if "services.resource_preparation" in command:
+                record = web_api.history_store.get(body["id"])
+                self.assertEqual(record["mediaClassification"], "video")
+                self.assertEqual(record["archivePublication"], "pending")
+                archive = MeetingArchive(record["meetingRoot"], read_only=True)
+                meeting = archive.get_meeting(record["meetingId"])
+                self.assertTrue(meeting["provisional"])
+                self.assertEqual(archive.list_meetings(), [])
+                self.assertIsNone(read_record(record["archiveRoot"], body["id"]))
+                observed_pending.append(True)
+                return _FakeProcess()
+            return _FakeProcess(asr_lines)
+
+        with (self.mock_url_media(video=True, source=media),
+              patch.object(web_api, "JobProcessController", _FakeController),
+              patch.object(web_api, "_run_meeting_post_stages", return_value=None),
+              patch.object(web_api.subprocess, "Popen", side_effect=process_factory)):
+            web_api.run_job(body["id"], body["source"])
+
+        record = web_api.history_store.get(body["id"])
+        archive = MeetingArchive(record["meetingRoot"], read_only=True)
+        meeting = archive.get_meeting(record["meetingId"])
+        self.assertEqual(observed_pending, [True])
+        self.assertEqual(record["status"], "completed")
+        self.assertEqual(record["archivePublication"], "published")
+        self.assertFalse(meeting["provisional"])
+        self.assertEqual(len(archive.list_meetings()), 1)
+
     def test_start_remaps_queued_cpu_and_gpu_jobs_from_profile_and_persists_effective_model(self):
         from services.runtime_devices import asr_gpu_candidate
-        for requested, expected_backend in (("cpu", "cpu"), ("gpu", "directml")):
+        for requested, expected_backend in (("cpu", "cpu"), ("gpu", "vulkan")):
             with self.subTest(device=requested):
                 job_id = ("a" if requested == "cpu" else "b") * 32
                 metadata, settings = web_api._simple_metadata(
@@ -273,19 +465,19 @@ class SimpleApiTests(unittest.TestCase):
                 web_api.history_store.create(metadata)
                 job = JobState(id=job_id, settings=settings)
                 web_api.jobs[job_id] = job
-                candidate = {"canPrepare": True, "backend": "directml", "deviceIndex": 5,
+                candidate = {"canPrepare": True, "backend": "vulkan", "deviceIndex": 5,
                              "name": "AMD Radeon", "identity": "dxgi-luid", "driverVersion": "1"}
                 patcher = patch("services.runtime_devices.asr_gpu_candidate", return_value=candidate)
                 with patcher:
                     selected = web_api._resolve_simple_execution(job_id, job)
 
-                self.assertEqual(job.settings["model"], "parakeet-tdt-0.6b-v3")
+                self.assertEqual(job.settings["model"], "large-v3")
                 self.assertEqual(job.settings["device"], expected_backend)
                 self.assertEqual(job.settings["_gpuIndex"], 5 if requested == "gpu" else None)
                 self.assertEqual(selected is not None, requested == "gpu")
                 saved = web_api.history_store.get(job_id)
-                self.assertEqual(saved["model"], "parakeet-tdt-0.6b-v3")
-                self.assertEqual(saved["effectiveModel"], "parakeet-tdt-0.6b-v3")
+                self.assertEqual(saved["model"], "large-v3")
+                self.assertEqual(saved["effectiveModel"], "large-v3")
                 self.assertEqual(saved["effectiveBackend"], expected_backend)
 
     def test_finished_legacy_history_keeps_its_original_model(self):
@@ -302,6 +494,175 @@ class SimpleApiTests(unittest.TestCase):
 
         self.assertEqual(shape["model"], "large-v3")
         self.assertEqual(web_api.history_store.get(job_id)["model"], "large-v3")
+
+    def test_dictionary_snapshot_is_immutable_for_job_and_fresh_for_retry(self):
+        first_id, retry_id = "1" * 32, "2" * 32
+        snapshots = iter([{"version": 4, "terms": ["Northstar-17"]},
+                          {"version": 5, "terms": ["Northstar-18"]}])
+        with patch("services.personal_dictionary.get_dictionary_snapshot", side_effect=lambda: next(snapshots)) as take:
+            for job_id in (first_id, retry_id):
+                metadata, settings = web_api._simple_metadata(job_id, "C:/source.wav", "file",
+                                                               "balanced", "cpu", 4, False)
+                web_api.history_store.create(metadata)
+                web_api.jobs[job_id] = JobState(id=job_id, settings=settings)
+            first = web_api._capture_dictionary_snapshot(first_id)
+            self.assertEqual(web_api._capture_dictionary_snapshot(first_id), first)
+            retry = web_api._capture_dictionary_snapshot(retry_id)
+
+        self.assertEqual(first, {"version": 4, "terms": ["Northstar-17"]})
+        self.assertEqual(retry, {"version": 5, "terms": ["Northstar-18"]})
+        self.assertEqual(take.call_count, 2)
+        self.assertEqual(web_api.history_store.get(first_id)["settings"]["dictionarySnapshot"], first)
+        self.assertEqual(web_api.history_store.get(retry_id)["settings"]["dictionarySnapshot"], retry)
+
+    def test_first_speech_snapshot_migrates_legacy_terms_and_retry_gets_new_version(self):
+        from services.meeting_archive import MeetingArchive
+        from services.personal_dictionary import get_dictionary
+
+        archive_root = Path(os.environ["VT_MEETING_ROOT"]).resolve()
+        media = Path(self.temp.name) / "legacy-source.mp4"
+        media.write_bytes(b"test source")
+        archive = MeetingArchive(archive_root)
+        meeting = archive.import_file(media)
+        archive.add_glossary_entry(meeting["meeting_id"], "LegacyPlatform", "Imported at speech start")
+
+        first_id, retry_id = "6" * 32, "7" * 32
+        for job_id in (first_id, retry_id):
+            metadata, settings = web_api._simple_metadata(
+                job_id, "C:/source.wav", "file", "balanced", "cpu", 4, False)
+            web_api.history_store.create(metadata)
+            web_api.jobs[job_id] = JobState(id=job_id, settings=settings)
+
+        first = web_api._capture_dictionary_snapshot(first_id)
+        self.assertIn("LegacyPlatform", first["terms"])
+        self.assertEqual(first["version"], 1)
+
+        get_dictionary().add("NewPlatform")
+        same_job = web_api._capture_dictionary_snapshot(first_id)
+        retry = web_api._capture_dictionary_snapshot(retry_id)
+
+        self.assertEqual(same_job, first)
+        self.assertNotIn("NewPlatform", same_job["terms"])
+        self.assertIn("LegacyPlatform", retry["terms"])
+        self.assertIn("NewPlatform", retry["terms"])
+        self.assertGreater(retry["version"], first["version"])
+
+    def test_dictionary_snapshot_cli_argument_is_a_single_literal_path(self):
+        path = str(Path(self.temp.name) / "dictionary & snapshot.json")
+        job = JobState(id="d" * 32, settings={
+            "_simple": True, "_dictionaryFile": path, "_outputDir": str(Path(self.temp.name) / "out"),
+            "language": "auto", "model": "large-v3", "device": "cpu", "outputFormat": "txt",
+            "nproc": 4, "saveAudio": False, "useTimestamps": False,
+        })
+        command = web_api.build_command(job, "C:/audio.wav")
+        dictionary_index = command.index("--dictionary-file")
+        self.assertEqual(command[dictionary_index + 1], path)
+        self.assertEqual(command.count(path), 1)
+
+    def test_auto_execution_uses_cpu_without_receipt_and_the_qualified_gpu_with_receipt(self):
+        gpu = {"canPrepare": True, "backend": "vulkan", "deviceIndex": 2,
+               "name": "Radeon", "identity": "adapter", "driverVersion": "driver"}
+        for job_id, selected, expected_backend, expected_status in (
+                ("3" * 32, None, "cpu", "cpu_unverified"),
+                ("4" * 32, gpu, "vulkan", "verified_gpu")):
+            metadata, settings = web_api._simple_metadata(job_id, "C:/source.wav", "file",
+                                                           "balanced", "cpu", 4, False,
+                                                           execution_mode="auto")
+            web_api.history_store.create(metadata)
+            job = JobState(id=job_id, settings=settings)
+            web_api.jobs[job_id] = job
+            with patch.object(web_api.asr_capabilities, "auto_whisper_candidate", return_value=selected), \
+                 patch("services.runtime_devices.asr_gpu_candidate", return_value=gpu) as discover:
+                web_api._resolve_simple_execution(job_id, job)
+            self.assertEqual(job.settings["device"], expected_backend)
+            self.assertEqual(job.settings["_autoAsrStatus"], expected_status)
+            self.assertEqual(discover.call_count, 0)
+
+    def test_auto_receipt_mode_tracks_diarization_word_timestamps_not_output_timestamps(self):
+        observed_modes = []
+        for job_id, use_timestamps, diarization_enabled in (
+                ("a" * 32, False, True),   # ordinary output, word-level diarization
+                ("b" * 32, True, False)):  # meeting-style output timestamps, no diarization
+            metadata, settings = web_api._simple_metadata(
+                job_id, "C:/source.wav", "file", "balanced", "cpu", 4, False,
+                diarization_enabled=diarization_enabled, execution_mode="auto")
+            settings["useTimestamps"] = use_timestamps
+            web_api.history_store.create(metadata)
+            job = JobState(id=job_id, settings=settings)
+            web_api.jobs[job_id] = job
+
+            def inspect_mode(_model, *, word_timestamps):
+                observed_modes.append(word_timestamps)
+                return None
+
+            with patch.object(web_api.asr_capabilities, "auto_whisper_candidate",
+                              side_effect=inspect_mode):
+                web_api._resolve_simple_execution(job_id, job)
+        self.assertEqual(observed_modes, [True, False])
+
+    def test_hydration_restores_archive_root_execution_mode_and_dictionary_snapshot(self):
+        job_id = "5" * 32
+        metadata, _settings = web_api._simple_metadata(job_id, "C:/source.wav", "file",
+                                                       "balanced", "cpu", 4, False,
+                                                       execution_mode="auto")
+        metadata["settings"]["dictionarySnapshot"] = {"version": 8, "terms": ["Project-X9"]}
+        web_api.history_store.create(metadata)
+        restored = web_api._hydrate_simple_job(web_api.history_store.get(job_id))
+        self.assertEqual(restored.settings["_archiveRoot"], metadata["archiveRoot"])
+        self.assertEqual(restored.settings["_executionMode"], "auto")
+        self.assertEqual(restored.settings["dictionarySnapshot"], {"version": 8, "terms": ["Project-X9"]})
+
+    def test_simple_shape_exposes_record_bound_archive_root_as_string(self):
+        job_id = "9" * 32
+        metadata, _settings = web_api._simple_metadata(
+            job_id, "C:/source.wav", "file", "balanced", "cpu", 4, False)
+        archive_root = str(Path(self.temp.name) / "restored-archive")
+        metadata["archiveRoot"] = archive_root
+        web_api.history_store.create(metadata)
+
+        shaped = self.client.get(f"/api/simple/jobs/{job_id}").json()
+
+        self.assertIsInstance(shaped["archiveRoot"], str)
+        self.assertEqual(shaped["archiveRoot"], archive_root)
+
+    def test_lifespan_migrates_legacy_history_once_before_simple_job_is_served(self):
+        from services.archive_catalog import read_record
+
+        job_id = "8" * 32
+        metadata, _settings = web_api._simple_metadata(
+            job_id, "C:/source.wav", "file", "balanced", "cpu", 4, False)
+        metadata["archiveRoot"] = None
+        metadata.pop("mediaClassification", None)  # This is a pre-classification legacy row.
+        metadata.pop("archivePublication", None)  # Legacy rows had no publication lifecycle marker.
+        web_api.history_store.create(metadata)
+        web_api.history_store.update(job_id, status="completed", stage="result")
+        web_api.history_store.write_text(job_id, "Portable corrected transcript", 0)
+        archive_root = Path(self.temp.name) / "selected-archive"
+        settings_path = Path(self.temp.name) / "meeting-settings.json"
+        before = web_api.history_store.get(job_id)
+        self.assertIsNone(before["archiveRoot"])
+        self.assertEqual(before["status"], "completed")
+
+        with patch.dict(os.environ, {"VT_MEETING_ROOT": str(archive_root),
+                                     "VT_MEETING_SETTINGS": str(settings_path)}):
+            with TestClient(web_api.app) as client:
+                public = client.get(f"/api/simple/jobs/{job_id}").json()
+                portable = read_record(archive_root, job_id)
+
+        after = web_api.history_store.get(job_id)
+        self.assertEqual(public["archiveRoot"], str(archive_root.resolve()))
+        self.assertEqual(public["text"], "Portable corrected transcript")
+        self.assertEqual(portable["text"], "Portable corrected transcript")
+        self.assertEqual(after["archiveRoot"], str(archive_root.resolve()))
+        self.assertEqual(after["status"], before["status"])
+        self.assertEqual(web_api.history_store.read_text(job_id), "Portable corrected transcript")
+
+    def test_archive_and_dictionary_mutations_reject_foreign_origins(self):
+        headers = {"Origin": "https://attacker.example"}
+        dictionary = self.client.put("/api/dictionary/settings", json={"auto_learn": False}, headers=headers)
+        archive = self.client.delete("/api/archive/transcription/nonexistent", headers=headers)
+        self.assertEqual(dictionary.status_code, 403)
+        self.assertEqual(archive.status_code, 403)
 
     def test_explicit_gpu_selection_fails_instead_of_rewriting_to_cpu(self):
         job_id = "d" * 32
@@ -330,7 +691,8 @@ class SimpleApiTests(unittest.TestCase):
         self.assertNotIn("text", history)
         self.assertEqual(history["source"], "https://example.org/watch/123")
         self.assertEqual([item["stage"] for item in created["checkpoints"]],
-                         ["preparation", "source", "audio", "recognition", "diarization", "postprocess", "result"])
+                         ["source_check", "preparation", "source", "audio", "recognition",
+                          "diarization", "postprocess", "result"])
         self.assertIsNone(created["progress"])
         self.assertIsNone(created["finishedAt"])
         self.assertIsNone(created["durationSeconds"])
@@ -351,6 +713,54 @@ class SimpleApiTests(unittest.TestCase):
         active = next(item for item in public["checkpoints"] if item["stage"] == "recognition")
         self.assertEqual(active["status"], "active")
         self.assertIsNotNone(active["startedAt"])
+
+    def test_video_post_stage_checkpoints_are_chronological_and_keep_archive_audio_distinct(self):
+        from services.meeting_pipeline import STAGES as MEETING_STAGES
+
+        job_id = "6" * 32
+        source = Path(self.temp.name) / "video.mp4"
+        source.write_bytes(b"video")
+        metadata, settings = web_api._simple_metadata(
+            job_id, str(source), "file", "quality", "cpu", 2, False)
+        metadata.update(meetingId="meeting-1", meetingRoot=str(self.temp.name),
+                        meetingStages=["screen", "audio", "index"])
+        settings.update(_meetingId="meeting-1", _meetingRoot=str(self.temp.name),
+                        _meetingStages=["screen", "audio", "index"])
+        web_api.history_store.create(metadata)
+        web_api.jobs[job_id] = JobState(id=job_id, settings=settings)
+
+        def fake_run_stages(_root, _meeting_id, _source, stages, *, progress, **_kwargs):
+            self.assertEqual(stages, list(MEETING_STAGES)[1:])
+            progress("screen", "active", {"duration": 60, "time": 30})
+            progress("screen", "ready", {"duration": 60, "time": 30})
+            self.assertEqual(web_api.history_store.get(job_id)["progress"]["percent"], 50)
+            progress("audio", "active", {})
+            progress("audio", "unavailable", {})
+            progress("index", "active", {})
+            progress("index", "ready", {})
+            return {"ok": True}
+
+        with patch("services.meeting_pipeline.run_stages", side_effect=fake_run_stages):
+            web_api._run_meeting_post_stages(job_id, str(source))
+
+        record = web_api.history_store.get(job_id)
+        stages = [item["stage"] for item in record["checkpoints"]]
+        self.assertEqual(stages[0], "source_check")
+        self.assertEqual(stages[-4:], ["screen", "archive_audio", "index", "result"])
+        self.assertNotIn("audio", stages[stages.index("screen"):])
+        self.assertEqual([item["status"] for item in record["checkpoints"][-4:]],
+                         ["completed", "completed", "completed", "pending"])
+        screen = next(item for item in record["checkpoints"] if item["stage"] == "screen")
+        archive_audio = next(item for item in record["checkpoints"] if item["stage"] == "archive_audio")
+        index = next(item for item in record["checkpoints"] if item["stage"] == "index")
+        self.assertLessEqual(screen["startedAt"], screen["completedAt"])
+        self.assertLessEqual(screen["completedAt"], archive_audio["startedAt"])
+        self.assertLessEqual(archive_audio["completedAt"], index["startedAt"])
+        web_api._simple_stage_event(job_id, "result", "completed")
+        completed = web_api.history_store.get(job_id)["checkpoints"]
+        self.assertEqual(completed[-1]["stage"], "result")
+        self.assertEqual(completed[-1]["status"], "completed")
+        self.assertLessEqual(index["completedAt"], completed[-1]["startedAt"])
 
     def test_progress_allows_only_exact_cli_warmup_and_fragment_count_messages(self):
         job_id = "7" * 32
@@ -599,7 +1009,8 @@ class SimpleApiTests(unittest.TestCase):
             first = self.client.post("/api/simple/jobs", json=self.payload()).json()
         error_line = "__VT_PREP__ " + json.dumps({"type": "error", "stage": "preparation",
                                                   "message": "Не удалось загрузить модель. Проверьте подключение к интернету и повторите попытку."})
-        with (patch.object(web_api, "JobProcessController", _FakeController),
+        with (self.mock_url_media(),
+              patch.object(web_api, "JobProcessController", _FakeController),
               patch.object(web_api.subprocess, "Popen", return_value=_FakeProcess([error_line], 1)) as popen):
             web_api.run_job(first["id"], "https://example.org/watch/123")
         popen.assert_called_once()
@@ -618,7 +1029,8 @@ class SimpleApiTests(unittest.TestCase):
               patch.object(web_api, "run_job", return_value=None)):
             body = self.client.post("/api/simple/jobs", json=self.payload()).json()
 
-        with (patch.object(web_api, "JobProcessController", _FakeController),
+        with (self.mock_url_media(),
+              patch.object(web_api, "JobProcessController", _FakeController),
               patch.object(web_api.subprocess, "Popen", side_effect=FileNotFoundError(2, "not found")),
               self.assertLogs(web_api.logger, level="ERROR") as captured):
             web_api.run_job(body["id"], "https://example.org/watch/123")
@@ -659,7 +1071,8 @@ class SimpleApiTests(unittest.TestCase):
             self.assertEqual(asr_resources.runtime_python("parakeet", "directml"), alias_python)
             controller.cancel()
 
-        with (patch.object(web_api, "JobProcessController", _FakeController),
+        with (self.mock_url_media(),
+              patch.object(web_api, "JobProcessController", _FakeController),
               patch("services.runtime_devices.asr_gpu_candidate", return_value=candidate),
               patch.object(asr_resources, "_installed_exact", side_effect=installed_exact),
               patch.object(web_api, "_run_owned_process", side_effect=run_owned),
@@ -676,7 +1089,8 @@ class SimpleApiTests(unittest.TestCase):
 
         candidate = {"canPrepare": True, "backend": "directml", "deviceIndex": 0,
                      "name": "Test GPU", "identity": "test-gpu", "driverVersion": "1"}
-        with (patch.object(web_api, "JobProcessController", _FakeController),
+        with (self.mock_url_media(),
+              patch.object(web_api, "JobProcessController", _FakeController),
               patch("services.runtime_devices.asr_gpu_candidate", return_value=candidate),
               patch("services.asr_resources.invalidate_runtime_cache") as invalidate,
               patch.object(web_api, "_run_owned_process", return_value=1),
@@ -699,7 +1113,8 @@ class SimpleApiTests(unittest.TestCase):
             controller.cancel()
             return 0
 
-        with (patch.object(web_api, "JobProcessController", _FakeController),
+        with (self.mock_url_media(),
+              patch.object(web_api, "JobProcessController", _FakeController),
               patch("services.runtime_devices.asr_gpu_candidate", return_value=candidate),
               patch("services.asr_resources.invalidate_runtime_cache") as invalidate,
               patch.object(web_api, "_run_owned_process", side_effect=cancel_during_preparation),
@@ -736,8 +1151,8 @@ class SimpleApiTests(unittest.TestCase):
         self.assertIsNone(cancelled["error"])
         self.assertIsInstance(cancelled["finishedAt"], str)
         self.assertGreaterEqual(cancelled["durationSeconds"], 0)
-        prep = next(item for item in cancelled["checkpoints"] if item["stage"] == "preparation")
-        self.assertEqual(prep["status"], "cancelled")
+        source_check = next(item for item in cancelled["checkpoints"] if item["stage"] == "source_check")
+        self.assertEqual(source_check["status"], "cancelled")
         self.assertEqual(self.client.post(f"/api/simple/jobs/{body['id']}/cancel").json()["status"], "cancelled")
         self.assertEqual(self.client.delete(f"/api/simple/history/{body['id']}").status_code, 204)
 
@@ -746,7 +1161,7 @@ class SimpleApiTests(unittest.TestCase):
         controller = web_api.job_process_controllers[body["id"]]
         child = _BlockingProcess()
         thread = threading.Thread(target=web_api.run_job, args=(body["id"], "https://example.org/watch/123"))
-        with patch.object(web_api.subprocess, "Popen", return_value=child) as popen:
+        with self.mock_url_media(), patch.object(web_api.subprocess, "Popen", return_value=child) as popen:
             thread.start()
             deadline = time.time() + 2
             while controller.process is None and time.time() < deadline:
@@ -795,7 +1210,7 @@ class SimpleApiTests(unittest.TestCase):
         child = _BlockingProcess()
         thread = threading.Thread(target=web_api.run_job,
                                   args=(body["id"], "https://example.org/watch/123"))
-        with patch.object(web_api.subprocess, "Popen", return_value=child):
+        with self.mock_url_media(), patch.object(web_api.subprocess, "Popen", return_value=child):
             thread.start()
             deadline = time.time() + 2
             while controller.process is None and time.time() < deadline:
@@ -824,7 +1239,7 @@ class SimpleApiTests(unittest.TestCase):
             return child
 
         thread = threading.Thread(target=web_api.run_job, args=(body["id"], "https://example.org/watch/123"))
-        with patch.object(web_api.subprocess, "Popen", side_effect=factory):
+        with self.mock_url_media(), patch.object(web_api.subprocess, "Popen", side_effect=factory):
             thread.start()
             self.assertTrue(asr_started.wait(2))
             deadline = time.time() + 2
@@ -892,7 +1307,8 @@ class SimpleApiTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 202)
             return original_finalize(job_id, status, **kwargs)
 
-        with (patch.object(web_api.subprocess, "Popen", side_effect=lambda *_args, **_kwargs: next(processes)),
+        with (self.mock_url_media(),
+              patch.object(web_api.subprocess, "Popen", side_effect=lambda *_args, **_kwargs: next(processes)),
               patch.object(web_api, "_finalize_simple_job", side_effect=cancel_before_finalize)):
             web_api.run_job(body["id"], "https://example.org/watch/123")
         record = web_api.history_store.get(body["id"])
@@ -998,6 +1414,32 @@ class SimpleApiTests(unittest.TestCase):
         stale = self.client.put(f"/api/simple/jobs/{job_id}/text", json={"text": "stale", "baseRevision": 0})
         self.assertEqual(stale.status_code, 409)
         self.assertEqual(self.client.get(f"/api/simple/jobs/{job_id}").json()["text"], "after")
+
+    def test_edit_response_exposes_transient_learned_terms_and_undo_does_not_revert_text(self):
+        job_id = "c" * 32
+        web_api.history_store.create({"id": job_id, "sourceType": "url", "source": "https://example.org/a",
+                                      "profile": "quality", "device": "cpu", "cpuThreads": 1,
+                                      "restorePunctuation": False})
+        web_api.history_store.update(job_id, status="completed", stage="result")
+        before = "Use Typo phrase in context"
+        corrected = "Use Fixed phrase in context"
+        web_api.history_store.write_text(job_id, before, 0)
+
+        edited = self.client.put(f"/api/simple/jobs/{job_id}/text",
+                                 json={"text": corrected, "baseRevision": 0})
+        self.assertEqual(edited.status_code, 200)
+        learned = edited.json()["rememberedTerms"]
+        self.assertEqual([item["term"] for item in learned], ["Fixed"])
+        undo_id = learned[0]["undo_id"]
+
+        public = self.client.get(f"/api/simple/jobs/{job_id}").json()
+        self.assertNotIn("rememberedTerms", public)
+        self.assertEqual(public["text"], corrected)
+        undone = self.client.post(f"/api/dictionary/undo/{undo_id}")
+        self.assertTrue(undone.json()["item"]["removed"])
+        after_undo = self.client.get(f"/api/simple/jobs/{job_id}").json()
+        self.assertEqual(after_undo["text"], corrected)
+        self.assertNotIn("rememberedTerms", after_undo)
 
 
 if __name__ == "__main__":

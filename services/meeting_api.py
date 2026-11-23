@@ -160,17 +160,29 @@ def list_meetings():
 
 @router.post("/import")
 def import_meetings(payload: ImportRequest):
-    archive = _archive()
-    items, rejected = [], []
+    accepted, rejected = [], []
     for raw_path in payload.paths:
         try:
             path = Path(raw_path).expanduser().resolve(strict=True)
             if not path.is_file():
                 raise ValueError("not_a_file")
-            items.append(archive.import_file(path, started_at=payload.started_at))
+            accepted.append(str(path))
         except (OSError, ValueError) as exc:
             rejected.append({"path": raw_path, "reason": str(exc)})
-    return {"items": items, "rejected": rejected}
+    if not accepted:
+        return {"jobs": [], "rejected": rejected}
+    import web_api
+    from services.meeting_settings import load_settings
+    settings = load_settings(web_api.APP_ROOT)
+    records = web_api._enqueue_simple_jobs(
+        [(path, "file") for path in accepted], settings["profile"], settings["device"],
+        max(1, min(4, web_api.logical_cpu_count())), False,
+        execution_mode=settings["execution_mode"],
+        conversion_origins=["archive_import"] * len(accepted),
+        job_metadata=[{"recordingTitle": Path(path).stem,
+                       "recordingStartedAt": payload.started_at} for path in accepted])
+    return {"jobs": [web_api._simple_shape(record, with_text=False) for record in records],
+            "rejected": rejected}
 
 
 @router.post("/process", status_code=202)
@@ -304,6 +316,10 @@ def edit_segment(meeting_id: str, segment_id: str, payload: SegmentEdit):
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Segment not found") from exc
     remembered_id = None
+    from services.personal_dictionary import remember_corrections
+    learned_terms = remember_corrections(
+        str(result.get("original_text", "")), payload.text,
+        {"kind": "meeting_segment_correction", "meeting_id": meeting_id, "segment_id": segment_id})
     if payload.remember:
         old_text = str(result.get("original_text", ""))
         new_text = payload.text
@@ -333,7 +349,7 @@ def edit_segment(meeting_id: str, segment_id: str, payload: SegmentEdit):
                             "original_text": old_text, "edited_text": new_text},
             )
     archive.refresh_editorial_exports(meeting_id)
-    return {"segment": result, "remembered_term_undo_id": remembered_id}
+    return {"segment": result, "remembered_term_undo_id": remembered_id, "remembered_terms": learned_terms}
 
 
 @router.put("/{meeting_id}/speakers/{speaker_id}")
@@ -408,11 +424,10 @@ def get_glossary(meeting_id: str | None = None):
     if meeting_id:
         _safe_meeting(archive, meeting_id)
         return {"meeting_id": meeting_id, "items": archive.glossary(meeting_id)}
-    items = []
-    for meeting in archive.list_meetings(limit=10000):
-        mid = meeting["meeting_id"]
-        items.extend({"meeting_id": mid, **entry} for entry in archive.glossary(mid))
-    return {"items": items}
+    from services.personal_dictionary import get_dictionary, migrate_legacy_meetings
+    migrate_legacy_meetings(_root())
+    dictionary = get_dictionary()
+    return {"items": dictionary.list(), "version": dictionary.snapshot()["version"]}
 
 
 @router.post("/glossary")
@@ -453,14 +468,22 @@ def reindex_meetings():
     import web_api
     archive = _archive()
     meetings = archive.list_meetings(limit=10**9)
+    from services.archive_catalog import (
+        enqueue_archive_transcription_reindex,
+        sync_history,
+    )
+
+    root = _root()
+    sync_history(root, web_api.history_store)
+    queued_transcriptions = enqueue_archive_transcription_reindex(root)
     if not meetings:
-        return {"jobs": []}
+        return {"jobs": [], "queued_transcriptions": queued_transcriptions}
     records = web_api._enqueue_simple_jobs(
         [("", "file") for _ in meetings], "balanced", "cpu", min(8, web_api.logical_cpu_count()), False,
         diarization_enabled=False, meeting_ids=[row["meeting_id"] for row in meetings],
         stages=["index"], meeting_root=str(_root()), execution_mode="auto",
     )
-    return {"jobs": records}
+    return {"jobs": records, "queued_transcriptions": queued_transcriptions}
 
 
 @router.get("/connector/status")

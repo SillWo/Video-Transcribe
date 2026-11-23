@@ -1,5 +1,6 @@
 import json
 import importlib.util
+import hashlib
 import logging
 import re
 import os
@@ -18,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from services.model_paths import MODEL_STORAGE_ROOT
 import psutil
@@ -115,7 +116,9 @@ def _restore_meeting_job_statuses(store: TranscriptionHistory) -> None:
             except (KeyError, ValueError):
                 continue
             desired_status = meta.get("status")
-            if row["status"] in {"failed", "cancelled", "interrupted"}:
+            preserve_published = bool(meta.get("archivePublication") == "published"
+                                      and not meta.get("provisional"))
+            if row["status"] in {"failed", "cancelled", "interrupted"} and not preserve_published:
                 desired_status = row["status"]
             elif desired_status in {"failed", "cancelled", "interrupted"}:
                 # A completed retry supersedes an older terminal failure. Reuse
@@ -129,14 +132,31 @@ def _restore_meeting_job_statuses(store: TranscriptionHistory) -> None:
                         desired_status = readiness
                 except (OSError, ValueError, TypeError, AttributeError):
                     pass
+            needs_publication = (row.get("status") == "completed"
+                                 and row.get("archivePublication") == "pending")
             if (meta.get("job_id") == row["id"] and meta.get("job_status") == row["status"]
-                    and meta.get("status") == desired_status):
+                    and meta.get("status") == desired_status
+                    and not needs_publication):
                 continue
             changes = {"job_id": row["id"], "job_status": row["status"]}
+            if needs_publication:
+                changes["speechAvailability"] = row.get("speechAvailability", "no_speech")
             if desired_status != meta.get("status"):
                 changes["status"] = desired_status
             archive.update_meeting(meeting_id, **changes)
             archive.finalize(meeting_id)
+            if needs_publication:
+                archive.update_meeting(meeting_id, provisional=False,
+                                       archivePublication="published", archiveKind="video",
+                                       archiveItemId=meeting_id)
+                try:
+                    archive.finalize(meeting_id)
+                except Exception:
+                    archive.update_meeting(meeting_id, provisional=True,
+                                           archivePublication="pending")
+                    raise
+                store.update(row["id"], archivePublication="published",
+                             archiveKind="video", archiveItemId=meeting_id)
     except Exception:
         logger.exception("Could not restore meeting job statuses from persistent history")
 
@@ -176,6 +196,7 @@ class SimpleJobRequest(BaseModel):
     restorePunctuation: bool
     diarizationEnabled: bool = False
     diarizationDevice: str = "auto"
+    executionMode: str | None = None
 
 
 class SimpleTextRequest(BaseModel):
@@ -191,6 +212,7 @@ class SimpleBatchRequest(BaseModel):
     restorePunctuation: bool
     diarizationEnabled: bool = False
     diarizationDevice: str = "auto"
+    executionMode: str | None = None
 
 
 @dataclass
@@ -287,6 +309,7 @@ simple_shutdown_jobs: dict[str, bool] = {}
 simple_dispatcher: SimpleQueueDispatcher | None = None
 simple_dispatcher_lock = threading.Lock()
 jobs_lock = threading.Lock()
+_media_conversion_lock = threading.Lock()
 transcription_semaphore = threading.Semaphore(1)
 model_download_jobs: dict[str, ModelOperationJobState] = {}
 model_delete_jobs: dict[str, ModelOperationJobState] = {}
@@ -313,18 +336,29 @@ def _hydrate_simple_job(record: dict[str, Any]) -> JobState:
                     _sourceType=record.get("sourceType"), _profile=record.get("profile"),
                     _requestedDevice=record.get("device"),
                     _outputDir=str(history_store.job_dir(job_id) / "output"))
+    if record.get("executionMode"):
+        settings["_executionMode"] = record["executionMode"]
+    if record.get("archiveRoot"):
+        settings["_archiveRoot"] = record["archiveRoot"]
     if record.get("meetingId"):
+        meeting_source = record.get("managedSource") or record.get("source")
+        settings["_source"] = meeting_source
         settings.update(_meetingId=record.get("meetingId"),
                         _meetingRoot=record.get("meetingRoot"),
                         _meetingStages=record.get("meetingStages") or ["speech"],
                         _executionMode=record.get("executionMode", "auto"),
                         useTimestamps=True)
+        if isinstance(record.get("settings"), dict):
+            persisted = record["settings"]
+            for key in ("_audioStreamIndex", "_videoStreamIndex", "_speechUnavailableReason"):
+                if key in persisted:
+                    settings[key] = persisted[key]
     settings["diarizationEnabled"] = bool(record.get("diarizationEnabled", False))
     settings["diarizationDevice"] = record.get("diarizationDevice", "auto")
     job = JobState(id=job_id, settings=settings, status=record.get("status", "queued"),
                    created_at=record.get("createdAt", utc_now()),
                    updated_at=record.get("updatedAt", utc_now()),
-                   source_name=record.get("source"))
+                   source_name=(record.get("managedSource") or record.get("source")))
     jobs[job_id] = job
     job_process_controllers.setdefault(job_id, JobProcessController())
     simple_worker_states.setdefault(job_id, "not_started")
@@ -345,6 +379,44 @@ def _mark_simple_job_started(job_id: str) -> bool:
         return True
 
 
+def _capture_dictionary_snapshot(job_id: str) -> dict[str, Any]:
+    """Take one immutable vocabulary version for a speech run and persist it with the job."""
+    job = get_job(job_id)
+    existing = job.settings.get("dictionarySnapshot")
+    if isinstance(existing, dict):
+        return existing
+    from services.personal_dictionary import get_dictionary_snapshot, migrate_legacy_meetings
+    archive_root = job.settings.get("_archiveRoot") or job.settings.get("_meetingRoot")
+    if not archive_root:
+        try:
+            from services.meeting_settings import load_settings
+            archive_root = load_settings(APP_ROOT).get("archive_root")
+        except Exception:
+            logger.exception("Could not resolve the selected archive before capturing dictionary terms.")
+    if archive_root:
+        try:
+            migrate_legacy_meetings(archive_root)
+        except Exception:
+            logger.exception("Could not migrate legacy glossary terms before capturing the speech dictionary snapshot.")
+    else:
+        logger.warning("No archive root is available for legacy dictionary migration before speech.")
+    snapshot = get_dictionary_snapshot()
+    if not isinstance(snapshot, dict):
+        snapshot = {"version": 0, "terms": []}
+    snapshot = {"version": int(snapshot.get("version", 0) or 0),
+                "terms": [term for term in snapshot.get("terms", [])
+                          if isinstance(term, str) and term.strip()]}
+    with jobs_lock:
+        current = jobs.get(job_id)
+        if current is not None:
+            current.settings["dictionarySnapshot"] = snapshot
+    record = history_store.get(job_id) or {}
+    settings = dict(record.get("settings") or {})
+    settings["dictionarySnapshot"] = snapshot
+    history_store.update(job_id, settings=settings)
+    return snapshot
+
+
 def _meeting_job(job_id: str) -> tuple[str, str, list[str]] | None:
     job = get_job(job_id)
     meeting_id = job.settings.get("_meetingId")
@@ -352,6 +424,332 @@ def _meeting_job(job_id: str) -> tuple[str, str, list[str]] | None:
     if not meeting_id or not root:
         return None
     return meeting_id, root, list(job.settings.get("_meetingStages") or ["speech"])
+
+
+def _classify_manual_file(job_id: str, source_path: str, controller: JobProcessController) -> tuple[str, bool] | None:
+    """Classify a decoded local source and promote real video streams to meetings."""
+    job = get_job(job_id)
+    if not job.settings.get("_simple") or job.settings.get("_sourceType") not in {"file", "url"}:
+        return None
+    if job.settings.get("_meetingId"):
+        return source_path, bool(job.settings.get("_hasAudio", True))
+
+    from services.manual_video import probe_local_media
+    media = probe_local_media(source_path, controller=controller)
+    usable_audio = media.get("decodedAudioStreams") or []
+    usable_video = media.get("decodedVideoStreams") or []
+    selected_audio_index = usable_audio[0].get("index") if usable_audio else None
+    selected_video_index = usable_video[0].get("index") if usable_video else None
+    with jobs_lock:
+        current = jobs.get(job_id)
+        if current is not None:
+            current.settings["_audioStreamIndex"] = selected_audio_index
+            current.settings["_videoStreamIndex"] = selected_video_index
+    record = history_store.get(job_id) or {}
+    settings = dict(record.get("settings") or {})
+    settings.update(_audioStreamIndex=selected_audio_index, _videoStreamIndex=selected_video_index)
+    history_store.update(job_id, settings=settings)
+    if not media["isVideo"]:
+        changes = {"mediaClassification": "audio", "archiveKind": "audio",
+                   "speechAvailability": "pending",
+                   "recordingTitle": record.get("recordingTitle"),
+                   "recordingTrackRoles": record.get("recordingTrackRoles")}
+        if job.settings.get("_sourceType") == "url":
+            changes["downloadedSource"] = source_path
+        history_store.update(job_id, **changes)
+        return source_path, True
+
+    from services.meeting_archive import MeetingArchive
+    from services.meeting_settings import load_settings
+    from services.archive_catalog import remove_pending_ordinary_transcription
+
+    record = history_store.get(job_id) or {}
+    root = (job.settings.get("_archiveRoot") or job.settings.get("_meetingRoot")
+            or record.get("archiveRoot"))
+    if not root:
+        root = load_settings(APP_ROOT).get("archive_root")
+    if not root:
+        raise TaskFailure("Не удалось определить архив для сохранения локального видео.",
+                          "storage_unavailable", stage="source")
+    root = str(Path(root).expanduser().resolve())
+    try:
+        archive = MeetingArchive(root)
+        meeting_record = archive.import_file(source_path, title=record.get("recordingTitle"),
+                                             started_at=record.get("recordingStartedAt"),
+                                             cancel=controller.check_cancelled,
+                                             provisional=True)
+    except InterruptedError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise TaskFailure(f"Не удалось сохранить исходное видео в архив встречи: {exc}",
+                          "storage_unavailable", stage="source") from exc
+    meeting_id = str(meeting_record["meeting_id"])
+    managed_source = archive.original_path(meeting_id)
+    if managed_source is None:
+        raise TaskFailure("Исходное видео не удалось сохранить в архиве встречи.",
+                          "storage_unavailable", stage="source")
+
+    stages = (["speech", "screen", "audio", "index"] if media["hasAudio"]
+              else ["screen", "index"])
+    no_audio_reason = (None if media["hasAudio"] else
+                       "Видео не содержит декодируемых звуковых отсчётов; распознавание речи пропущено.")
+    with jobs_lock:
+        current = jobs.get(job_id)
+        if current is None:
+            raise RuntimeError("Simple job disappeared while promoting its video source.")
+        current.settings.update(
+            _archiveRoot=root, _meetingId=meeting_id, _meetingRoot=root,
+            _meetingStages=stages, _hasAudio=bool(media["hasAudio"]),
+            useTimestamps=True, _source=str(managed_source), _sourceType="file",
+        )
+        if no_audio_reason:
+            current.settings["_speechUnavailableReason"] = no_audio_reason
+        current.source_name = str(managed_source)
+
+    settings = dict(record.get("settings") or {})
+    settings.update(useTimestamps=True, meetingId=meeting_id, meetingRoot=root,
+                    meetingStages=stages)
+    changes = {"meetingId": meeting_id, "meetingRoot": root, "meetingStages": stages,
+               "mediaClassification": "video", "archiveKind": "video",
+               "archiveItemId": meeting_id, "archivePublication": "pending", "archiveRoot": root,
+               "managedSource": str(managed_source), "sourceFilename": managed_source.name,
+               "speechAvailability": "pending" if media["hasAudio"] else "unavailable",
+               "settings": settings, "notice": no_audio_reason}
+    linked = history_store.update(job_id, **changes)
+    if linked is None:
+        raise LookupError(job_id)
+    # Keep meeting editorial data and speaker overrides on content-addressed dedup.
+    current_meta = archive.get_meeting(meeting_id)
+    if not current_meta.get("provisional"):
+        # A content-addressed meeting may already be published. Keep its existing
+        # publication and source metadata intact while this job runs.
+        with jobs_lock:
+            current = jobs.get(job_id)
+            if current:
+                current.settings["_preservePublishedMeeting"] = True
+                if record.get("conversionOrigin") in {"archive_import", "recorder", "mcp"}:
+                    current.settings["_reusePublishedMeeting"] = True
+    else:
+        meeting_changes = {"job_id": job_id, "job_status": linked.get("status", "running"),
+                           "archivePublication": "pending", "archiveKind": "video",
+                           "archiveItemId": meeting_id,
+                           "video_stream_index": selected_video_index,
+                           "speechAvailability": "pending" if media["hasAudio"] else "unavailable",
+                           "speech_status": "pending" if media["hasAudio"] else "unavailable"}
+        if record.get("conversionOrigin") == "recorder":
+            meeting_changes.update(recording_status="ready", recording_source="obs-private",
+                                   recording_sha256=meeting_record.get("sha256"),
+                                   audio_track_roles=record.get("recordingTrackRoles"))
+        archive.update_meeting(meeting_id, **meeting_changes)
+    try:
+        remove_pending_ordinary_transcription(root, job_id)
+    except (ImportError, OSError, ValueError):
+        logger.exception("Could not remove pending ordinary transcription job_id=%s", job_id)
+    return str(managed_source), bool(media["hasAudio"])
+
+
+def _download_simple_media(job_id: str, url: str, controller: JobProcessController) -> str:
+    """Download one finished media item for classification and local ASR/screen work."""
+    record = history_store.get(job_id) or {}
+    persisted = (record.get("settings") or {}).get("_resolvedSource")
+    if persisted and Path(persisted).is_file():
+        return str(Path(persisted).resolve())
+    try:
+        canonical_url = _simple_public_url(url)
+    except HTTPException as exc:
+        raise TaskFailure("Ссылка должна вести на публичный сайт.", "source_invalid", stage="source") from exc
+    output_dir = history_store.job_dir(job_id) / "download"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_template = str(output_dir / "source.%(ext)s")
+    command = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-warnings",
+               "--format", "bv*+ba/best/bv*/ba", "--merge-output-format", "mkv",
+               "--output", output_template, "--print", "after_move:filepath", canonical_url]
+    try:
+        download_env = os.environ.copy()
+        download_env["PYTHONIOENCODING"] = "utf-8"
+        download_env.setdefault("PYTHONUTF8", "1")
+        process = subprocess.Popen(command, cwd=APP_ROOT, env=download_env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError as exc:
+        raise TaskFailure(f"Не удалось запустить загрузчик медиа: {exc}",
+                          "media_download_unavailable", stage="source") from exc
+    registered = False
+    try:
+        controller.register(process)
+        registered = True
+        deadline = time.monotonic() + 4 * 60 * 60
+        while True:
+            controller.check_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TaskFailure("Загрузка видео не завершилась за отведённое время.",
+                                  "media_download_failed", stage="source")
+            try:
+                stdout, stderr = process.communicate(timeout=min(.5, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if process.returncode != 0:
+            detail = (stderr or b"").decode("utf-8", "replace").strip()
+            raise TaskFailure("Не удалось загрузить видео по ссылке. " + (detail[-500:] if detail else "Повторите попытку."),
+                              "media_download_failed", stage="source")
+    finally:
+        if process.poll() is None:
+            try:
+                process.kill()
+                process.communicate(timeout=1)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if registered:
+            controller.unregister(process)
+    lines = (stdout or b"").decode("utf-8", "replace").splitlines()
+    resolved = next((Path(line.strip()).resolve() for line in reversed(lines)
+                     if line.strip()), None)
+    if resolved is None or not resolved.is_file() or not resolved.is_relative_to(output_dir.resolve()):
+        raise TaskFailure("Загрузчик завершился без доступного видеофайла.",
+                          "media_download_failed", stage="source")
+    settings = dict(record.get("settings") or {})
+    settings["_resolvedSource"] = str(resolved)
+    history_store.update(job_id, settings=settings, downloadedSource=str(resolved))
+    with jobs_lock:
+        current = jobs.get(job_id)
+        if current:
+            current.settings["_resolvedSource"] = str(resolved)
+    return str(resolved)
+
+
+def _prepare_simple_speech_source(job_id: str, source_path: str,
+                                  controller: JobProcessController) -> str:
+    """Extract the first verified non-silent stream so Whisper does not pick a cover/silent track."""
+    record = history_store.get(job_id) or {}
+    settings = dict(record.get("settings") or {})
+    stream_index = settings.get("_audioStreamIndex")
+    if stream_index is None:
+        return source_path
+    target = history_store.job_dir(job_id) / "speech-source.wav"
+    if target.is_file() and target.stat().st_size > 44:
+        return str(target)
+    ffmpeg = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    if not ffmpeg:
+        raise TaskFailure("Не удалось подготовить выбранную звуковую дорожку: ffmpeg недоступен.",
+                          "media_decode_unavailable", stage="source")
+    command = [ffmpeg, "-v", "error", "-y", "-i", source_path, "-map", f"0:{int(stream_index)}",
+               "-vn", "-c:a", "pcm_f32le", "-ar", "48000", str(target)]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    registered = False
+    try:
+        controller.register(process)
+        registered = True
+        deadline = time.monotonic() + 3600
+        while True:
+            controller.check_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TaskFailure("Подготовка звуковой дорожки не завершилась за отведённое время.",
+                                  "media_decode_failed", stage="source")
+            try:
+                _stdout, stderr = process.communicate(timeout=min(.25, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if process.returncode != 0 or not target.is_file() or target.stat().st_size <= 44:
+            raise TaskFailure("Не удалось извлечь проверенную звуковую дорожку.",
+                              "media_decode_failed", stage="source")
+    finally:
+        if process.poll() is None:
+            try:
+                process.kill()
+                process.communicate(timeout=1)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if registered:
+            controller.unregister(process)
+    return str(target)
+
+
+def _cleanup_successful_job_media(job_id: str) -> None:
+    """Remove only app-owned conversion intermediates after successful publication."""
+    record = history_store.get(job_id) or {}
+    if record.get("archivePublication") != "published":
+        return
+    job_root = history_store.job_dir(job_id).resolve()
+    for value in (record.get("downloadedSource"), job_root / "speech-source.wav"):
+        if not value:
+            continue
+        path = Path(value).resolve()
+        try:
+            if path.is_relative_to(job_root) and path.is_file():
+                path.unlink()
+        except (OSError, RuntimeError, ValueError):
+            logger.warning("Could not remove conversion intermediate %s for job_id=%s", path, job_id)
+    cleanup_source = record.get("cleanupSource")
+    if cleanup_source:
+        try:
+            allowed = Path(record.get("cleanupSourceRoot") or
+                           (Path(os.environ.get("VT_SIMPLE_RUNTIME_DIR", SIMPLE_RUNTIME_DIR))
+                            / "meeting-recorder" / "recordings")).expanduser().resolve()
+            path = Path(cleanup_source).resolve()
+            if path.is_relative_to(allowed) and path.is_file():
+                path.unlink()
+        except (ImportError, OSError, RuntimeError, ValueError):
+            logger.warning("Could not remove staged recorder source for job_id=%s", job_id)
+
+
+def _classify_existing_meeting_source(job_id: str, source_path: str,
+                                      controller: JobProcessController) -> None:
+    """Select verified source streams for imported and recorder-created meetings."""
+    job = get_job(job_id)
+    if job.settings.get("_audioStreamIndex") is not None or job.settings.get("_videoStreamIndex") is not None:
+        return
+    from services.manual_video import probe_local_media
+    media = probe_local_media(source_path, controller=controller)
+    if not media.get("isVideo"):
+        raise TaskFailure("Источник не содержит пригодного видеопотока. Выберите видеозапись для встречи.",
+                          "media_video_missing", stage="source")
+    audios = media.get("decodedAudioStreams") or []
+    videos = media.get("decodedVideoStreams") or []
+    audio_index = audios[0].get("index") if audios else None
+    video_index = videos[0].get("index") if videos else None
+    no_audio_reason = (None if audio_index is not None else
+                       "Видео не содержит декодируемых звуковых отсчётов; распознавание речи пропущено.")
+    record = history_store.get(job_id) or {}
+    settings = dict(record.get("settings") or {})
+    settings.update(_audioStreamIndex=audio_index, _videoStreamIndex=video_index)
+    stages = list(record.get("meetingStages") or ["speech", "screen", "audio", "index"])
+    if audio_index is None:
+        stages = [stage for stage in stages if stage != "speech"]
+        settings["_speechUnavailableReason"] = no_audio_reason
+    changes = {"settings": settings, "meetingStages": stages,
+               "speechAvailability": "pending" if audio_index is not None else "unavailable",
+               "notice": no_audio_reason}
+    history_store.update(job_id, **changes)
+    with jobs_lock:
+        current = jobs.get(job_id)
+        if current:
+            current.settings.update(_audioStreamIndex=audio_index, _videoStreamIndex=video_index,
+                                    _meetingStages=stages)
+            if no_audio_reason:
+                current.settings["_speechUnavailableReason"] = no_audio_reason
+    try:
+        from services.meeting_archive import MeetingArchive
+        meeting_id, root, _ = _meeting_job(job_id)
+        archive = MeetingArchive(root)
+        meta = archive.get_meeting(meeting_id)
+        if meta.get("provisional"):
+            archive.update_meeting(meeting_id, video_stream_index=video_index,
+                                   speechAvailability=changes["speechAvailability"],
+                                   speech_status=changes["speechAvailability"])
+        else:
+            with jobs_lock:
+                current = jobs.get(job_id)
+                if current:
+                    current.settings["_preservePublishedMeeting"] = True
+                    if record.get("conversionOrigin") in {"archive_import", "recorder", "mcp"}:
+                        current.settings["_reusePublishedMeeting"] = True
+    except Exception:
+        logger.exception("Could not persist selected meeting stream indices job_id=%s", job_id)
 
 
 def _persist_meeting_result(job_id: str, result: dict[str, Any]) -> None:
@@ -370,16 +768,20 @@ def _run_meeting_post_stages(job_id: str, source_path: str) -> dict | None:
     meeting_id, root, stages = meeting
     selected = [stage for stage in stages if stage != "speech"]
     def report(stage: str, status: str, details: dict) -> None:
-        update_job(job_id, stage=stage)
-        if stage in STAGES:
-            _simple_stage_event(job_id, stage, status)
+        public_stage = {"audio": "archive_audio"}.get(stage, stage)
+        update_job(job_id, stage=public_stage)
         progress = dict(details)
         if stage == "screen" and progress.get("duration") and progress.get("time") is not None:
             progress["percent"] = min(99, int(float(progress["time"]) * 100 / max(0.1, float(progress["duration"]))))
-        if status in {"ready", "completed"}:
+        if status in {"ready", "completed"} and not (stage == "screen" and progress.get("percent") is not None):
             progress["percent"] = 100
+        checkpoint_status = ("active" if status in {"active", "in_progress"}
+                             else "failed" if status == "failed"
+                             else "cancelled" if status == "cancelled"
+                             else "completed")
+        _simple_stage_event(job_id, public_stage, checkpoint_status)
         progress["message"] = progress.get("message") or f"Meeting {stage}: {status}"
-        _simple_progress(job_id, stage, progress)
+        _simple_progress(job_id, public_stage, progress)
     from services.meeting_pipeline import run_stages
     job = get_job(job_id)
     device = "directml" if job.settings.get("_requestedDevice") == "gpu" else "cpu"
@@ -490,14 +892,28 @@ def _resolve_simple_execution(job_id: str, job: JobState) -> dict[str, Any] | No
     persisted = history_store.get(job_id) or {}
     profile = job.settings.get("_profile") or persisted.get("profile")
     requested_device = job.settings.get("_requestedDevice", persisted.get("device", "cpu"))
+    execution_mode = str(job.settings.get("_executionMode", persisted.get("executionMode") or "manual"))
     if profile not in simple_profiles.PROFILES:
         raise TaskFailure("Неизвестный профиль расшифровки.", "device_unavailable", stage="preparation")
     model_id = simple_profiles.PROFILES[profile][1]
     candidate = None
+    auto_status = "manual"
+    if execution_mode == "auto":
+        # The Whisper prompt/backend mode follows word-level timestamps used for
+        # diarization. `useTimestamps` only controls rendered output timestamps.
+        candidate = asr_capabilities.auto_whisper_candidate(
+            model_id, word_timestamps=bool(job.settings.get("diarizationEnabled")))
+        if candidate:
+            requested_device = "gpu"
+            auto_status = "verified_gpu"
+        else:
+            requested_device = "cpu"
+            auto_status = "cpu_unverified"
     if requested_device == "gpu":
         from services.runtime_devices import asr_gpu_candidate, invalidate_gpu_inventory_cache
-        invalidate_gpu_inventory_cache()
-        candidate = asr_gpu_candidate(model_id)
+        if auto_status != "verified_gpu":
+            invalidate_gpu_inventory_cache()
+            candidate = asr_gpu_candidate(model_id)
         if not candidate.get("canPrepare") or not candidate.get("backend"):
             raise TaskFailure(candidate.get("reason") or "Совместимая видеокарта сейчас недоступна.",
                               "device_unavailable", stage="preparation")
@@ -514,10 +930,11 @@ def _resolve_simple_execution(job_id: str, job: JobState) -> dict[str, Any] | No
         current.settings["model"] = model_id
         current.settings["device"] = backend
         current.settings["_gpuIndex"] = device_index
+        current.settings["_autoAsrStatus"] = auto_status
         current.effective_model = model_id
         current.effective_device = "cpu" if backend == "cpu" else backend
         current.effective_backend = backend
-        current.precision = asr_capabilities.expected_precision(model_id)
+        current.precision = asr_capabilities.expected_precision(model_id, backend)
         settings = dict(current.settings)
     history_store.update(
         job_id,
@@ -525,12 +942,16 @@ def _resolve_simple_execution(job_id: str, job: JobState) -> dict[str, Any] | No
         effectiveModel=model_id,
         effectiveDevice="cpu" if backend == "cpu" else backend,
         effectiveBackend=backend,
-        precision=asr_capabilities.expected_precision(model_id),
+        precision=asr_capabilities.expected_precision(model_id, backend),
         settings={key: settings.get(key) for key in (
             "language", "model", "device", "nproc", "outputFormat", "saveAudio",
             "useTimestamps", "restorePunctuation", "diarizationEnabled", "diarizationDevice",
+            "dictionarySnapshot", "archiveRoot", "executionMode", "autoAsrStatus",
         )},
     )
+    if auto_status != "manual":
+        history_store.update(job_id, settings={**(history_store.get(job_id) or {}).get("settings", {}),
+                                                "autoAsrStatus": auto_status})
     return candidate
 
 
@@ -553,7 +974,7 @@ def _run_simple_gpu_smoke(job: JobState, controller: JobProcessController,
     asr_capabilities.start_gpu_check(model_id, candidate)
     smoke_result: dict[str, Any] = {"ok": False, "error": "GPU smoke process did not produce a result."}
     try:
-        if model_id == "small":
+        if model_id in {"small", "large-v3"}:
             smoke_job = JobState(
                 id=f"{job.id}-gpu-smoke",
                 settings={
@@ -698,6 +1119,22 @@ def _meeting_cleanup_activity() -> dict[str, bool]:
 
 @asynccontextmanager
 async def _lifespan(_app):
+    try:
+        from fastapi.concurrency import run_in_threadpool
+        from services.archive_catalog import sync_history
+        from services.meeting_settings import load_settings
+
+        configured = await run_in_threadpool(load_settings, APP_ROOT)
+        archive_root = Path(configured["archive_root"]).expanduser().resolve()
+        result = await run_in_threadpool(sync_history, archive_root, history_store)
+        logger.info("Synced %s legacy transcription(s) to archive %s.",
+                    result.get("synced", 0), archive_root)
+    except Exception:
+        logger.exception("Could not sync legacy transcription history to the selected archive; local history remains intact.")
+    try:
+        ensure_media_conversion_dispatcher_started()
+    except Exception:
+        logger.exception("Could not resume persisted media conversion queue")
     from services.meeting_backup_api import start_cleanup_maintenance
     controller = start_cleanup_maintenance(activity_probe=_meeting_cleanup_activity)
     try:
@@ -705,6 +1142,11 @@ async def _lifespan(_app):
     finally:
         if controller is not None:
             controller.stop()
+        try:
+            from services.archive_catalog import shutdown_archive_indexing
+            shutdown_archive_indexing(timeout=2)
+        except Exception:
+            pass
 
 
 app = FastAPI(title="Video Transcribe Local API", version="1.1.0", lifespan=_lifespan)
@@ -720,7 +1162,8 @@ app.add_middleware(
 @app.middleware("http")
 async def block_cross_site_meeting_mutations(request, call_next):
     """Protect local meeting mutations from cross-site form/fetch POSTs."""
-    if request.url.path.startswith("/api/meetings/") and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+    protected_prefixes = ("/api/meetings/", "/api/archive", "/api/dictionary")
+    if request.url.path.startswith(protected_prefixes) and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         origin = request.headers.get("origin")
         if origin:
             try:
@@ -740,7 +1183,7 @@ async def block_cross_site_meeting_mutations(request, call_next):
                     raise ValueError("origin mismatch")
             except (ValueError, UnicodeError):
                 from fastapi.responses import JSONResponse
-                return JSONResponse({"detail": "Cross-site meeting mutation rejected"}, status_code=403)
+                return JSONResponse({"detail": "Cross-site local data mutation rejected"}, status_code=403)
     return await call_next(request)
 
 model_management_router = APIRouter(prefix="/api/models", tags=["model-management"])
@@ -874,7 +1317,12 @@ def _checkpoint_update(job_id: str, stage: str, status: str) -> None:
     checkpoints = [dict(item) for item in record.get("checkpoints", [])]
     checkpoint = next((item for item in checkpoints if item.get("stage") == stage), None)
     if checkpoint is None:
-        return
+        checkpoint = {"stage": stage, "status": "pending", "startedAt": None, "completedAt": None}
+        order = list(STAGES)
+        target_index = order.index(stage)
+        insert_at = next((index for index, item in enumerate(checkpoints)
+                          if item.get("stage") in order and order.index(item["stage"]) > target_index), len(checkpoints))
+        checkpoints.insert(insert_at, checkpoint)
     stamp = utc_now()
     if status == "active":
         if checkpoint.get("status") in {"pending", "active"}:
@@ -925,9 +1373,11 @@ def _simple_progress(job_id: str, stage: str, payload: dict[str, Any]) -> None:
                             if same_stage and previous.get("phase") == phase
                             else utc_now())
     safe_messages = {
-        "source": "Загрузка источника", "audio": "Подготовка аудио",
+        "source_check": "Проверка записи", "source": "Загрузка источника", "audio": "Подготовка аудио",
         "recognition": "Распознавание речи", "postprocess": "Обработка текста",
-        "diarization": "Определение говорящих", "result": "Подготовка результата",
+        "diarization": "Определение говорящих", "screen": "Извлечение кадров",
+        "archive_audio": "Сохранение аудио", "index": "Индексация записи",
+        "result": "Подготовка результата",
     }
     if stage == "preparation":
         allowed_prep = {"Загрузка модели распознавания", "Загрузка модели пунктуации",
@@ -950,6 +1400,10 @@ def _simple_progress(job_id: str, stage: str, payload: dict[str, Any]) -> None:
             "Загружаем модель в память", "Загружаем модель в память."
         }:
             message = "Загружаем модель в память"
+        elif stage == "recognition" and requested_message == (
+            "Whisper зациклил текст. Повторяем распознавание без предыдущего контекста."
+        ):
+            message = requested_message
         elif stage == "postprocess":
             message = "Восстановление пунктуации"
             if isinstance(requested_message, str) and re.fullmatch(
@@ -1103,10 +1557,20 @@ def _finalize_simple_job(job_id: str, status: str, *, error: str | None = None,
                 history_store.write_text(job_id, transcript or "", revision=0)
                 if full_diarization is not None:
                     history_store.write_diarization(job_id, full_diarization)
+            publication_changes: dict[str, Any] = {}
+            if status == "completed" and record.get("archivePublication") == "pending":
+                result_text = transcript if transcript is not None else job.result_text
+                availability = record.get("speechAvailability")
+                publication_changes = {
+                    "speechAvailability": availability if availability == "unavailable" else
+                    ("available" if isinstance(result_text, str) and result_text.strip() else "no_speech"),
+                }
+                if job.settings.get("_meetingId"):
+                    publication_changes = {"speechAvailability": publication_changes["speechAvailability"]}
             updated = history_store.update(job_id, status=status, stage=final_stage,
                                            error=final_error, errorCode=error_code if status == "failed" else None,
                                            checkpoints=checkpoints, progress=progress,
-                                           diarization=diarization)
+                                           diarization=diarization, **publication_changes)
             if updated is None:
                 raise LookupError(job_id)
         except Exception:
@@ -1135,18 +1599,58 @@ def _finalize_simple_job(job_id: str, status: str, *, error: str | None = None,
             archive = MeetingArchive(meeting_root)
             archive.get_meeting(meeting_id)
             changes = {"job_id": job_id, "job_status": status}
+            if status == "completed":
+                if job.settings.get("_speechUnavailableReason"):
+                    changes["speechAvailability"] = "unavailable"
+                else:
+                    transcript_data = archive._read_transcript(meeting_id)
+                    raw_text = transcript_data.get("raw_text")
+                    changes["speechAvailability"] = (
+                        "available" if isinstance(raw_text, str) and raw_text.strip() else "no_speech")
             if status in {"failed", "interrupted", "cancelled"}:
                 changes["status"] = status
                 selected_stages = job.settings.get("_meetingStages")
                 speech_selected = not selected_stages or "speech" in selected_stages
                 if speech_selected and terminal_stage in {
-                    "preparation", "source", "recognition", "diarization", "postprocess", "result"
+                    "source_check", "preparation", "source", "audio", "recognition",
+                    "diarization", "postprocess", "result"
                 }:
                     changes["speech_status"] = status
-            archive.update_meeting(meeting_id, **changes)
-            archive.finalize(meeting_id)
+            preserve_published = bool(job.settings.get("_preservePublishedMeeting"))
+            if not preserve_published or status == "completed":
+                archive.update_meeting(meeting_id, **changes)
+                archive.finalize(meeting_id)
+                if status == "completed":
+                    archive.update_meeting(meeting_id, provisional=False,
+                                           archivePublication="published", archiveKind="video",
+                                           archiveItemId=meeting_id)
+                    try:
+                        archive.finalize(meeting_id)
+                    except Exception:
+                        archive.update_meeting(meeting_id, provisional=True,
+                                               archivePublication="pending")
+                        raise
+                    history_store.update(job_id, archivePublication="published",
+                                         archiveKind="video", archiveItemId=meeting_id,
+                                         speechAvailability=changes.get("speechAvailability", "no_speech"))
+            elif preserve_published:
+                logger.info("Preserving previously published meeting after failed retry job_id=%s", job_id)
         except Exception:
             logger.exception("Could not synchronize meeting archive job status job_id=%s", job_id)
+            if status == "completed" and not job.settings.get("_preservePublishedMeeting"):
+                publication_error = ("Обработка завершена, но публикация видео в архиве не удалась. "
+                                     "Проверьте доступность архива и повторите попытку.")
+                history_store.update(job_id, status="failed", error=publication_error,
+                                     errorCode="storage_unavailable", archivePublication="pending")
+                with jobs_lock:
+                    current = jobs.get(job_id)
+                    if current:
+                        current.status = "failed"
+                        current.error = publication_error
+    elif status == "completed" and record.get("archivePublication") == "pending":
+        _reconcile_audio_publication(job_id)
+    if status == "completed":
+        _cleanup_successful_job_media(job_id)
     return True
 
 
@@ -1163,9 +1667,22 @@ def _leave_simple_job_cancelling(job_id: str) -> None:
 
 def _task_failure_message(code: str, fallback: str | None = None) -> str:
     messages = {
+        "media_empty": "Файл пустой: в нём нет ни одного байта.",
+        "media_format_unsupported": "Не удалось распознать аудио- или видеопотоки. Проверьте формат файла и выберите поддерживаемый медиафайл.",
+        "media_video_missing": "Источник не содержит пригодного видеопотока. Выберите видеозапись для встречи.",
+        "audio_silent": "Звуковая дорожка декодирована, но содержит только цифровую тишину. Выберите файл с записанным звуком.",
+        "media_decode_unavailable": "Не удалось проверить медиапотоки: компонент декодирования недоступен. Повторите попытку.",
+        "media_decode_failed": "Не удалось декодировать медиапотоки. Проверьте файл и повторите попытку.",
+        "media_download_failed": "Не удалось загрузить видео по ссылке. Проверьте подключение и повторите попытку.",
+        "media_download_unavailable": "Загрузчик видео недоступен. Повторите попытку.",
         "source_unavailable": "Исходный файл недоступен. Проверьте путь и повторите попытку.",
         "source_invalid": "Не удалось прочитать исходный файл. Проверьте файл и повторите попытку.",
+        "media_probe_unavailable": "Не удалось определить тип локального файла: проверьте установку ffprobe и повторите попытку.",
+        "media_probe_failed": "Не удалось проверить структуру локального файла через ffprobe. Проверьте файл и повторите попытку.",
+        "storage_unavailable": "Не удалось сохранить локальное видео в архив встречи. Проверьте доступность архива и свободное место.",
+        "audio_missing": "Видеофайл не содержит аудиодорожки; экранные материалы сохранены без расшифровки речи.",
         "transcription_failed": "Не удалось обработать эту запись. Проверьте источник и повторите попытку.",
+        "repetitive_transcription": "Whisper повторял один и тот же текст при распознавании, даже после повтора.",
         "internal_error": "Не удалось завершить обработку. Повторите попытку.",
         "model_download_failed": "Не удалось загрузить модель. Проверьте подключение к интернету и повторите попытку.",
         "model_unavailable": "Выбранная модель сейчас недоступна. Проверьте подключение или выберите другую модель.",
@@ -1395,6 +1912,7 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
     acquired = False
     activity_held = False
     meeting_speech_started = None
+    dictionary_file: Path | None = None
     with jobs_lock:
         job = jobs.get(job_id)
         if job is None or job.status in {"completed", "failed", "cancelled", "interrupted"}:
@@ -1419,22 +1937,76 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
         hold_activity(f"simple-job:{job_id}")
         activity_held = True
         meeting = _meeting_job(job_id)
+        _simple_stage_event(job_id, "source_check", "active")
+        update_job(job_id, stage="source_check")
+        try:
+            if meeting and Path(source_path).is_file():
+                _classify_existing_meeting_source(job_id, source_path, controller)
+                meeting = _meeting_job(job_id)
+                job = get_job(job_id)
+            source_type = job.settings.get("_sourceType")
+            if source_type == "url" and not meeting:
+                source_path = _download_simple_media(job_id, source_path, controller)
+                job = get_job(job_id)
+            if source_type in {"file", "url"} and not Path(source_path).is_file():
+                raise TaskFailure(_task_failure_message("source_unavailable"), "source_unavailable", stage="source")
+            if source_type in {"file", "url"} and not meeting:
+                promoted = _classify_manual_file(job_id, source_path, controller)
+                if promoted is not None:
+                    source_path = promoted[0]
+                    job = get_job(job_id)
+                    meeting = _meeting_job(job_id)
+        except JobCancelled:
+            raise
+        except Exception:
+            _simple_stage_event(job_id, "source_check", "failed")
+            raise
+        _simple_stage_event(job_id, "source_check", "completed")
+        if meeting and job.settings.get("_reusePublishedMeeting"):
+            controller.check_cancelled()
+            _finalize_simple_job(job_id, "completed")
+            return
         if meeting and "speech" not in meeting[2]:
             controller.check_cancelled()
             _run_meeting_post_stages(job_id, source_path)
             controller.check_cancelled()
             _finalize_simple_job(job_id, "completed")
             return
+        if meeting and job.settings.get("_speechUnavailableReason"):
+            reason = str(job.settings["_speechUnavailableReason"])
+            from services.meeting_archive import MeetingArchive
+            archive = MeetingArchive(meeting[1])
+            meta = archive.get_meeting(meeting[0])
+            stage_state = dict(meta.get("stage_state", {}))
+            stage_state["speech"] = {"status": "unavailable", "reason": reason}
+            archive.update_meeting(meeting[0], stage_state=stage_state,
+                                   speech_status="unavailable", status="partial")
+            history_store.update(job_id, speechAvailability="unavailable", notice=reason)
+            update_job(job_id, stage="recognition", notice=reason)
+            _simple_stage_event(job_id, "recognition", "skipped")
+            _run_meeting_post_stages(job_id, source_path)
+            controller.check_cancelled()
+            _finalize_simple_job(job_id, "completed")
+            return
+        if meeting and "speech" not in meeting[2]:
+            controller.check_cancelled()
+            _run_meeting_post_stages(job_id, source_path)
+            controller.check_cancelled()
+            _finalize_simple_job(job_id, "completed")
+            return
+        snapshot = _capture_dictionary_snapshot(job_id)
+        dictionary_file = history_store.job_dir(job_id) / "dictionary-snapshot.json"
+        dictionary_file.parent.mkdir(parents=True, exist_ok=True)
+        dictionary_file.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+        job.settings["_dictionaryFile"] = str(dictionary_file)
         if meeting:
             meeting_speech_started = time.monotonic()
-        source_type = job.settings.get("_sourceType")
-        if source_type == "file" and not Path(source_path).is_file():
-            raise TaskFailure(_task_failure_message("source_unavailable"), "source_unavailable", stage="source")
         persisted = history_store.get(job_id) or {}
         profile = job.settings.get("_profile") or persisted.get("profile")
         requested_device = job.settings.get("_requestedDevice", persisted.get("device", "cpu"))
         try:
-            simple_profiles.resolve(profile, requested_device)
+            resolve_device = requested_device if job.settings.get("_executionMode", "manual") == "manual" else "cpu"
+            simple_profiles.resolve(profile, resolve_device)
         except ValueError as exc:
             raise TaskFailure(str(exc), "device_unavailable", stage="preparation") from exc
         selected_gpu = _resolve_simple_execution(job_id, job)
@@ -1491,14 +2063,17 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
         from services.asr_resources import invalidate_runtime_cache
 
         invalidate_runtime_cache()
+        if job.settings.get("device") != "cpu" and selected_gpu:
+            _run_simple_gpu_smoke(job, controller, selected_gpu)
         _checkpoint_update(job_id, "preparation", "completed")
         _simple_progress(job_id, "preparation", {"percent": 100, "ready": True})
 
-        if job.settings.get("_requestedDevice") == "gpu" and selected_gpu:
-            _run_simple_gpu_smoke(job, controller, selected_gpu)
-
         controller.check_cancelled()
-        command = build_command(job, source_path)
+        update_job(job_id, stage="source")
+        _simple_stage_event(job_id, "source", "active")
+        _simple_progress(job_id, "source", {})
+        speech_source = _prepare_simple_speech_source(job_id, source_path, controller)
+        command = build_command(job, speech_source)
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env.setdefault("PYTHONUTF8", "1")
@@ -1516,12 +2091,12 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
                 env.pop("VT_VULKAN_DEVICE_INDEX", None)
         update_job(job_id, status="running", stage="source")
         controller.check_cancelled()
-        _simple_stage_event(job_id, "source", "active")
-        _simple_progress(job_id, "source", {})
         append_log(job_id, f"$ {' '.join(command)}")
 
         pipeline_error: str | None = None
         pipeline_error_code: str | None = None
+        deferred_result: dict[str, Any] | None = None
+        deferred_complete: dict[str, Any] | None = None
 
         def on_pipeline_line(line: str) -> None:
             nonlocal pipeline_error, pipeline_error_code
@@ -1551,16 +2126,24 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
                 _simple_stage_event(job_id, stage, payload.get("status", "active"))
                 _simple_progress(job_id, stage, payload)
             elif payload["type"] == "result":
-                apply_result(job_id, payload["result"])
-                stage = payload.get("stage", "result")
-                update_job(job_id, stage=stage)
-                _simple_stage_event(job_id, stage, payload.get("status", "completed"))
-                _simple_progress(job_id, stage, {"percent": 100})
+                if meeting:
+                    nonlocal deferred_result
+                    deferred_result = payload
+                else:
+                    apply_result(job_id, payload["result"])
+                    stage = payload.get("stage", "result")
+                    update_job(job_id, stage=stage)
+                    _simple_stage_event(job_id, stage, payload.get("status", "completed"))
+                    _simple_progress(job_id, stage, {"percent": 100})
             elif payload["type"] == "complete":
-                apply_complete(job_id, payload.get("results", []))
-                update_job(job_id, stage=payload.get("stage", "result"))
-                _finish_simple_checkpoints(job_id)
-                _simple_stage_event(job_id, "result", "completed")
+                if meeting:
+                    nonlocal deferred_complete
+                    deferred_complete = payload
+                else:
+                    apply_complete(job_id, payload.get("results", []))
+                    update_job(job_id, stage=payload.get("stage", "result"))
+                    _finish_simple_checkpoints(job_id)
+                    _simple_stage_event(job_id, "result", "completed")
             elif payload["type"] == "error":
                 pipeline_error = payload.get("message")
                 pipeline_error_code = payload.get("code")
@@ -1579,9 +2162,13 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
                 code = "transcription_failed"
             raise TaskFailure(_task_failure_message(code, pipeline_error), code, stage=get_job(job_id).stage)
         current = get_job(job_id)
-        if current.output_path is None:
+        pending_results = (deferred_complete or {}).get("results", [])
+        pending_result = (deferred_result or {}).get("result")
+        if pending_result is None and pending_results:
+            pending_result = pending_results[-1]
+        if current.output_path is None and not (meeting and pending_result and pending_result.get("output_path")):
             raise RuntimeError("Transcription finished without an output file")
-        if current.result_text is None:
+        if current.result_text is None and not (meeting and pending_result and pending_result.get("text") is not None):
             raise RuntimeError("Расшифровка завершилась без результата.")
         controller.check_cancelled()
         if meeting:
@@ -1594,6 +2181,12 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
             archive.update_meeting(meeting_id, stage_state=stage_state, status="partial")
             _run_meeting_post_stages(job_id, source_path)
             controller.check_cancelled()
+            if deferred_result is not None:
+                apply_result(job_id, deferred_result["result"])
+            if deferred_complete is not None:
+                apply_complete(job_id, deferred_complete.get("results", []))
+            update_job(job_id, stage="result")
+            _simple_stage_event(job_id, "result", "completed")
         if not _finalize_simple_job(job_id, "completed", transcript=current.result_text):
             controller.check_cancelled()
             raise JobCancelled("This job was cancelled before results were published.")
@@ -1649,6 +2242,10 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
             if task_failure is not None:
                 code = task_failure.code
                 stage = task_failure.stage or get_job(job_id).stage
+                source_check = next((item for item in (history_store.get(job_id) or {}).get("checkpoints", [])
+                                     if item.get("stage") == "source_check"), None)
+                if source_check and source_check.get("status") == "failed":
+                    stage = "source_check"
                 message = (str(task_failure) if meeting_failure else
                            (_diarization_failure_message(code) if stage == "diarization"
                             else _task_failure_message(code, str(task_failure))))
@@ -1666,6 +2263,11 @@ def _run_simple_job(job_id: str, source_path: str) -> None:
             _finalize_simple_job(job_id, "failed", error=message, error_code=code)
             _pause_simple_queue_for_error(code, message if meeting_failure else None, force=meeting_failure)
     finally:
+        if dictionary_file is not None:
+            try:
+                dictionary_file.unlink(missing_ok=True)
+            except OSError:
+                pass
         if activity_held:
             from services.meeting_activity import release_activity
             release_activity(f"simple-job:{job_id}")
@@ -1976,7 +2578,10 @@ def apply_result(job_id: str, result: dict[str, Any]) -> None:
         effective_backend = result.get("effective_backend") or (current_job.effective_backend if current_job else None)
         precision = result.get("precision") or (current_job.precision if current_job else None)
         asr_diagnostics = (result.get("diagnostics") or result.get("asr_diagnostics")
-                           or result.get("asrDiagnostics") or simple_record.get("asrDiagnostics"))
+                           or result.get("asrDiagnostics")
+                           or ({"dictionary": result["dictionaryDiagnostics"]}
+                               if isinstance(result.get("dictionaryDiagnostics"), dict) else None)
+                           or simple_record.get("asrDiagnostics"))
         simple_execution_fields = {
             "model": model_id, "effectiveModel": effective_model,
             "effectiveDevice": effective_device, "effectiveBackend": effective_backend,
@@ -2055,6 +2660,8 @@ def apply_complete(job_id: str, results: list[dict[str, Any]]) -> None:
                          precision=precision,
                          asrDiagnostics=(latest_result.get("diagnostics") or latest_result.get("asr_diagnostics")
                                          or latest_result.get("asrDiagnostics")
+                                         or ({"dictionary": latest_result["dictionaryDiagnostics"]}
+                                             if isinstance(latest_result.get("dictionaryDiagnostics"), dict) else None)
                                          or existing_record.get("asrDiagnostics")))
 
     update_job(
@@ -2108,6 +2715,8 @@ def build_command(job: JobState, source_path: str) -> list[str]:
         command.append("--restore_punctuation")
     if settings.get("_simple"):
         command.append("--single-source")
+        if settings.get("_dictionaryFile"):
+            command.extend(["--dictionary-file", str(settings["_dictionaryFile"])])
         if settings.get("diarizationEnabled"):
             command.extend(["--diarization", "--diarization-device",
                             settings.get("diarizationDevice", "auto")])
@@ -2341,8 +2950,41 @@ def _simple_download_stem(record: dict[str, Any]) -> str:
     return stem or "Расшифровка"
 
 
+def _meeting_effective_text(record: dict[str, Any]) -> tuple[str | None, str | None]:
+    meeting_id = record.get("meetingId")
+    meeting_root = record.get("meetingRoot")
+    archive_root = record.get("archiveRoot")
+    if not meeting_id or not meeting_root:
+        return None, "Не удалось проверить архив встречи. Откройте её в Архиве → Встречи."
+    try:
+        root = Path(meeting_root).expanduser().resolve()
+        # Earlier meeting jobs predate job-bound archiveRoot. Their persisted
+        # meetingRoot is authoritative and remains read-only; compare both roots
+        # whenever the newer binding is present.
+        if archive_root:
+            bound_root = Path(archive_root).expanduser().resolve()
+            if root != bound_root:
+                return None, "Корень архива встречи не совпадает с корнем записи. Откройте её в Архиве → Встречи."
+        from services.meeting_archive import MeetingArchive
+        archive = MeetingArchive(root, read_only=True)
+        meta = archive.get_meeting(str(meeting_id))
+        if meta.get("meeting_id") != str(meeting_id):
+            return None, "Запись встречи не найдена в связанном архиве. Откройте её в Архиве → Встречи."
+        return archive.effective_text(str(meeting_id)), None
+    except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+        return None, "Текст встречи недоступен в связанном архиве. Откройте её в Архиве → Встречи."
+
+
 def _simple_shape(record: dict[str, Any], *, with_text: bool) -> dict[str, Any]:
     record = normalize_terminal_timing(record)
+    record_settings = record.get("settings") or {}
+    asr_diagnostics = record.get("asrDiagnostics") or {}
+    dictionary_diagnostics = (asr_diagnostics.get("dictionary")
+                             or (asr_diagnostics.get("asr") or {}).get("dictionary")
+                             or {}) if isinstance(asr_diagnostics, dict) else {}
+    dictionary_summary = ({key: dictionary_diagnostics.get(key) for key in
+                           ("version", "usedCount", "omittedCount", "truncated")}
+                          if isinstance(dictionary_diagnostics, dict) and dictionary_diagnostics else None)
     files = []
     download_stem = _simple_download_stem(record)
     for ext in ("txt", "md"):
@@ -2350,7 +2992,14 @@ def _simple_shape(record: dict[str, Any], *, with_text: bool) -> dict[str, Any]:
         if record["status"] == "completed" and path.is_file():
             files.append({"format": ext, "name": f"{download_stem}.{ext}",
                           "downloadUrl": f"/api/simple/jobs/{record['id']}/download?format={ext}"})
-    text = history_store.read_text(record["id"]) if with_text and record["status"] == "completed" else None
+    meeting_text_error = None
+    if with_text and record["status"] == "completed":
+        if record.get("meetingId"):
+            text, meeting_text_error = _meeting_effective_text(record)
+        else:
+            text = history_store.read_text(record["id"])
+    else:
+        text = None
     enabled = bool(record.get("diarizationEnabled", False))
     diarization = _diarization_record(record)
     diarization["turns"] = []
@@ -2368,7 +3017,18 @@ def _simple_shape(record: dict[str, Any], *, with_text: bool) -> dict[str, Any]:
                             "startedAt": None, "completedAt": None})
     result = {
         "id": record["id"], "sourceType": record["sourceType"], "source": record["source"],
+        "archiveRoot": record.get("archiveRoot"),
+        "meetingId": record.get("meetingId"), "meetingRoot": record.get("meetingRoot"),
+        "mediaClassification": record.get("mediaClassification"),
+        "archivePublication": record.get("archivePublication"),
+        "archiveKind": record.get("archiveKind"), "archiveItemId": record.get("archiveItemId"),
+        "speechAvailability": record.get("speechAvailability"),
+        "conversionOrigin": record.get("conversionOrigin"),
+        "recordingTitle": record.get("recordingTitle"),
         "profile": record["profile"], "device": record["device"], "cpuThreads": record["cpuThreads"],
+        "executionMode": record.get("executionMode", "manual"),
+        "autoAsrStatus": record_settings.get("autoAsrStatus"),
+        "dictionarySummary": dictionary_summary,
         "model": record.get("model") or (record.get("settings") or {}).get("model"),
         "effectiveModel": record.get("effectiveModel") or record.get("model"),
         "effectiveDevice": record.get("effectiveDevice"),
@@ -2389,6 +3049,11 @@ def _simple_shape(record: dict[str, Any], *, with_text: bool) -> dict[str, Any]:
     }
     if with_text:
         result["text"] = text
+        if record.get("meetingId"):
+            result["meetingTextError"] = meeting_text_error
+    remembered_terms = record.get("rememberedTerms")
+    if isinstance(remembered_terms, list) and remembered_terms:
+        result["rememberedTerms"] = remembered_terms
     return result
 
 
@@ -2467,7 +3132,8 @@ def _validate_simple_common(profile: str, device: str, cpu_threads: int) -> None
 
 def _simple_metadata(job_id: str, source: str, source_type: str, profile: str,
                      device: str, cpu_threads: int, restore_punctuation: bool,
-                     diarization_enabled: bool = False, diarization_device: str = "auto") -> tuple[dict, dict]:
+                     diarization_enabled: bool = False, diarization_device: str = "auto",
+                     execution_mode: str = "manual") -> tuple[dict, dict]:
     model = simple_profiles.PROFILES[profile][1]
     backend_device = "cpu" if device == "cpu" else "cpu"  # GPU capability is resolved at dispatch time.
     settings = {"_simple": True, "_outputDir": str(history_store.job_dir(job_id) / "output"),
@@ -2476,8 +3142,13 @@ def _simple_metadata(job_id: str, source: str, source_type: str, profile: str,
                 "model": model, "device": backend_device, "nproc": cpu_threads,
                 "outputFormat": "txt", "saveAudio": False, "useTimestamps": False,
                 "restorePunctuation": restore_punctuation,
-                "diarizationEnabled": diarization_enabled, "diarizationDevice": diarization_device}
+                "diarizationEnabled": diarization_enabled, "diarizationDevice": diarization_device,
+                "executionMode": execution_mode, "_executionMode": execution_mode}
+    from services.meeting_settings import load_settings
+    archive_root = load_settings(APP_ROOT)["archive_root"]
+    settings["_archiveRoot"] = archive_root
     metadata = {"id": job_id, "sourceType": source_type, "source": source,
+                "archiveRoot": archive_root, "executionMode": execution_mode,
                 "profile": profile, "device": device, "cpuThreads": cpu_threads,
                 "restorePunctuation": restore_punctuation,
                 "diarizationEnabled": diarization_enabled, "diarizationDevice": diarization_device,
@@ -2487,8 +3158,11 @@ def _simple_metadata(job_id: str, source: str, source_type: str, profile: str,
                 "checkpoints": initial_checkpoints(),
                 "settings": {key: settings[key] for key in
                              ("language", "model", "device", "nproc", "outputFormat", "saveAudio",
-                              "useTimestamps", "restorePunctuation", "diarizationEnabled", "diarizationDevice")},
+                              "useTimestamps", "restorePunctuation", "diarizationEnabled", "diarizationDevice",
+                              "executionMode")},
                 "artifactPaths": {ext: str(history_store.artifact(job_id, ext)) for ext in ("txt", "md")}}
+    metadata["mediaClassification"] = "pending"
+    metadata["archivePublication"] = "pending"
     if not diarization_enabled:
         checkpoint = next(item for item in metadata["checkpoints"] if item["stage"] == "diarization")
         checkpoint.update(status="skipped", completedAt=utc_now())
@@ -2499,7 +3173,14 @@ def _enqueue_simple_jobs(items: list[tuple[str, str]], profile: str, device: str
                          cpu_threads: int, restore_punctuation: bool,
                          diarization_enabled: bool = False, diarization_device: str = "auto",
                          meeting_ids: list[str] | None = None, stages: list[str] | None = None,
-                         meeting_root: str | None = None, execution_mode: str = "auto") -> list[dict]:
+                         meeting_root: str | None = None, execution_mode: str | None = None,
+                         job_ids: list[str] | None = None,
+                         request_ids: list[str | None] | None = None,
+                         request_sources: list[str | None] | None = None,
+                         conversion_origins: list[str | None] | None = None,
+                         cleanup_sources: list[str | None] | None = None,
+                         cleanup_source_roots: list[str | None] | None = None,
+                         job_metadata: list[dict[str, Any] | None] | None = None) -> list[dict]:
     _validate_simple_common(profile, device, cpu_threads)
     diarization_device = _validate_diarization_device(diarization_device)
     with jobs_lock:
@@ -2508,24 +3189,64 @@ def _enqueue_simple_jobs(items: list[tuple[str, str]], profile: str, device: str
         queue = get_simple_queue()
         if meeting_ids is not None and len(meeting_ids) != len(items):
             raise HTTPException(status_code=400, detail="meeting_ids must match the number of job sources")
+        if job_ids is not None and len(job_ids) != len(items):
+            raise HTTPException(status_code=400, detail="job_ids must match the number of job sources")
+        if request_ids is not None and len(request_ids) != len(items):
+            raise HTTPException(status_code=400, detail="request_ids must match the number of job sources")
+        if request_sources is not None and len(request_sources) != len(items):
+            raise HTTPException(status_code=400, detail="request_sources must match the number of job sources")
+        if conversion_origins is not None and len(conversion_origins) != len(items):
+            raise HTTPException(status_code=400, detail="conversion_origins must match the number of job sources")
+        if cleanup_sources is not None and len(cleanup_sources) != len(items):
+            raise HTTPException(status_code=400, detail="cleanup_sources must match the number of job sources")
+        if cleanup_source_roots is not None and len(cleanup_source_roots) != len(items):
+            raise HTTPException(status_code=400, detail="cleanup_source_roots must match the number of job sources")
+        if job_metadata is not None and len(job_metadata) != len(items):
+            raise HTTPException(status_code=400, detail="job_metadata must match the number of job sources")
         records_metadata, prepared = [], []
         for index, (source, source_type) in enumerate(items):
-            job_id = uuid.uuid4().hex
+            job_id = job_ids[index] if job_ids is not None else uuid.uuid4().hex
+            selected_mode = execution_mode or ("auto" if meeting_ids is not None else "manual")
             metadata, settings = _simple_metadata(job_id, source, source_type, profile, device,
                                                   cpu_threads, restore_punctuation,
-                                                  diarization_enabled, diarization_device)
+                                                  diarization_enabled, diarization_device,
+                                                  selected_mode)
             if meeting_ids is not None:
                 meeting_id = meeting_ids[index]
                 selected_stages = list(stages or ["speech"])
                 settings.update(_meetingId=meeting_id, _meetingRoot=meeting_root,
-                                _meetingStages=selected_stages, _executionMode=execution_mode,
+                                _meetingStages=selected_stages, _executionMode=selected_mode,
                                 useTimestamps=True)
                 metadata.update(meetingId=meeting_id, meetingRoot=meeting_root,
-                                meetingStages=selected_stages, executionMode=execution_mode)
+                                meetingStages=selected_stages, executionMode=selected_mode)
                 metadata["settings"].update(useTimestamps=True)
+                prior_recordings = [row for row in history_store.list()
+                                    if row.get("meetingId") == meeting_id and row.get("cleanupSource")]
+                if prior_recordings:
+                    prior = max(prior_recordings, key=lambda item: item.get("createdAt") or "")
+                    metadata["cleanupSource"] = prior.get("cleanupSource")
+                    metadata["cleanupSourceRoot"] = prior.get("cleanupSourceRoot")
+            if request_ids is not None and request_ids[index] is not None:
+                metadata["requestId"] = request_ids[index]
+                metadata["requestSource"] = request_sources[index] if request_sources else source
+            if conversion_origins is not None and conversion_origins[index] is not None:
+                metadata["conversionOrigin"] = conversion_origins[index]
+            if cleanup_sources is not None and cleanup_sources[index] is not None:
+                metadata["cleanupSource"] = cleanup_sources[index]
+                metadata["cleanupSourceRoot"] = (cleanup_source_roots[index]
+                                                   if cleanup_source_roots else None)
+            if job_metadata is not None and isinstance(job_metadata[index], dict):
+                metadata.update(job_metadata[index])
             records_metadata.append(metadata)
             prepared.append((job_id, source, settings))
         records = queue.enqueue_many(records_metadata)
+        for record in records:
+            if record.get("archivePublication") == "pending" and record.get("archiveRoot"):
+                try:
+                    from services.archive_catalog import update_from_history
+                    update_from_history(history_store, record["id"], record=record)
+                except (ImportError, OSError, ValueError):
+                    logger.exception("Could not hide pending archive job_id=%s", record["id"])
         for job_id, source, settings in prepared:
             jobs[job_id] = JobState(id=job_id, settings=settings, source_name=source)
             job_process_controllers[job_id] = JobProcessController()
@@ -2533,6 +3254,187 @@ def _enqueue_simple_jobs(items: list[tuple[str, str]], profile: str, device: str
     dispatcher = _get_simple_dispatcher()
     dispatcher.start()
     return records
+
+
+def ensure_media_conversion_dispatcher_started() -> bool:
+    """Resume persisted queued work after host restart; a paused queue stays paused."""
+    for record in history_store.list():
+        if (record.get("status") == "completed" and not record.get("meetingId")
+                and record.get("mediaClassification") == "audio"
+                and record.get("archivePublication") == "pending"):
+            _reconcile_audio_publication(record["id"])
+    if not get_simple_queue().ids():
+        return False
+    _get_simple_dispatcher().start()
+    return True
+
+
+def _reconcile_audio_publication(job_id: str) -> bool:
+    """Retry the portable transcript write while leaving failed publication hidden."""
+    record = history_store.get(job_id)
+    if (not record or record.get("status") != "completed" or record.get("meetingId")
+            or record.get("archivePublication") != "pending"
+            or record.get("mediaClassification") != "audio" or not record.get("archiveRoot")):
+        return False
+    try:
+        prospective = {**record, "archivePublication": "published",
+                       "archiveKind": "audio", "archiveItemId": job_id}
+        from services.archive_catalog import write_record
+        text = history_store.read_text(job_id)
+        written = write_record(record["archiveRoot"], prospective, text)
+        if written is None:
+            raise OSError("The portable transcription item was not written")
+        history_store.update(job_id, archivePublication="published", archiveKind="audio",
+                             archiveItemId=job_id)
+    except Exception:
+        logger.exception("Could not reconcile audio publication job_id=%s", job_id)
+        message = "Расшифровка готова, но не удалось опубликовать её в архиве. Проверьте доступность архива и повторите попытку."
+        history_store.update(job_id, status="failed", error=message,
+                             errorCode="storage_unavailable", archivePublication="pending")
+        with jobs_lock:
+            current = jobs.get(job_id)
+            if current:
+                current.status = "failed"
+                current.error = message
+        return False
+    if text is not None and text.strip():
+        try:
+            from services.archive_catalog import enqueue_transcription_index
+            enqueue_transcription_index(record["archiveRoot"], prospective, text)
+        except Exception:
+            logger.exception("Could not enqueue audio transcription indexing job_id=%s", job_id)
+    return True
+
+
+def enqueue_media_conversion(path: str, request_id: str | None = None) -> dict[str, Any]:
+    """Queue a file conversion through the shared UI/MCP persistent queue."""
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("path must be a non-empty string")
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("path must be absolute")
+    canonical = candidate.resolve()
+    if not canonical.is_file():
+        raise ValueError("path must refer to an existing file")
+    if request_id is not None:
+        if (not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 128
+                or any(unicodedata.category(char) == "Cc" for char in request_id)):
+            raise ValueError("request_id must be a non-empty opaque string of at most 128 characters")
+        request_id = request_id.strip()
+        job_id = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:32]
+    else:
+        job_id = None
+    with _media_conversion_lock:
+        existing = history_store.get(job_id) if job_id else None
+        if existing is not None:
+            original = existing.get("requestSource") or existing.get("source")
+            if existing.get("sourceType") != "file" or str(Path(original).expanduser().resolve()) != str(canonical):
+                raise ValueError("request_id is already associated with a different source")
+            result = _simple_shape(existing, with_text=False)
+            result["job_id"] = result["id"]
+            result["kind"] = existing.get("archiveKind") if existing.get("archivePublication") == "published" else None
+            result["item_id"] = (existing.get("archiveItemId") or
+                                 (existing["id"] if existing.get("archiveKind") == "audio" else None)) \
+                if existing.get("archivePublication") == "published" else None
+            result["queuePosition"] = get_simple_queue().position(result["id"])
+            return result
+        from services.meeting_settings import load_settings
+        preferences = load_settings(APP_ROOT)
+        try:
+            record = _enqueue_simple_jobs([(str(canonical), "file")], preferences["profile"], preferences["device"],
+                                           max(1, min(4, logical_cpu_count())), False,
+                                           execution_mode=preferences["execution_mode"],
+                                           job_ids=[job_id] if job_id else None,
+                                           request_ids=[request_id] if request_id else None,
+                                       request_sources=[str(canonical)] if request_id else None,
+                                       conversion_origins=["mcp"])[0]
+        except HTTPException as exc:
+            raise RuntimeError(str(exc.detail)) from exc
+    result = _simple_shape(record, with_text=False)
+    result["job_id"] = result["id"]
+    result["kind"] = record.get("archiveKind") if record.get("archivePublication") == "published" else None
+    result["item_id"] = (record.get("archiveItemId") or
+                         (record["id"] if record.get("archiveKind") == "audio" else None)) \
+        if record.get("archivePublication") == "published" else None
+    result["queuePosition"] = get_simple_queue().position(result["id"])
+    return result
+
+
+def media_conversion_status(job_id: str) -> dict[str, Any] | None:
+    record = history_store.get(str(job_id))
+    if record is None:
+        return None
+    result = _simple_shape(record, with_text=False)
+    result["job_id"] = result["id"]
+    result["kind"] = record.get("archiveKind") if record.get("archivePublication") == "published" else None
+    result["item_id"] = (record.get("archiveItemId") or
+                         (record["id"] if record.get("archiveKind") == "audio" else None)) \
+        if record.get("archivePublication") == "published" else None
+    result["queuePosition"] = get_simple_queue().position(result["id"])
+    return result
+
+
+def enqueue_existing_meeting_conversion(path: str, meeting_id: str, root: str,
+                                        cleanup_source: str | None = None,
+                                        cleanup_source_root: str | None = None) -> dict[str, Any]:
+    """Queue a staged/imported video in the shared persistent transcription queue."""
+    candidate = Path(path).expanduser().resolve()
+    archive_root = str(Path(root).expanduser().resolve())
+    if not candidate.is_file():
+        raise ValueError("meeting source file is unavailable")
+    from services.meeting_settings import load_settings
+    preferences = load_settings(APP_ROOT)
+    active = [row for row in history_store.list()
+              if row.get("meetingId") == meeting_id and row.get("meetingRoot")
+              and str(Path(row["meetingRoot"]).expanduser().resolve()) == archive_root
+              and row.get("status") in {"queued", "running", "cancelling"}]
+    if active:
+        row = max(active, key=lambda item: item.get("createdAt") or "")
+        result = _simple_shape(row, with_text=False)
+        result["job_id"] = result["id"]
+        result["queuePosition"] = get_simple_queue().position(result["id"])
+        return result
+    record = _enqueue_simple_jobs([(str(candidate), "file")], preferences["profile"],
+                                   preferences["device"], max(1, min(4, logical_cpu_count())), False,
+                                   meeting_ids=[meeting_id], stages=["speech", "screen", "audio", "index"],
+                                   meeting_root=archive_root,
+                                   execution_mode=preferences["execution_mode"],
+                                   conversion_origins=["recorder"],
+                                   cleanup_sources=[str(Path(cleanup_source).expanduser().resolve())
+                                                    if cleanup_source else None],
+                                   cleanup_source_roots=[str(Path(cleanup_source_root).expanduser().resolve())
+                                                         if cleanup_source_root else None])[0]
+    try:
+        from services.meeting_archive import MeetingArchive
+        archive = MeetingArchive(archive_root)
+        meta = archive.get_meeting(meeting_id)
+        if meta.get("provisional"):
+            archive.update_meeting(meeting_id, job_id=record["id"], job_status=record["status"],
+                                   archivePublication="pending", archiveKind="video",
+                                   archiveItemId=meeting_id)
+    except Exception:
+        logger.exception("Could not link accepted conversion to meeting_id=%s", meeting_id)
+    return {**_simple_shape(record, with_text=False), "job_id": record["id"],
+            "queuePosition": get_simple_queue().position(record["id"])}
+
+
+def enqueue_recording_conversion(path: str, *, title: str, started_at: str | None,
+                                 track_roles: dict[str, str], cleanup_root: str) -> dict[str, Any]:
+    """Queue an OBS-owned capture without publishing/copying it before classification."""
+    source = Path(path).expanduser().resolve()
+    if not source.is_file():
+        raise ValueError("recording file is unavailable")
+    from services.meeting_settings import load_settings
+    preferences = load_settings(APP_ROOT)
+    record = _enqueue_simple_jobs(
+        [(str(source), "file")], preferences["profile"], preferences["device"],
+        max(1, min(4, logical_cpu_count())), False,
+        execution_mode=preferences["execution_mode"], conversion_origins=["recorder"],
+        cleanup_sources=[str(source)], cleanup_source_roots=[str(Path(cleanup_root).expanduser().resolve())],
+        job_metadata=[{"recordingTitle": title, "recordingStartedAt": started_at,
+                       "recordingTrackRoles": dict(track_roles)}])[0]
+    return {**_simple_shape(record, with_text=False), "job_id": record["id"],
+            "queuePosition": get_simple_queue().position(record["id"])}
 
 
 def _queue_summary(record: dict[str, Any], position: int | None) -> dict[str, Any]:
@@ -2678,7 +3580,8 @@ def create_simple_job(payload: SimpleJobRequest):
         source = str(path)
     record = _enqueue_simple_jobs([(source, payload.sourceType)], payload.profile, payload.device,
                                   payload.cpuThreads, payload.restorePunctuation,
-                                  payload.diarizationEnabled, payload.diarizationDevice)[0]
+                                  payload.diarizationEnabled, payload.diarizationDevice,
+                                  execution_mode=payload.executionMode or "manual")[0]
     return _simple_shape(record, with_text=True)
 
 
@@ -2705,7 +3608,8 @@ def create_simple_batch(payload: SimpleBatchRequest):
             rejected.append({"path": str(raw), "message": str(exc)})
     records = _enqueue_simple_jobs(accepted, payload.profile, payload.device,
                                    payload.cpuThreads, payload.restorePunctuation,
-                                   payload.diarizationEnabled, payload.diarizationDevice) if accepted else []
+                                   payload.diarizationEnabled, payload.diarizationDevice,
+                                   execution_mode=payload.executionMode or "manual") if accepted else []
     return {"jobs": [_simple_shape(record, with_text=False) for record in records],
             "queue": get_simple_queue_snapshot(), "rejected": rejected}
 
@@ -2718,23 +3622,44 @@ def cancel_simple_job(job_id: str):
 
 @app.put("/api/simple/jobs/{job_id}/text")
 def edit_simple_text(job_id: str, payload: SimpleTextRequest):
+    current = history_store.get(job_id)
+    if current and current.get("meetingId"):
+        raise HTTPException(
+            status_code=409,
+            detail="Текст видео редактируется в редакторе встречи. Откройте запись в Архиве → Встречи.",
+        )
     try:
         record = history_store.replace_text(job_id, payload.text, payload.baseRevision)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail="Расшифровка не найдена.") from exc
     except PermissionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return {"text": payload.text, "revision": record["revision"]}
+    response = {"text": payload.text, "revision": record["revision"]}
+    remembered_terms = _simple_shape(record, with_text=False).get("rememberedTerms")
+    if remembered_terms:
+        response["rememberedTerms"] = remembered_terms
+    return response
 
 
 @app.get("/api/simple/jobs/{job_id}/download")
 def download_simple_text(job_id: str, format: str = "txt"):
+    if format not in {"txt", "md"}:
+        raise HTTPException(status_code=400, detail="Формат должен быть txt или md.")
+    record = history_store.get(job_id)
+    if not record or record["status"] != "completed":
+        raise HTTPException(status_code=404, detail="Файл расшифровки не найден.")
+    if record.get("meetingId"):
+        text, error = _meeting_effective_text(record)
+        if error:
+            raise HTTPException(status_code=409, detail=error)
+        filename = f"{_simple_download_stem(record)}.{format}"
+        return Response(content=text or "", media_type="text/plain; charset=utf-8",
+                        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename, safe='')}"})
     try:
         path = history_store.artifact(job_id, format)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Формат должен быть txt или md.") from exc
-    record = history_store.get(job_id)
-    if not record or record["status"] != "completed" or not path.is_file():
+    if not path.is_file():
         raise HTTPException(status_code=404, detail="Файл расшифровки не найден.")
     return FileResponse(path=path, filename=f"{_simple_download_stem(record)}.{format}",
                         media_type="text/plain; charset=utf-8")
@@ -3027,6 +3952,10 @@ def download_result(job_id: str):
 
 
 app.include_router(model_management_router)
+from services.archive_api import router as archive_api_router
+from services.dictionary_api import router as dictionary_api_router
+app.include_router(archive_api_router)
+app.include_router(dictionary_api_router)
 from services.meeting_recording_api import router as meeting_recording_api_router
 app.include_router(meeting_recording_api_router)
 from services.meeting_hardware_api import router as meeting_hardware_api_router

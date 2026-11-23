@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 import web_api
 from services.meeting_archive import MeetingArchive
+from services.archive_catalog import write_record
 from services.meeting_recorder import MeetingRecorder
 from services.transcription_history import TranscriptionHistory
 
@@ -38,6 +39,12 @@ class MeetingApiTests(unittest.TestCase):
         web_api.get_simple_queue().set_state(True)
 
     def tearDown(self):
+        from services.archive_catalog import wait_archive_indexing_idle
+
+        self.assertTrue(
+            wait_archive_indexing_idle(timeout=20),
+            "portable archive indexing did not finish before test cleanup",
+        )
         web_api.reset_simple_queue_for_tests()
         with web_api.jobs_lock:
             web_api.jobs.clear()
@@ -55,9 +62,27 @@ class MeetingApiTests(unittest.TestCase):
     def _import(self):
         source = self.root / "запись.wav"
         source.write_bytes(b"audio")
+        meeting = MeetingArchive(self.root / "archive").import_file(source)
+        return meeting["meeting_id"], source
+
+    def test_import_queues_conversion_without_publishing_audio_as_meeting(self):
+        source = self.root / "queued audio.wav"
+        source.write_bytes(b"audio that has not been converted")
+        web_api.get_simple_queue().set_state(True)
+
         response = self.client.post("/api/meetings/import", json={"paths": [str(source)]})
-        self.assertEqual(response.status_code, 200)
-        return response.json()["items"][0]["meeting_id"], source
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["rejected"], [])
+        self.assertEqual(len(payload["jobs"]), 1)
+        job = payload["jobs"][0]
+        self.assertEqual(job["status"], "queued")
+        persisted = web_api.history_store.get(job["id"])
+        self.assertEqual(persisted["conversionOrigin"], "archive_import")
+        self.assertEqual(persisted["recordingTitle"], source.stem)
+        self.assertEqual(self.client.get("/api/meetings").json()["items"], [])
+        self.assertEqual(MeetingArchive(self.root / "archive").list_meetings(), [])
 
     def _finalize_meeting_job(self, meeting_id, job_id, *, status, stage, stages=None):
         archive_root = str(self.root / "archive")
@@ -305,9 +330,16 @@ class MeetingApiTests(unittest.TestCase):
         recorder._connect = lambda attempts=1: Client()
         recorder._status_from_obs = lambda: {"state": "idle", "connected": True}
         result = recorder.stop()
-        self.assertEqual(result["meeting"]["meeting_id"], recorder.archive.list_meetings()[0]["meeting_id"])
+        self.assertIn("job", result)
+        self.assertIn("recorder", result)
+        record = web_api.history_store.get(result["job"]["id"])
+        self.assertEqual(record["conversionOrigin"], "recorder")
+        self.assertEqual(record["recordingTitle"], "QA meeting")
+        self.assertEqual(record["recordingTrackRoles"], {"1": "mix", "2": "browser", "3": "microphone"})
+        self.assertTrue(capture.is_file())
+        self.assertEqual(recorder.archive.list_meetings(), [])
         listed = self.client.get("/api/meetings").json()["items"]
-        self.assertIn(result["meeting"]["meeting_id"], [item["meeting_id"] for item in listed])
+        self.assertEqual(listed, [])
 
     def test_import_to_manual_queue_restores_flags_and_persists_real_timed_result(self):
         meeting_id, source = self._import()
@@ -375,7 +407,7 @@ class MeetingApiTests(unittest.TestCase):
         response = self.client.put("/api/meetings/settings", json={"profile": "unknown"})
         self.assertEqual(response.status_code, 400)
 
-    def test_manual_gpu_worker_is_attempted_without_speed_receipt(self):
+    def test_manual_gpu_screen_worker_uses_cpu_frame_extraction(self):
         from unittest.mock import patch
         staging = self.root / "worker-stage"
         staging.mkdir()
@@ -386,81 +418,35 @@ class MeetingApiTests(unittest.TestCase):
             result_path.write_text(json.dumps({"ok": True, "stage": "screen"}), encoding="utf-8")
             return 0
         job = SimpleNamespace(settings={"_requestedDevice": "gpu", "_executionMode": "manual", "_profile": "balanced"})
-        runtime = {"device": "directml", "python": str(Path(__import__("sys").executable)),
-                   "env": {}, "verified": False, "reason": "manual attempt", "error": None}
         with patch("web_api.get_job", return_value=job), \
-             patch("services.meeting_hardware.plan_stage", return_value=runtime), \
              patch("web_api._run_owned_process", side_effect=run_owned):
             result = web_api._run_meeting_stage_worker("manual-gpu", "screen", str(self.root / "archive"),
-                "meeting-id", "", staging, "directml", None)
+                "meeting-id", "", staging, "gpu", None)
         self.assertTrue(result["ok"])
         command = command_seen["command"]
-        self.assertEqual(command[0], runtime["python"])
-        self.assertEqual(command[command.index("--device") + 1], "directml")
+        self.assertEqual(command[0], __import__("sys").executable)
+        self.assertEqual(command[command.index("--device") + 1], "cpu")
 
     def test_non_speech_retry_reuses_queue_without_calling_asr_resolver(self):
         meeting_id, source = self._import()
-        response = self.client.post("/api/meetings/process", json={
-            "meeting_ids": [meeting_id], "stages": ["screen"], "device": "cpu", "cpu_threads": 2,
-        })
-        self.assertEqual(response.status_code, 202, response.text)
-        job_id = response.json()["jobs"][0]["id"]
-        with patch("services.meeting_pipeline.run_stages", return_value={"stages": {"screen": {"status": "ready"}}, "manifest": {}}) as stages, \
+        with patch.object(web_api, "_classify_existing_meeting_source"), \
+             patch("services.meeting_pipeline.run_stages", return_value={"stages": {"screen": {"status": "ready"}}, "manifest": {}}) as stages, \
              patch.object(web_api, "_resolve_simple_execution", side_effect=AssertionError("ASR must not run")):
+            response = self.client.post("/api/meetings/process", json={
+                "meeting_ids": [meeting_id], "stages": ["screen"], "device": "cpu", "cpu_threads": 2,
+            })
+            self.assertEqual(response.status_code, 202, response.text)
+            job_id = response.json()["jobs"][0]["id"]
             web_api._run_simple_job(job_id, str(source))
         stages.assert_called_once()
         self.assertEqual(stages.call_args.args[3], ["screen"])
         self.assertEqual(web_api.history_store.get(job_id)["status"], "completed")
 
-    def test_manual_gpu_meeting_failure_pauses_shared_fifo_until_resume(self):
-        meeting_ids = []
-        for number in (1, 2):
-            source = self.root / f"meeting-{number}.wav"
-            source.write_bytes(f"distinct audio source {number}".encode("ascii"))
-            imported = self.client.post("/api/meetings/import", json={"paths": [str(source)]})
-            self.assertEqual(imported.status_code, 200, imported.text)
-            meeting_ids.append(imported.json()["items"][0]["meeting_id"])
-        jobs = []
-        for meeting_id in meeting_ids:
-            queued = self.client.post("/api/meetings/process", json={
-                "meeting_ids": [meeting_id], "execution_mode": "manual", "device": "gpu",
-                "stages": ["index"], "cpu_threads": 2,
-            })
-            self.assertEqual(queued.status_code, 202, queued.text)
-            jobs.append(queued.json()["jobs"][0]["id"])
-
-        calls = []
-        original_worker = web_api._run_meeting_stage_worker
-        def observed_worker(job_id, *args, **kwargs):
-            calls.append(job_id)
-            return original_worker(job_id, *args, **kwargs)
-
-        def wait_for(predicate, timeout=8):
-            deadline = __import__("time").monotonic() + timeout
-            while __import__("time").monotonic() < deadline:
-                if predicate():
-                    return
-                __import__("time").sleep(0.02)
-            self.fail("The shared meeting queue did not reach the expected state in time.")
-
-        with patch.object(web_api, "_run_meeting_stage_worker", side_effect=observed_worker):
-            self.assertTrue(self.client.post("/api/simple/queue/resume").json()["paused"] is False)
-            wait_for(lambda: web_api.get_simple_queue().state()["paused"] and
-                     web_api.history_store.get(jobs[0])["status"] == "failed")
-            self.assertEqual(calls, [jobs[0]])
-            self.assertEqual(web_api.history_store.get(jobs[1])["status"], "queued")
-            self.assertEqual(web_api.get_simple_queue().state()["pauseReason"]["code"], "gpu_stage_unsupported")
-            self.assertIn("GPU", web_api.get_simple_queue().state()["pauseReason"]["message"])
-            wait_for(lambda: web_api.simple_dispatcher is not None and
-                     web_api.simple_dispatcher.active_job_id is None)
-
-            resumed = self.client.post("/api/simple/queue/resume")
-            self.assertEqual(resumed.status_code, 200, resumed.text)
-            wait_for(lambda: web_api.get_simple_queue().state()["paused"] and
-                     web_api.history_store.get(jobs[1])["status"] == "failed")
-            self.assertEqual(calls, jobs)
-            self.assertEqual(web_api.jobs[jobs[1]].settings["_requestedDevice"], "gpu")
-            self.assertIn("GPU", web_api.get_simple_queue().state()["pauseReason"]["message"])
+    def test_manual_gpu_selection_does_not_gate_screen_stage(self):
+        planned = __import__("services.meeting_hardware", fromlist=["plan_stage"]).plan_stage(
+            "screen", "manual", "gpu")
+        self.assertEqual(planned["device"], "cpu")
+        self.assertIsNone(planned["error"])
 
     def test_recovered_active_job_marks_archive_interrupted(self):
         meeting_id, _source = self._import()
@@ -713,9 +699,29 @@ class MeetingApiTests(unittest.TestCase):
         response = self.client.post("/api/meetings/reindex")
         self.assertEqual(response.status_code, 200, response.text)
         job = response.json()["jobs"][0]
+        self.assertEqual(response.json()["queued_transcriptions"], 0)
         self.assertEqual(job["meetingId"], meeting_id)
         self.assertEqual(job["meetingStages"], ["index"])
         self.assertEqual(job["source"], "")
+
+    def test_reindex_reports_transcriptions_for_restored_ordinary_only_archive(self):
+        job_id = "e" * 32
+        write_record(
+            self.root / "archive",
+            {
+                "id": job_id,
+                "status": "completed",
+                "revision": 0,
+                "createdAt": "2026-01-01T00:00:00+00:00",
+                "title": "Restored transcript",
+            },
+            "Restored ordinary transcript text.",
+        )
+
+        response = self.client.post("/api/meetings/reindex")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"jobs": [], "queued_transcriptions": 1})
 
 
 if __name__ == "__main__":

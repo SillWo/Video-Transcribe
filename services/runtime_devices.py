@@ -311,7 +311,7 @@ def asr_gpu_candidate(model_id: str) -> dict[str, Any]:
     qwen_id = "qwen3-asr-1.7b"
     parakeet_id = "parakeet-tdt-0.6b-v3"
     is_new = model_id in {qwen_id, parakeet_id}
-    if model_id not in {qwen_id, parakeet_id, "small"}:
+    if model_id not in {qwen_id, parakeet_id, "small", "large-v3"}:
         return {"available": False, "canPrepare": False, "backend": None, "deviceIndex": None,
                 "name": None, "reason": "Для этой модели GPU backend не настроен."}
 

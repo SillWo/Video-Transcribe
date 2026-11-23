@@ -26,9 +26,9 @@ def _successful_smoke():
     }
 
 
-def test_quality_balanced_economy_map_to_new_models_and_small():
+def test_quality_balanced_economy_map_to_qwen_large_v3_and_small():
     assert simple_profiles.PROFILES["quality"][1] == "qwen3-asr-1.7b"
-    assert simple_profiles.PROFILES["balanced"][1] == "parakeet-tdt-0.6b-v3"
+    assert simple_profiles.PROFILES["balanced"][1] == "large-v3"
     assert simple_profiles.PROFILES["economy"][1] == "small"
 
 
@@ -133,18 +133,19 @@ def test_options_report_profile_specific_backend_and_default(tmp_path, monkeypat
     monkeypatch.setattr(asr_capabilities, "get_device_details", lambda: [{"id": "cpu", "name": "Test CPU"}])
     candidates = {
         "qwen3-asr-1.7b": _candidate("vulkan", 1, name="Arc"),
-        "parakeet-tdt-0.6b-v3": _candidate("directml", 2, name="Radeon"),
+        "large-v3": _candidate("vulkan", 2, name="Radeon"),
         "small": _candidate("vulkan", 3, name="Arc"),
     }
     monkeypatch.setattr(asr_capabilities, "asr_gpu_candidate", lambda model: candidates[model])
+    monkeypatch.setattr(asr_capabilities, "auto_whisper_candidate", lambda *_args, **_kwargs: None)
 
     result = simple_profiles.options(16)
 
     by_id = {row["id"]: row for row in result["profiles"]}
     assert by_id["quality"]["devices"]["gpu"]["backend"] == "vulkan"
-    assert by_id["balanced"]["devices"]["gpu"]["backend"] == "directml"
+    assert by_id["balanced"]["devices"]["gpu"]["backend"] == "vulkan"
     assert by_id["economy"]["devices"]["gpu"]["backend"] == "vulkan"
-    assert all(row["defaultDevice"] == "gpu" for row in by_id.values())
+    assert all(row["defaultDevice"] == "cpu" for row in by_id.values())
     assert result["devices"] == by_id["balanced"]["devices"]
 
 
@@ -161,3 +162,52 @@ def test_probe_cache_records_runtime_identity_precision_and_actual_diagnostics(t
     assert saved["driverVersion"] == "32.0.32015.7029"
     assert saved["resourceFingerprint"] == "fp"
     assert saved["diagnostics"]["gpu_verified"] is True
+
+
+def test_auto_whisper_receipt_requires_speed_quality_ids_and_current_identity(tmp_path, monkeypatch):
+    receipt_path = tmp_path / "asr-receipt.json"
+    monkeypatch.setattr(asr_capabilities, "ASR_BENCHMARK_RECEIPT", receipt_path)
+    candidate = _candidate("vulkan", 4, name="AMD", identity="adapter", driver="driver-1")
+    identity = {"model": "large-v3", "resourceFingerprint": "weights-1", "wordTimestamps": False}
+    monkeypatch.setattr(asr_capabilities, "asr_gpu_candidate", lambda _model: candidate)
+    monkeypatch.setattr(asr_capabilities, "asr_benchmark_identity", lambda *_args, **_kwargs: identity)
+    monkeypatch.setattr(asr_capabilities, "_resources_ready", lambda *_args: (True, None))
+
+    def write_receipt(speedup, quality=.97, mismatches=0, receipt_identity=identity):
+        receipt_path.write_text(json.dumps({
+            "verified": True, "identity": receipt_identity,
+            "assessment": {"speedup": speedup, "qualityAgreement": quality,
+                           "numericIdMismatches": mismatches, "actualGpuVerified": True,
+                           "criticalIdsPresent": True, "gatesPassed": True,
+                           "timedRunsPerBackend": 3, "warmupRunsPerBackend": 1,
+                           "quickRun": False},
+        }), encoding="utf-8")
+
+    write_receipt(1.49)
+    assert asr_capabilities.auto_whisper_candidate("large-v3") is None
+    write_receipt(1.5, quality=.949)
+    assert asr_capabilities.auto_whisper_candidate("large-v3") is None
+    write_receipt(1.5, mismatches=1)
+    assert asr_capabilities.auto_whisper_candidate("large-v3") is None
+    write_receipt(1.5)
+    assert asr_capabilities.auto_whisper_candidate("large-v3") == candidate
+    write_receipt(2.0, mismatches=None)
+    assert asr_capabilities.auto_whisper_candidate("large-v3") is None
+    write_receipt(float("nan"))
+    assert asr_capabilities.auto_whisper_candidate("large-v3") is None
+    write_receipt(float("inf"))
+    assert asr_capabilities.auto_whisper_candidate("large-v3") is None
+    stale = {**identity, "resourceFingerprint": "weights-2"}
+    write_receipt(2.0, receipt_identity=stale)
+    assert asr_capabilities.auto_whisper_candidate("large-v3") is None
+
+
+def test_vulkan_readiness_explains_missing_dictionary_tokenizer(monkeypatch):
+    monkeypatch.setattr("services.runtime_devices.find_whisper_cpp_executable", lambda: "whisper-cli.exe")
+    monkeypatch.setattr("services.prepare_models._vulkan_cached", lambda _model: True)
+    monkeypatch.setattr("services.whisper_cpp.cached_tokenizer_path", lambda _model: None)
+
+    ready, reason = asr_capabilities._resources_ready("large-v3", "vulkan")
+
+    assert ready is False
+    assert "tokenizer for dictionary hints" in reason

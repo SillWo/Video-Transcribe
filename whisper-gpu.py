@@ -24,7 +24,7 @@ from utils.get_audio import AudioProcess
 from utils.text_postprocess import build_polished_russian_text_from_segments, restore_russian_segment_text
 from services.runtime_devices import VULKAN_MODELS, get_device_details
 from services.task_errors import TaskFailure, failure_stage, is_invalid_source_error, is_out_of_memory_error
-from services.whisper_cpp import WhisperCppModel
+from services.whisper_cpp import WhisperCppModel, bound_whisper_vocabulary
 
 audio_file = "intermediate_audio_file.mp3"
 JSON_EVENT_PREFIX = "__VT_JSON__ "
@@ -33,6 +33,23 @@ JSON_EVENT_PREFIX = "__VT_JSON__ "
 def sizes_supported() -> list[str]:
     from services.asr_resources import NEW_MODELS
     return [*available_models(), *sorted(NEW_MODELS)]
+
+
+def _read_dictionary_snapshot(path: str | None) -> dict:
+    if not path:
+        return {"version": 0, "terms": []}
+    try:
+        snapshot = json.loads(Path(path).expanduser().resolve().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"version": 0, "terms": []}
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("terms"), list):
+        return {"version": 0, "terms": []}
+    try:
+        version = max(0, int(snapshot.get("version", 0)))
+    except (TypeError, ValueError):
+        version = 0
+    return {"version": version, "terms": [term for term in snapshot["terms"]
+                                              if isinstance(term, str) and term.strip()]}
 
 
 def logical_cpu_count() -> int:
@@ -92,6 +109,8 @@ def progress_callback(args, stage: str, message: str):
         values = values or {}
         percent = values.get("percent")
         phase = "alignment" if values.get("phase") == "alignment" else None
+        event_message = values.get("message", message)
+        retry_started = values.get("retry") is True
         now = timeit.default_timer()
         if percent is not None:
             try:
@@ -100,7 +119,8 @@ def progress_callback(args, stage: str, message: str):
                 percent = None
         changed_enough = percent is not None and (last_percent is None or abs(percent - last_percent) >= 1.0)
         phase_changed = phase != last_phase
-        if last_time and now - last_time < 1.0 and not changed_enough and not phase_changed:
+        if (last_time and now - last_time < 1.0 and not changed_enough and not phase_changed
+                and not retry_started):
             return
         last_time = now
         last_phase = phase
@@ -109,7 +129,7 @@ def progress_callback(args, stage: str, message: str):
         event = {"stage": stage, "percent": percent,
                  "completedBytes": values.get("completedBytes"), "totalBytes": values.get("totalBytes"),
                  "processedSeconds": values.get("processedSeconds"), "totalSeconds": values.get("totalSeconds"),
-                 "message": values.get("message", message)}
+                 "message": event_message}
         if phase == "alignment":
             event.update(phase="alignment", workerStage="alignment")
         emit_event(args, "progress", **event)
@@ -332,10 +352,47 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
                 raise TaskFailure(f"FFmpeg could not prepare diarization audio: {detail[-1200:]}",
                                   "source_invalid", stage="source")
             transcription_path = str(diarization_wav)
+        snapshot = _read_dictionary_snapshot(getattr(args, "dictionary_file", None))
+        dictionary_terms = snapshot["terms"]
+        dictionary_diagnostics = {"version": snapshot["version"], "usedTerms": [],
+                                  "omittedTerms": list(dictionary_terms), "usedCount": 0,
+                                  "omittedCount": len(dictionary_terms), "truncated": bool(dictionary_terms),
+                                  "integration": "none"}
         transcribe_kwargs = {"beam_size": args.beam_size, "language": language}
         if diarization_enabled:
             transcribe_kwargs["word_timestamps"] = True
+        if model.__class__.__name__ == "NewAsrModel":
+            transcribe_kwargs.update(vocabulary=dictionary_terms, dictionary_snapshot=snapshot)
+            dictionary_diagnostics = {"version": snapshot["version"], "usedTerms": dictionary_terms,
+                                      "omittedTerms": [], "usedCount": len(dictionary_terms),
+                                      "omittedCount": 0, "truncated": False,
+                                      "integration": "transcribe.cpp vocabulary"}
+        elif isinstance(model, WhisperCppModel):
+            transcribe_kwargs["vocabulary"] = dictionary_terms
+            whisper_model_name = getattr(args, "model_size", getattr(model, "model_name", "small"))
+            _prompt, bounded = bound_whisper_vocabulary(dictionary_terms, whisper_model_name)
+            dictionary_diagnostics = {"version": snapshot["version"], **bounded,
+                                      "integration": "whisper.cpp prompt"}
+        elif dictionary_terms:
+            whisper_model_name = getattr(args, "model_size", getattr(model, "model_name", "small"))
+            hotwords, bounded = bound_whisper_vocabulary(dictionary_terms, whisper_model_name)
+            if hotwords:
+                transcribe_kwargs["hotwords"] = hotwords
+            dictionary_diagnostics = {"version": snapshot["version"], **bounded,
+                                      "integration": "faster-whisper hotwords" if hotwords else "omitted"}
         segments_iter, stats = model.transcribe(transcription_path, **transcribe_kwargs)
+        if model.__class__.__name__ == "NewAsrModel":
+            dictionary_diagnostics = (getattr(model, "diagnostics", {}).get("dictionary")
+                                     or dictionary_diagnostics)
+        elif isinstance(model, WhisperCppModel):
+            actual_diagnostics = getattr(model, "dictionary_diagnostics", None)
+            if isinstance(actual_diagnostics, dict):
+                dictionary_diagnostics = {
+                    **dictionary_diagnostics,
+                    **actual_diagnostics,
+                    "version": snapshot["version"],
+                    "integration": dictionary_diagnostics.get("integration", "whisper.cpp prompt"),
+                }
         if native_progress is not None and not uses_native_whisper_cpp:
             # Consume the real lazy generator so progress follows completed segments.
             segment_list = []
@@ -480,6 +537,7 @@ def transcribe(args, model, full_filepath: str, filename: str | None = None) -> 
         "effective_backend": asr_effective_backend,
     }
     result["diarization"] = diarization
+    result["dictionaryDiagnostics"] = dictionary_diagnostics
     if model.__class__.__name__ == "NewAsrModel":
         result["model"] = model.model_id
         result["precision"] = model.precision
@@ -734,6 +792,7 @@ def build_argument_parser():
     parser.add_argument("--diarization", help="Enable Nemotron speaker diarization.", action="store_true", default=False)
     parser.add_argument("--diarization-device", help="Nemotron device ID (auto, cpu, cuda:N, or vulkan:N).", type=str, default="auto")
     parser.add_argument("--single-source", help=argparse.SUPPRESS, action="store_true")
+    parser.add_argument("--dictionary-file", help="JSON speech vocabulary snapshot for this job")
     parser.add_argument("--web_json", help=argparse.SUPPRESS, action="store_true")
     return parser
 

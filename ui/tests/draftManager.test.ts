@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { DraftManager, SelectionGate, flushAndRead } from '../src/lib/draftManager.ts'
+import { DraftManager, SelectionGate, flushAndRead, sharedDraftManager, transcriptionDraftKey } from '../src/lib/draftManager.ts'
 
 test('keeps drafts and revisions isolated by job id while saves are delayed', async () => {
   const drafts = new DraftManager()
@@ -51,6 +51,16 @@ test('does not overwrite a dirty draft when a completion response hydrates it', 
   assert.equal(drafts.get('A')?.revision, 0)
 })
 
+test('a stale clean GET cannot roll back text or revision after a successful save', async () => {
+  const drafts = new DraftManager()
+  drafts.open('A', 'old text', 1)
+  drafts.edit('A', 'saved text')
+  await drafts.flush('A', async (text, revision) => ({ text, revision: revision + 1 }))
+  drafts.hydrate('A', 'older server text', 1)
+  assert.equal(drafts.get('A')?.text, 'saved text')
+  assert.equal(drafts.get('A')?.revision, 2)
+})
+
 test('failed flush retains the editable draft and can be retried', async () => {
   const drafts = new DraftManager()
   drafts.open('A', 'source', 2)
@@ -94,4 +104,52 @@ test('copy/export keeps the captured task id while another task becomes selected
   }, (capturedId) => drafts.get(capturedId)?.text)
   assert.equal(await exported, 'edited A')
   assert.equal(selectedId, 'B')
+})
+
+test('archive and transcription views observe the same draft and late saves preserve the newest edit', async () => {
+  const id = `shared-${Date.now()}`
+  sharedDraftManager.open(id, 'server text', 2)
+  const observed: string[] = []
+  const unsubscribe = sharedDraftManager.subscribe(id, (record) => observed.push(record.text))
+  sharedDraftManager.edit(id, 'archive edit')
+  let release!: () => void
+  const blocked = new Promise<void>((resolve) => { release = resolve })
+  const persisted: string[] = []
+  const save = sharedDraftManager.save(id, async (text, revision) => {
+    if (text === 'archive edit') await blocked
+    persisted.push(text)
+    return { text, revision: revision + 1 }
+  }, 1)
+  sharedDraftManager.edit(id, 'transcription edit')
+  const flush = sharedDraftManager.flush(id, async (text, revision) => { persisted.push(text); return { text, revision: revision + 1 } })
+  release()
+  await Promise.all([save, flush])
+  assert.equal(sharedDraftManager.get(id)?.text, 'transcription edit')
+  assert.equal(sharedDraftManager.get(id)?.savedVersion, 2)
+  assert.deepEqual(persisted, ['archive edit', 'transcription edit'])
+  assert.ok(observed.includes('archive edit'))
+  assert.ok(observed.includes('transcription edit'))
+  unsubscribe()
+  sharedDraftManager.remove(id)
+})
+
+test('same job id in different archive roots has isolated drafts and keeps each root-bound save adapter', async () => {
+  const drafts = new DraftManager()
+  const firstKey = transcriptionDraftKey('same-id', 'D:\\Archive\\A')
+  const secondKey = transcriptionDraftKey('same-id', 'E:/Archive/B/')
+  assert.equal(transcriptionDraftKey('same-id', 'd:/archive/a/'), firstKey)
+  assert.notEqual(firstKey, secondKey)
+  drafts.open(firstKey, 'A source', 2)
+  drafts.open(secondKey, 'B source', 9)
+  const saved: string[] = []
+  drafts.registerPersister(firstKey, async (text, revision) => { saved.push(`A:${text}@${revision}`); return { text, revision: revision + 1 } })
+  drafts.registerPersister(secondKey, async (text, revision) => { saved.push(`B:${text}@${revision}`); return { text, revision: revision + 1 } })
+  drafts.edit(firstKey, 'A edit')
+  drafts.edit(secondKey, 'B edit')
+  await drafts.flushAll(async () => { throw new Error('bound adapter must take precedence') })
+  assert.deepEqual(saved.sort(), ['A:A edit@2', 'B:B edit@9'])
+  assert.equal(drafts.get(firstKey)?.text, 'A edit')
+  assert.equal(drafts.get(firstKey)?.revision, 3)
+  assert.equal(drafts.get(secondKey)?.text, 'B edit')
+  assert.equal(drafts.get(secondKey)?.revision, 10)
 })

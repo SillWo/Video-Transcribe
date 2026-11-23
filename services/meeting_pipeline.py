@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from services.job_processes import JobCancelled, JobProcessController
-from services.meeting_archive import MeetingArchive
+from services.meeting_archive import MeetingArchive, _uniquify_speech_ids
 
 STAGES = ("speech", "screen", "audio", "index")
 
@@ -32,10 +32,13 @@ _EVENT_PREFIX = "__VT_MEETING__ "
 
 def _worker_command(stage: str, root: Path, meeting_id: str, source: str | Path,
                     staging: Path, device: str) -> list[str]:
-    return [sys.executable, "-m", "services.meeting_worker", "--stage", stage,
+    command = [sys.executable, "-m", "services.meeting_worker", "--stage", stage,
             "--root", str(root), "--meeting-id", meeting_id,
             "--source", str(source or ""), "--result-path", str(staging / "result.json"),
             "--device", device]
+    if stage == "screen":
+        command += ["--mode", "frames_only"]
+    return command
 
 
 def _standalone_worker(stage: str, root: Path, meeting_id: str, source: str | Path,
@@ -102,29 +105,54 @@ def _standalone_worker(stage: str, root: Path, meeting_id: str, source: str | Pa
     return result
 
 
-def _commit_files(staging: Path, meeting_dir: Path, relative_paths: list[str]) -> None:
+def _commit_files(staging: Path, meeting_dir: Path, relative_paths: list[str], *,
+                  cancel: Callable[[], bool] | None = None,
+                  require_new: bool = False) -> list[Path]:
     root = staging.resolve()
     meeting_root = meeting_dir.resolve()
-    for relative_text in relative_paths:
-        relative = Path(relative_text)
-        if relative.is_absolute() or ".." in relative.parts:
-            raise ValueError("Worker returned an unsafe artifact path")
-        source = (staging / relative).resolve()
-        if source != root and root not in source.parents:
-            raise ValueError("Worker artifact resolves outside staging")
-        if not source.is_file():
-            raise FileNotFoundError(source)
-        target = meeting_dir / relative
-        resolved_target_parent = target.parent.resolve()
-        if resolved_target_parent != meeting_root and meeting_root not in resolved_target_parent.parents:
-            raise ValueError("Artifact target resolves outside meeting directory")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temp = target.with_name(target.name + f".{uuid.uuid4().hex}.tmp")
-        try:
-            shutil.copyfile(source, temp)
-            os.replace(temp, target)
-        finally:
-            temp.unlink(missing_ok=True)
+    published: list[Path] = []
+    try:
+        for relative_text in relative_paths:
+            if cancel and cancel():
+                raise InterruptedError("stage cancelled during artifact publication")
+            relative = Path(relative_text)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError("Worker returned an unsafe artifact path")
+            source = (staging / relative).resolve()
+            if source != root and root not in source.parents:
+                raise ValueError("Worker artifact resolves outside staging")
+            if not source.is_file():
+                raise FileNotFoundError(source)
+            target = meeting_dir / relative
+            resolved_target_parent = target.parent.resolve()
+            if resolved_target_parent != meeting_root and meeting_root not in resolved_target_parent.parents:
+                raise ValueError("Artifact target resolves outside meeting directory")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if require_new and target.exists():
+                raise FileExistsError(f"Worker frame path is already published: {relative}")
+            if require_new:
+                # Exclusive creation works on filesystems without hard links;
+                # JSON references this new path only after the full copy ends.
+                with source.open("rb") as src, target.open("xb") as dst:
+                    published.append(target)
+                    shutil.copyfileobj(src, dst)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                if cancel and cancel():
+                    raise InterruptedError("stage cancelled during artifact publication")
+            else:
+                temp = target.with_name(target.name + f".{uuid.uuid4().hex}.tmp")
+                try:
+                    shutil.copyfile(source, temp)
+                    os.replace(temp, target)
+                finally:
+                    temp.unlink(missing_ok=True)
+        return published
+    except Exception:
+        if require_new:
+            for path in published:
+                path.unlink(missing_ok=True)
+        raise
 
 
 def meeting_segments(result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -165,7 +193,7 @@ def meeting_segments(result: dict[str, Any]) -> list[dict[str, Any]]:
         elif len(speaker_ids) > 1:
             segment["speaker_ambiguous"] = True
         prepared.append(segment)
-    return prepared
+    return _uniquify_speech_ids(prepared)[0]
 
 
 def persist_speech(root: str | Path, meeting_id: str, result: dict[str, Any]) -> dict:
@@ -294,10 +322,25 @@ def run_stages(root: str | Path, meeting_id: str, source_path: str | Path,
                 extracted = output.get("result", {})
                 events = extracted.get("events", [])
                 frame_paths = [str(event.get("frame")) for event in events if event.get("frame")]
-                _commit_files(staging, folder, frame_paths)
-                archive.write_screen_events(meeting_id, extracted.get("events", []),
-                                            status=extracted.get("status", "unavailable"),
-                                            limitations=extracted.get("limitations", []))
+                # Cancellation before publication leaves the last valid JSON and
+                # its referenced paths intact. New frame names are unique, so a
+                # failed publication cannot replace files referenced by it.
+                if cancel and cancel():
+                    raise InterruptedError("screen stage cancelled before publication")
+                copied = _commit_files(staging, folder, frame_paths, cancel=cancel, require_new=True)
+                if cancel and cancel():
+                    for path in copied:
+                        path.unlink(missing_ok=True)
+                    raise InterruptedError("screen stage cancelled before publication")
+                try:
+                    archive.write_screen_events(meeting_id, extracted.get("events", []),
+                                                status=extracted.get("status", "unavailable"),
+                                                limitations=extracted.get("limitations", []),
+                                                mode="frames_only", publish_check=cancel)
+                except Exception:
+                    for path in copied:
+                        path.unlink(missing_ok=True)
+                    raise
                 entry.update(status=extracted.get("status", "unavailable"), stats=extracted.get("stats", {}),
                              limitations=extracted.get("limitations", []))
             elif stage == "audio":
@@ -308,7 +351,7 @@ def run_stages(root: str | Path, meeting_id: str, source_path: str | Path,
             elif stage == "index":
                 entry.update(status="ready", indexed_items=output.get("indexed_items"),
                              embeddings=output.get("embeddings", {"status": "unavailable"}))
-            if cancel and cancel():
+            if stage != "screen" and cancel and cancel():
                 raise InterruptedError(f"{stage} stage cancelled")
             entry["elapsed_seconds"] = round(time.monotonic() - started, 3)
             entry["completed_at"] = time.time()

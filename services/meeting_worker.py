@@ -94,21 +94,24 @@ def _validated_paths(args) -> tuple[Path, Path, Path | None, Path]:
 
 
 def run_stage(stage: str, root: Path, meeting_dir: Path, source: Path | None,
-              staging: Path, device: str, runtime_root: Path | None = None) -> dict[str, Any]:
+              staging: Path, device: str, runtime_root: Path | None = None,
+              mode: str = "frames_only") -> dict[str, Any]:
     if stage == "screen":
         if source is None:
             raise ValueError("screen stage requires an original recording")
         # Heavy screen extraction imports happen only inside this child process.
-        from services.meeting_screen import extract_screen
+        from services.meeting_screen import extract_frames
         runtime_root = runtime_root or Path(os.environ.get("VT_SIMPLE_RUNTIME_DIR") or Path(__file__).resolve().parents[1] / ".runtime")
         def report(payload):
             wait_for_recording_clear(runtime_root, on_wait=lambda waiting: _emit(
                 {"type": "progress", "stage": stage, "progress": waiting}))
             _emit({"type": "progress", "stage": stage, "progress": payload})
-        result = extract_screen(source, staging,
+        meeting_meta = MeetingArchive(root, read_only=True).get_meeting(meeting_dir.name)
+        result = extract_frames(source, staging,
             progress=report,
-            device=device)
-        return {"stage": stage, "device": device, "result": result}
+            video_stream_index=meeting_meta.get("video_stream_index"))
+        result.update(schema_version=2, mode=mode)
+        return {"stage": stage, "device": "cpu", "result": result}
     if stage == "audio":
         if source is None:
             raise ValueError("audio stage requires an original recording")
@@ -136,6 +139,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source", default="")
     parser.add_argument("--result-path", required=True)
     parser.add_argument("--device", choices=("cpu", "directml"), default="cpu")
+    parser.add_argument("--mode", choices=("frames_only",), default="frames_only")
     parser.add_argument("--runtime-root", default="")
     args = parser.parse_args(argv)
     result_path: Path | None = None
@@ -143,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
         root, meeting_dir, source, result_path = _validated_paths(args)
         staging = result_path.parent
         runtime_root = Path(args.runtime_root).expanduser().resolve() if args.runtime_root else None
-        output = run_stage(args.stage, root, meeting_dir, source, staging, args.device, runtime_root)
+        output = run_stage(args.stage, root, meeting_dir, source, staging, args.device, runtime_root, args.mode)
         envelope = {"ok": True, **output}
         _write_json(result_path, envelope)
         _emit({"type": "result", "stage": args.stage, "status": output.get("status", "ready"),

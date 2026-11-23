@@ -68,7 +68,7 @@ def test_power_api_failure_does_not_escape_to_application():
     _wait_for(lambda: activity._thread is None)
 
 
-def test_recorder_releases_hold_when_stop_is_confirmed_even_if_import_fails(tmp_path, monkeypatch):
+def test_recorder_releases_hold_when_stop_is_confirmed_even_if_enqueue_fails(tmp_path, monkeypatch):
     from services import meeting_recorder
     from services.meeting_recorder import MeetingRecorder
 
@@ -90,16 +90,21 @@ def test_recorder_releases_hold_when_stop_is_confirmed_even_if_import_fails(tmp_
     calls = []
     monkeypatch.setattr(meeting_recorder, "hold_activity", lambda key: calls.append(("hold", key)))
     monkeypatch.setattr(meeting_recorder, "release_activity", lambda key: calls.append(("release", key)))
-    recorder = MeetingRecorder(runtime_root=tmp_path, ffprobe=lambda _path: (_ for _ in ()).throw(ValueError("bad media")))
+    recorder = MeetingRecorder(runtime_root=tmp_path)
     recorder._session = {"recording_path": str(recording), "title": "Meeting"}
     recorder._is_owned_process = lambda: True
     recorder._connect = lambda **_kwargs: Client()
 
     import pytest
-    with pytest.raises(ValueError, match="bad media"):
+    monkeypatch.setattr("web_api.enqueue_recording_conversion",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("queue unavailable")))
+    with pytest.raises(ValueError, match="queue unavailable"):
         recorder.stop()
 
     assert calls == [("hold", "meeting-recorder"), ("release", "meeting-recorder")]
+    assert recorder._state == "recording"
+    assert recorder._session["recording_path"] == str(recording)
+    assert recording.read_bytes() == b"mkv"
 
 
 def test_recorder_keeps_hold_if_obs_rejects_stop(tmp_path, monkeypatch):

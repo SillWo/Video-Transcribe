@@ -123,16 +123,6 @@ def _python_utf8_env(base: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
-def _stock_ocr_env() -> dict[str, str]:
-    """Clear inherited model overrides for CPU and unverified GPU runs."""
-    return {
-        "VT_MEETING_OCR_REC_PRECISION": "fp32",
-        "VT_MEETING_OCR_BATCHING": "stock",
-        "VT_MEETING_OCR_REC_MODEL_PATH": "",
-        "VT_MEETING_OCR_REC_MODEL_SHA256": "",
-    }
-
-
 def _receipt_matches(identity: dict) -> bool:
     if not _has_receipt_identity(identity):
         return False
@@ -252,6 +242,23 @@ def get_hardware_status() -> dict:
         settings = load_settings(APP_ROOT)
     except Exception:
         settings = {"execution_mode": "auto", "device": "cpu"}
+    try:
+        from services import asr_capabilities, simple_profiles
+        profile = settings.get("profile", "balanced")
+        speech_model = simple_profiles.PROFILES.get(profile, simple_profiles.PROFILES["balanced"])[1]
+        speech_candidate = asr_capabilities.auto_whisper_candidate(
+            speech_model, word_timestamps=False)
+        speech_state = {
+            "profile": profile, "model": speech_model,
+            "auto_device": speech_candidate.get("backend") if speech_candidate else "cpu",
+            "verified": speech_candidate is not None,
+            "reason": None if speech_candidate else
+                "Auto speech uses CPU until the current model, GPU, runtime, driver, and speech mode have a qualified speed/quality receipt.",
+        }
+    except Exception:
+        speech_state = {"profile": settings.get("profile", "balanced"),
+                        "auto_device": "cpu", "verified": False,
+                        "reason": "Auto speech readiness could not be checked; CPU will be used."}
     model_ready = bool(_model_manifest())
     av_ready = python_ok and "av-18.1.0.dist-info" not in missing_components
     from services.meeting_model_variants import conversion_status
@@ -268,6 +275,7 @@ def get_hardware_status() -> dict:
                      "directml_registered": directml_possible,
                      "intel_arc_verified": False},
         "stages": {
+            "speech": speech_state,
             "screen": {"cpu": {"available": True, "verified": True},
                        "gpu": {"available": receipt_ok, "backend": "directml",
                                "prepared": prepared, "verified": receipt_ok,
@@ -292,7 +300,7 @@ def get_hardware_status() -> dict:
 
 def plan_stage(stage: str, execution_mode: str = "auto", requested_device: str = "cpu",
                profile: str = "balanced") -> dict:
-    """Resolve CPU/GPU runtime for meeting workers, with no implicit fallback."""
+    """Resolve stage runtime; CPU frame extraction is independent of ASR device."""
     stage = str(stage).casefold()
     mode = str(execution_mode).casefold()
     requested = str(requested_device).casefold()
@@ -302,69 +310,23 @@ def plan_stage(stage: str, execution_mode: str = "auto", requested_device: str =
     if mode not in {"auto", "manual"} or requested not in {"cpu", "gpu", "directml"}:
         return {"device": "cpu", "python": sys.executable, "env": {}, "verified": False,
                 "reason": "Некорректный режим или устройство.", "error": "invalid_selection"}
+    if stage == "screen":
+        return {"device": "cpu", "python": sys.executable,
+                "env": {"PYTHONPATH": str(APP_ROOT)}, "verified": True,
+                "reason": "Извлечение кадров выполняется на CPU и не зависит от устройства распознавания речи.",
+                "error": None}
     if stage == "audio":
         return {"device": "cpu", "python": sys.executable,
-                "env": {"PYTHONPATH": str(APP_ROOT), **_stock_ocr_env()},
+                "env": {"PYTHONPATH": str(APP_ROOT)},
                 "verified": True,
                 "reason": "Сжатие Opus выполняется на CPU; GPU для этого этапа не используется.",
                 "error": None}
-    want_gpu = requested in {"gpu", "directml"} if mode == "manual" else False
-    if mode == "auto":
-        # Only screen OCR currently has a device-specific receipt. No ASR GPU
-        # selection is made without paired quality and performance evidence.
-        want_gpu = stage == "screen" and _receipt_matches(_identity())
-    if not want_gpu:
+    if stage == "index":
         return {"device": "cpu", "python": sys.executable,
-                "env": {"PYTHONPATH": str(APP_ROOT), **_stock_ocr_env()},
-                "verified": True, "reason": "CPU выбран как доступный проверенный путь.", "error": None}
-    identity = _identity()
-    if not _has_dml_target(identity):
-        return {"device": "directml", "python": str(GPU_PYTHON),
-                "env": {"PYTHONPATH": str(APP_ROOT)}, "verified": False,
-                "reason": "Не удалось определить индекс GPU для DirectML.",
-                "error": "gpu_device_index_unavailable" if mode == "manual" else None}
-    if stage != "screen":
-        return {"device": "directml", "python": sys.executable, "env": {"PYTHONPATH": str(APP_ROOT)},
-                "verified": False, "reason": "Для этого этапа GPU путь не подтверждён.",
-                "error": "gpu_stage_unsupported" if mode == "manual" else None}
-    if not GPU_PYTHON.is_file():
-        return {"device": "directml", "python": str(GPU_PYTHON), "env": {"PYTHONPATH": str(APP_ROOT)},
-                "verified": False, "reason": "Изолированная DirectML-среда не подготовлена.",
-                "error": "gpu_runtime_missing" if mode == "manual" else None}
-    components_ready, missing_components = _gpu_component_state()
-    if not components_ready:
-        return {"device": "directml", "python": str(GPU_PYTHON), "env": {"PYTHONPATH": str(APP_ROOT)},
-                "verified": False, "reason": _component_missing_reason(missing_components),
-                "error": "gpu_runtime_missing" if mode == "manual" else None}
-    verified = _receipt_matches(identity)
-    env = {"PYTHONPATH": str(APP_ROOT),
-           "VT_MEETING_DML_DEVICE_ID": str(identity["device_index"]),
-           **_stock_ocr_env()}
-    if verified:
-        env.update(_selected_variant_env())
-    return {"device": "directml", "python": str(GPU_PYTHON), "env": env,
-            "verified": verified,
-            "reason": None if verified else "Ручной DirectML запуск разрешён без актуального receipt качества/скорости; результат будет экспериментальным.",
-            "error": None}
-
-
-def _selected_variant_env() -> dict[str, str]:
-    try:
-        variant = json.loads(RECEIPT.read_text(encoding="utf-8")).get("selected_variant") or {}
-    except (OSError, ValueError, TypeError):
-        return {}
-    if not isinstance(variant, dict):
-        return {}
-    env = {
-        "VT_MEETING_OCR_REC_PRECISION": str(variant.get("precision", "fp32")),
-        "VT_MEETING_OCR_BATCHING": str(variant.get("batching", "stock")),
-        "VT_MEETING_OCR_REC_MODEL_PATH": "",
-        "VT_MEETING_OCR_REC_MODEL_SHA256": "",
-    }
-    if variant.get("precision") == "fp16":
-        env["VT_MEETING_OCR_REC_MODEL_PATH"] = str(variant.get("model_path", ""))
-        env["VT_MEETING_OCR_REC_MODEL_SHA256"] = str(variant.get("model_sha256", ""))
-    return env
+                "env": {"PYTHONPATH": str(APP_ROOT)},
+                "verified": True,
+                "reason": "Индексация архива выполняется на CPU; этот этап не использует GPU.",
+                "error": None}
 
 
 def prepare_gpu_runtime(progress: Callable[[dict], None] | None = None) -> dict:

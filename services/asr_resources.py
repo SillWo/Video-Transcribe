@@ -26,7 +26,7 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = APP_ROOT / ".runtime"
 MODEL_ROOT = RUNTIME / "models" / "asr"
 ENV_ROOT = RUNTIME / "asr"
-NEW_MODELS = frozenset({"parakeet-tdt-0.6b-v3", "qwen3-asr-1.7b"})
+NEW_MODELS = frozenset({"qwen3-asr-1.7b"})
 Progress = Callable[[dict], None]
 _HASH_CACHE: dict[tuple[str, int, int, int], str] = {}
 _ENV_CACHE: dict[tuple, bool] = {}
@@ -96,6 +96,11 @@ _CANDIDATES = {
 
 def is_new_asr(model_id: str) -> bool:
     return model_id in NEW_MODELS
+
+
+def is_asr_adapter(model_id: str) -> bool:
+    """Whether an isolated ASR adapter exists, including the dormant Parakeet implementation."""
+    return model_id in NEW_MODELS or model_id == "parakeet-tdt-0.6b-v3"
 
 
 def _uses_qwen_aligner(model_id: str, diarization: bool) -> bool:
@@ -498,14 +503,14 @@ def _resource_status(model_id: str, backend: str, diarization: bool) -> dict:
 
 
 def asr_resource_status(model_id: str, backend: str, *, diarization: bool = False) -> dict:
-    if not is_new_asr(model_id):
+    if not is_asr_adapter(model_id):
         raise ValueError(f"Not a new ASR model: {model_id}")
     return _resource_status(model_id, backend, diarization)
 
 
 def ensure_asr_resources(model_id: str, backend: str, *, diarization: bool = False,
                          on_progress: Progress | None = None) -> None:
-    if not is_new_asr(model_id):
+    if not is_asr_adapter(model_id):
         raise ValueError(f"Not a new ASR model: {model_id}")
     kind = "native" if model_id == "qwen3-asr-1.7b" else "parakeet"
     _kind_backend(kind, backend)

@@ -1,8 +1,13 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Link, useLocation } from 'react-router-dom'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { useLocation } from 'react-router-dom'
 import { AlertCircle, Check, Clock3, FilePlus2, FolderOpen, Image as ImageIcon, LoaderCircle, Mic, Monitor, Play, Plus, Radio, Search, Settings2, Square, Undo2, Volume2, X } from 'lucide-react'
 import { registerPendingSave } from '../lib/pendingSaves'
-import { canApplyMeetingEditResult, confirmedMeetingDate, isPendingMeetingValueCurrent, latestFailedMeetingJob, meetingId, meetingLabel, meetingsApi, parseMeetingCompositeKey, readMeetingSnapshot } from '../lib/meetingsApi'
+import { AutoLearnSetting } from '../pages/DictionaryPage'
+import { commitDictionarySettingsDraft, getDictionarySettingsDraft, subscribeDictionarySettingsDraft } from '../lib/dictionarySettingsDraft'
+import ToastNotice from './ToastNotice'
+import { notifyLearnedTerms } from '../lib/learnedTermsNotice'
+import { shouldShowPreservedModal } from '../lib/modalVisibility'
+import { canApplyMeetingEditResult, confirmedMeetingDate, isPendingMeetingValueCurrent, latestFailedMeetingJob, meetingId, meetingLabel, meetingsApi, parseMeetingCompositeKey, preserveMeetingSettingsDraft, readMeetingSnapshot } from '../lib/meetingsApi'
 import type { AssetPreparation, BackupJob, BackupStatus, CleanupPreview, ConnectorStatus, GlossaryEntry, HardwarePreparation, MeetingAssetStatus, MeetingDetail, MeetingHardware, MeetingJobSummary, MeetingManifest, MeetingQueueState, MeetingRecord, MeetingSettings, RecorderSelection, RecorderStatus, TimelineItem } from '../lib/meetingsApi'
 import '../meetings.css'
 
@@ -11,7 +16,7 @@ type SegmentDraft = { text: string; savedText: string; version: number; dirty: b
 type MeetingError = { title: string; reason: string; recommendation: string } | null
 type Toast = { message: string; onUndo?: () => void }
 
-const stageLabels: Record<StageName, string> = { speech: 'Речь', screen: 'Экран', audio: 'Звук', index: 'Поиск' }
+const stageLabels: Record<StageName, string> = { speech: 'Речь', screen: 'Извлечение кадров', audio: 'Звук', index: 'Поиск' }
 const queueStageLabels: Record<string, string> = {
   preparation: 'Подготовка',
   source: 'Проверка файла',
@@ -124,9 +129,9 @@ export function MeetingRecordingBanner() {
   return <div className="meeting-recording-banner" role="status"><span className="recording-pulse" aria-hidden="true" /><Radio size={17} /><strong>Идёт запись</strong><span>{recorder.title || 'Встреча'}</span><time>{formatTime(recorder.duration_seconds)}</time></div>
 }
 
-export function MeetingWorkspace() {
+export function MeetingWorkspace({ visible }: { visible: boolean }) {
   const location = useLocation()
-  const tab = location.pathname.startsWith('/meetings/glossary') ? 'glossary' : location.pathname.startsWith('/meetings/settings') ? 'settings' : 'meetings'
+  const tab = location.pathname === '/recording' ? 'recording' : location.pathname === '/settings' || location.pathname.startsWith('/meetings/settings') ? 'settings' : location.pathname.startsWith('/meetings/glossary') ? 'glossary' : 'meetings'
   const [meetings, setMeetings] = useState<MeetingRecord[]>([])
   const [listBusy, setListBusy] = useState(true)
   const [listError, setListError] = useState('')
@@ -151,21 +156,30 @@ export function MeetingWorkspace() {
   const [selectedTime, setSelectedTime] = useState(0)
   const [viewerUrl, setViewerUrl] = useState('')
   const [selectedFrame, setSelectedFrame] = useState('')
-  const [errorDialog, setErrorDialog] = useState<MeetingError>(null)
+  const [errorDialog, setErrorDialogState] = useState<MeetingError>(null)
+  const visibleRef = useRef(visible)
+  const setErrorDialog = useCallback((next: MeetingError) => {
+    if (visibleRef.current) setErrorDialogState(next)
+  }, [])
+  const errorDialogRef = useRef<HTMLDialogElement>(null)
   const [toast, setToast] = useState<Toast | null>(null)
   const [settings, setSettings] = useState<MeetingSettings | null>(null)
+  const [settingsSavedSnapshot, setSettingsSavedSnapshot] = useState('')
+  const dictionarySettingsDraft = useSyncExternalStore(subscribeDictionarySettingsDraft, getDictionarySettingsDraft, getDictionarySettingsDraft)
   const [hardware, setHardware] = useState<MeetingHardware | null>(null)
   const [hardwarePreparation, setHardwarePreparation] = useState<HardwarePreparation | null>(null)
-  const [hardwarePrepareBusy, setHardwarePrepareBusy] = useState(false)
   const [assets, setAssets] = useState<MeetingAssetStatus | null>(null)
   const [assetPreparation, setAssetPreparation] = useState<AssetPreparation | null>(null)
   const [assetsPrepareBusy, setAssetsPrepareBusy] = useState(false)
+  const [archiveReindexBusy, setArchiveReindexBusy] = useState(false)
+  const [archiveReindexStatus, setArchiveReindexStatus] = useState('')
   const [backupStatus, setBackupStatus] = useState<BackupStatus | null>(null)
   const [backupJob, setBackupJob] = useState<BackupJob | null>(null)
   const [backupBusy, setBackupBusy] = useState(false)
   const [backupTarget, setBackupTarget] = useState('')
   const [cleanupPreview, setCleanupPreview] = useState<CleanupPreview | null>(null)
   const [backupConfirmation, setBackupConfirmation] = useState<{ operation: 'restore' | 'cleanup'; snapshotId?: string } | null>(null)
+  const backupConfirmationRef = useRef<HTMLDialogElement>(null)
   const [settingsBusy, setSettingsBusy] = useState(false)
   const [settingsError, setSettingsError] = useState('')
   const [connector, setConnector] = useState<ConnectorStatus | null>(null)
@@ -191,12 +205,39 @@ export function MeetingWorkspace() {
   const reportedBackupCompletions = useRef(new Set<string>())
   const [recorderPrepared, setRecorderPrepared] = useState(false)
   const [recorderBusy, setRecorderBusy] = useState(false)
+  const [recorderPreparing, setRecorderPreparing] = useState(false)
   const [recorderTitle, setRecorderTitle] = useState('')
   const [recorderSelection, setRecorderSelection] = useState<RecorderSelection>({ monitor_id: null, browser_id: null, microphone_id: null })
   const [previewFailed, setPreviewFailed] = useState(false)
+  const [previewConfigured, setPreviewConfigured] = useState(false)
+  const [previewNonce, setPreviewNonce] = useState(() => Date.now())
   const requestGeneration = useRef(0)
   const settingsLoadedRef = useRef(false)
   const connectorLoadedRef = useRef(false)
+
+  useLayoutEffect(() => { visibleRef.current = visible }, [visible])
+
+  useLayoutEffect(() => {
+    const dialog = errorDialogRef.current
+    if (!dialog) return
+    const shouldShow = shouldShowPreservedModal(visible, Boolean(errorDialog))
+    if (!visible) {
+      if (dialog.open) dialog.close()
+      if (errorDialog) queueMicrotask(() => { if (!visibleRef.current) setErrorDialogState(null) })
+    } else if (shouldShow && !dialog.open) dialog.showModal()
+    else if (!shouldShow && dialog.open) dialog.close()
+  }, [errorDialog, visible])
+
+  useLayoutEffect(() => {
+    const dialog = backupConfirmationRef.current
+    if (!dialog) return
+    const shouldShow = shouldShowPreservedModal(visible, Boolean(backupConfirmation))
+    if (!visible) {
+      if (dialog.open) dialog.close()
+      if (backupConfirmation) queueMicrotask(() => { if (!visibleRef.current) setBackupConfirmation(null) })
+    } else if (shouldShow && !dialog.open) dialog.showModal()
+    else if (!shouldShow && dialog.open) dialog.close()
+  }, [backupConfirmation, visible])
 
   const refreshMeetings = useCallback(async (quiet = false) => {
     try {
@@ -221,7 +262,7 @@ export function MeetingWorkspace() {
     } finally {
       if (!quiet) setListBusy(false)
     }
-  }, [])
+  }, [setErrorDialog])
 
   useEffect(() => {
     let stopped = false
@@ -303,6 +344,7 @@ export function MeetingWorkspace() {
       const version = record.version
       const text = record.text
       const operation = meetingsApi.saveSegment(meeting, segmentId, text).then((result) => {
+        notifyLearnedTerms(result.remembered_terms)
         const current = draftMapRef.current.get(key)
         if (current && current.version === version) {
           current.savedText = text
@@ -326,7 +368,7 @@ export function MeetingWorkspace() {
       savingRef.current.set(key, operation)
       await operation
     }
-  }, [])
+  }, [setErrorDialog])
 
   const flushMeetingEdits = useCallback(async () => {
     for (const timer of saveTimersRef.current.values()) clearTimeout(timer)
@@ -344,14 +386,15 @@ export function MeetingWorkspace() {
   useEffect(() => registerPendingSave('meetings', flushMeetingEdits), [flushMeetingEdits])
 
   useEffect(() => {
-    if (tab !== 'settings' && (settingsLoadedRef.current && connectorLoadedRef.current)) return
+    if (settingsLoadedRef.current && connectorLoadedRef.current) return
     let stopped = false
     setSettingsBusy(true)
     void Promise.all([meetingsApi.settings(), meetingsApi.connectorStatus()]).then(([nextSettings, nextConnector]) => {
       if (stopped) return
       settingsLoadedRef.current = true
       connectorLoadedRef.current = true
-      setSettings(nextSettings)
+      setSettingsSavedSnapshot(JSON.stringify(nextSettings))
+      setSettings((current) => preserveMeetingSettingsDraft(current, nextSettings))
       setConnector(nextConnector)
       setSettingsError('')
     }).catch((error: unknown) => {
@@ -366,7 +409,7 @@ export function MeetingWorkspace() {
       if (!stopped) setErrorDialog({ title: 'Состояние устройств недоступно', reason: errorMessage(error), recommendation: 'Проверьте подключение и обновите сведения в настройках.' })
     })
     return () => { stopped = true }
-  }, [])
+  }, [setErrorDialog])
 
   const hardwarePreparationId = hardwarePreparation?.id ?? hardwarePreparation?.job_id
   const hardwarePreparationStatus = hardwarePreparation?.status
@@ -401,7 +444,7 @@ export function MeetingWorkspace() {
     const timer = setInterval(() => void poll(), 1500)
     void poll()
     return () => { stopped = true; clearInterval(timer) }
-  }, [hardwarePreparationId, hardwarePreparationStatus])
+  }, [hardwarePreparationId, hardwarePreparationStatus, setErrorDialog])
 
   useEffect(() => {
     let stopped = false
@@ -409,7 +452,7 @@ export function MeetingWorkspace() {
       if (!stopped) setErrorDialog({ title: 'Состояние семантического поиска недоступно', reason: errorMessage(error), recommendation: 'Проверьте соединение и обновите сведения в настройках.' })
     })
     return () => { stopped = true }
-  }, [])
+  }, [setErrorDialog])
 
   useEffect(() => {
     let stopped = false
@@ -417,7 +460,7 @@ export function MeetingWorkspace() {
       if (!stopped) setErrorDialog({ title: 'Состояние резервных копий недоступно', reason: errorMessage(error), recommendation: 'Проверьте подключение и повторите запрос позже.' })
     })
     return () => { stopped = true }
-  }, [])
+  }, [setErrorDialog])
 
   const assetPreparationId = assetPreparation?.id ?? assetPreparation?.job_id
   const assetPreparationStatus = assetPreparation?.status
@@ -450,7 +493,7 @@ export function MeetingWorkspace() {
     const timer = setInterval(() => void poll(), 1500)
     void poll()
     return () => { stopped = true; clearInterval(timer) }
-  }, [assetPreparationId, assetPreparationStatus])
+  }, [assetPreparationId, assetPreparationStatus, setErrorDialog])
 
   const backupJobId = backupJob?.job_id
   const backupJobStatus = backupJob?.status
@@ -502,7 +545,7 @@ export function MeetingWorkspace() {
     const timer = setInterval(() => void poll(), 1500)
     void poll()
     return () => { stopped = true; clearInterval(timer) }
-  }, [backupJobId, backupJobStatus, refreshMeetings])
+  }, [backupJobId, backupJobStatus, refreshMeetings, setErrorDialog])
 
   useEffect(() => {
     if (tab !== 'glossary') return
@@ -511,7 +554,7 @@ export function MeetingWorkspace() {
       if (!stopped) setErrorDialog({ title: 'Словарь недоступен', reason: errorStatus(error) === 404 ? 'Служба архива пока не готова.' : errorMessage(error), recommendation: 'Проверьте подключение к архиву и обновите страницу.' })
     }).finally(() => { if (!stopped) setGlossaryBusy(false) })
     return () => { stopped = true }
-  }, [tab])
+  }, [tab, setErrorDialog])
 
   useEffect(() => {
     let stopped = false
@@ -547,7 +590,7 @@ export function MeetingWorkspace() {
     void poll()
     const timer = setInterval(() => void poll(), 2500)
     return () => { stopped = true; clearInterval(timer) }
-  }, [])
+  }, [setErrorDialog])
 
   const resumeProcessingQueue = async () => {
     setQueueBusy(true)
@@ -605,11 +648,10 @@ export function MeetingWorkspace() {
         return
       }
       const result = await meetingsApi.importFiles(paths)
-      await refreshMeetings()
-      const first = result.items[0]
-      if (first) openMeeting(meetingId(first))
+      window.dispatchEvent(new Event('archive-changed'))
+      window.dispatchEvent(new Event('simple-history-changed'))
       if (result.rejected.length) setErrorDialog({ title: 'Часть файлов не добавлена', reason: result.rejected.map((item) => item.reason).join(' '), recommendation: 'Проверьте форматы неподдержанных файлов.' })
-      else setToast({ message: `Добавлено встреч: ${result.items.length}. Обработка не запускалась.` })
+      if (result.jobs.length) setToast({ message: `Добавлено в очередь обработки: ${result.jobs.length}.` })
     } catch (error) {
       setErrorDialog({ title: 'Не удалось добавить встречу', reason: errorMessage(error), recommendation: 'Проверьте выбранные файлы и повторите попытку.' })
     } finally { setImportBusy(false) }
@@ -699,7 +741,9 @@ export function MeetingWorkspace() {
     try {
       const values = { ...settings }
       delete values.disk
+      await commitDictionarySettingsDraft()
       const saved = await meetingsApi.saveSettings(values)
+      setSettingsSavedSnapshot(JSON.stringify(saved))
       setSettings(saved)
       setBackupStatus(await meetingsApi.backupStatus())
       setCleanupPreview(null)
@@ -708,16 +752,6 @@ export function MeetingWorkspace() {
     } catch (error) {
       setErrorDialog({ title: 'Не удалось сохранить настройки', reason: errorMessage(error), recommendation: 'Проверьте доступ к папке архива и повторите сохранение.' })
     } finally { setSettingsBusy(false) }
-  }
-
-  const prepareGpu = async () => {
-    setHardwarePrepareBusy(true)
-    try {
-      const result = await meetingsApi.prepareHardware()
-      setHardwarePreparation({ job_id: result.job_id, status: result.status, estimated_download_bytes: result.estimated_download_bytes })
-    } catch (error) {
-      setErrorDialog({ title: 'Не удалось подготовить GPU', reason: errorMessage(error), recommendation: 'Проверьте подключение и повторите подготовку вручную.' })
-    } finally { setHardwarePrepareBusy(false) }
   }
 
   const prepareSemanticSearch = async () => {
@@ -730,6 +764,20 @@ export function MeetingWorkspace() {
     } catch (error) {
       setErrorDialog({ title: 'Не удалось подготовить семантический поиск', reason: errorMessage(error), recommendation: 'Проверьте подключение и повторите подготовку вручную.' })
     } finally { setAssetsPrepareBusy(false) }
+  }
+
+  const reindexArchive = async () => {
+    setArchiveReindexBusy(true)
+    setArchiveReindexStatus('')
+    try {
+      const result = await meetingsApi.reindex()
+      const meetingCount = Array.isArray(result.jobs) ? result.jobs.length : 0
+      const transcriptionCount = result.queued_transcriptions
+      const counts = [meetingCount ? `встреч: ${meetingCount}` : '', typeof transcriptionCount === 'number' ? `текстовых расшифровок: ${transcriptionCount}` : ''].filter(Boolean)
+      setArchiveReindexStatus(`Обновление индекса поставлено в очередь${counts.length ? ` · ${counts.join(' · ')}` : ''}. Готовность появится по мере обработки.`)
+    } catch (error) {
+      setArchiveReindexStatus(errorMessage(error))
+    } finally { setArchiveReindexBusy(false) }
   }
 
   const runBackupOperation = async (operation: 'backup' | 'verify' | 'restore_test' | 'restore' | 'cleanup_preview' | 'cleanup', snapshotId?: string) => {
@@ -833,13 +881,23 @@ export function MeetingWorkspace() {
     } finally { setRecorderBusy(false) }
   }
 
-  const prepareRecording = () => void loadRecorder(() => meetingsApi.prepareRecorder(), 'Источник записи подготовлен. Проверьте изображение и уровни звука.')
-  const configureRecording = () => void loadRecorder(() => meetingsApi.configureRecorder(recorderSelection), 'Источники записи сохранены.')
+  const prepareRecording = () => {
+    setPreviewConfigured(false)
+    setPreviewFailed(false)
+    setRecorderPreparing(true)
+    void loadRecorder(() => meetingsApi.prepareRecorder(), 'Источник записи подготовлен. Проверьте изображение и уровни звука.')
+      .finally(() => setRecorderPreparing(false))
+  }
+  const configureRecording = () => { void loadRecorder(() => meetingsApi.configureRecorder(recorderSelection), 'Источники записи сохранены.').then((next) => {
+    setPreviewFailed(false)
+    setPreviewConfigured(Boolean(next?.selection.monitor_id && next.selection.browser_id && next.selection.microphone_id))
+  }) }
   const startRecording = async () => {
     if (!recorderSelection.monitor_id || !recorderSelection.browser_id || !recorderSelection.microphone_id) {
       setErrorDialog({ title: 'Выберите источники записи', reason: 'Для записи нужны экран, звук созвона и микрофон.', recommendation: 'Выберите доступные источники и настройте их перед началом.' })
       return
     }
+    window.dispatchEvent(new CustomEvent('recorder-transition', { detail: 'starting' }))
     setRecorderBusy(true)
     try {
       const result = await meetingsApi.startRecording(recorderTitle.trim() || 'Новая встреча')
@@ -847,20 +905,25 @@ export function MeetingWorkspace() {
       await refreshMeetings()
     } catch (error) {
       setErrorDialog({ title: 'Не удалось начать запись', reason: errorMessage(error), recommendation: 'Проверьте доступ к экрану и источникам звука.' })
-    } finally { setRecorderBusy(false) }
+    } finally { setRecorderBusy(false); window.dispatchEvent(new CustomEvent('recorder-transition', { detail: 'settled' })) }
   }
 
   const stopRecording = async () => {
+    const previous = recorder
+    window.dispatchEvent(new CustomEvent('recorder-transition', { detail: 'stopping' }))
+    if (previous) setRecorder({ ...previous, state: 'stopping' })
     setRecorderBusy(true)
     try {
       const result = await meetingsApi.stopRecording()
       setRecorder(result.recorder)
-      openMeeting(meetingId(result.meeting))
+      window.dispatchEvent(new Event('archive-changed'))
+      window.dispatchEvent(new Event('simple-history-changed'))
       await refreshMeetings()
-      setToast({ message: 'Запись сохранена. Встреча ожидает обработки.' })
+      setToast({ message: 'Запись сохранена и добавлена в очередь обработки.' })
     } catch (error) {
+      if (previous?.state === 'recording') setRecorder(previous)
       setErrorDialog({ title: 'Не удалось завершить запись', reason: errorMessage(error), recommendation: 'Проверьте состояние записи и повторите остановку.' })
-    } finally { setRecorderBusy(false) }
+    } finally { setRecorderBusy(false); window.dispatchEvent(new CustomEvent('recorder-transition', { detail: 'settled' })) }
   }
 
   const visibleGlossary = useMemo(() => {
@@ -868,23 +931,32 @@ export function MeetingWorkspace() {
     return glossary.filter((item) => !needle || `${item.term} ${item.definition ?? ''}`.toLocaleLowerCase('ru').includes(needle))
   }, [glossary, glossaryQuery])
   const speakerIds = [...new Set(timeline.map((item) => item.speaker_cluster).filter((value): value is string => Boolean(value)))].sort((a, b) => a.localeCompare(b, 'ru', { numeric: true }))
-  const screenGpu = hardware?.stages.screen?.gpu
-  const latestHardwareProgress = hardwarePreparation?.progress?.at(-1)
   const latestAssetProgress = assetPreparation?.progress?.at(-1)
-  const gpuPrepared = Boolean(screenGpu?.prepared || hardware?.gpu_runtime.prepared)
-  const gpuVerified = Boolean(screenGpu?.verified)
   const backupRootSaved = Boolean(settings?.backup_root && backupStatus?.storage.backup_root
     && settings.backup_root.trim().toLocaleLowerCase() === backupStatus.storage.backup_root.trim().toLocaleLowerCase())
+  const settingsDirty = Boolean(settings && JSON.stringify(settings) !== settingsSavedSnapshot)
+    || dictionarySettingsDraft.value !== dictionarySettingsDraft.savedValue
   const activeStatus = statusText(detail?.meeting.status ?? activeMeeting?.status, detail?.manifest)
   const retryable = ['failed', 'interrupted', 'partial'].some((value) => String(detail?.meeting.status ?? detail?.manifest?.status?.overall ?? '').toLowerCase().includes(value))
+  const previewSourcesReady = Boolean(recorderSelection.monitor_id && recorderSelection.browser_id && recorderSelection.microphone_id)
+  const savedPreviewSelectionMatches = Boolean(previewSourcesReady && recorder?.selection.monitor_id === recorderSelection.monitor_id && recorder?.selection.browser_id === recorderSelection.browser_id && recorder?.selection.microphone_id === recorderSelection.microphone_id)
+  const previewIsConfigured = previewConfigured || savedPreviewSelectionMatches
 
-  return <main className="meeting-workspace">
-    <div className="meeting-subnav" aria-label="Разделы архива встреч" role="navigation">
-      <Link to="/meetings" className={tab === 'meetings' ? 'selected' : ''}>Встречи</Link>
-      <Link to="/meetings/glossary" className={tab === 'glossary' ? 'selected' : ''}>Словарь</Link>
-      <Link to="/meetings/settings" className={tab === 'settings' ? 'selected' : ''}>Настройки</Link>
-    </div>
+  useEffect(() => {
+    if (tab !== 'recording' || !previewIsConfigured || !recorder?.available || !recorder.connected || !previewSourcesReady) return
+    const timer = window.setInterval(() => {
+      setPreviewNonce(Date.now())
+      setPreviewFailed(false)
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [tab, previewIsConfigured, recorder?.available, recorder?.connected, previewSourcesReady])
 
+  return <main className={`meeting-workspace${tab === 'recording' ? ' recording-workspace' : ''}`}>
+    {tab === 'recording' && <>
+      <RecorderPanel recorder={recorder} error={recorderError} busy={recorderBusy} prepareBusy={recorderPreparing} prepared={recorderPrepared} title={recorderTitle} selection={recorderSelection} previewFailed={previewFailed} previewReady={previewIsConfigured} previewNonce={previewNonce}
+        onTitle={setRecorderTitle} onSelection={(value) => { setRecorderSelection(value); setPreviewConfigured(false) }} onPrepare={() => { setRecorderPrepared(true); setPreviewConfigured(false); setPreviewFailed(false); prepareRecording() }} onConfigure={configureRecording} onStart={() => void startRecording()} onStop={() => void stopRecording()} onPreviewError={() => setPreviewFailed(true)} onPreviewLoad={() => setPreviewFailed(false)} />
+      <button type="button" className="secondary-button recording-import" onClick={() => void importMeetings()} disabled={importBusy}><FilePlus2 size={16} />Импортировать запись</button>
+    </>}
     {tab === 'meetings' && <>
       <section className="meetings-heading">
         <div><p className="eyebrow">Архив разговоров</p><h1>Встречи</h1><p>Записи, материалы и сохранённые доказательства.</p></div>
@@ -899,8 +971,8 @@ export function MeetingWorkspace() {
         <span>Ожидают: {queue.waitingCount}</span>
         {queue.paused && <button className="secondary-button" type="button" onClick={() => void resumeProcessingQueue()} disabled={queueBusy}>{queueBusy ? 'Продолжаем…' : 'Продолжить очередь'}</button>}
       </aside>}
-      <RecorderPanel recorder={recorder} error={recorderError} busy={recorderBusy} prepared={recorderPrepared} title={recorderTitle} selection={recorderSelection} previewFailed={previewFailed}
-        onTitle={setRecorderTitle} onSelection={setRecorderSelection} onPrepare={() => { setRecorderPrepared(true); prepareRecording() }} onConfigure={configureRecording} onStart={() => void startRecording()} onStop={() => void stopRecording()} onPreviewError={() => setPreviewFailed(true)} />
+      <RecorderPanel recorder={recorder} error={recorderError} busy={recorderBusy} prepareBusy={recorderPreparing} prepared={recorderPrepared} title={recorderTitle} selection={recorderSelection} previewFailed={previewFailed} previewReady={previewIsConfigured} previewNonce={previewNonce}
+        onTitle={setRecorderTitle} onSelection={(value) => { setRecorderSelection(value); setPreviewConfigured(false) }} onPrepare={() => { setRecorderPrepared(true); setPreviewConfigured(false); setPreviewFailed(false); prepareRecording() }} onConfigure={configureRecording} onStart={() => void startRecording()} onStop={() => void stopRecording()} onPreviewError={() => setPreviewFailed(true)} onPreviewLoad={() => setPreviewFailed(false)} />
       <div className="meetings-grid">
         <section className="meeting-list-panel" aria-label="Список встреч">
           <div className="meeting-list-tools">
@@ -945,7 +1017,7 @@ export function MeetingWorkspace() {
                     <button className="timeline-time" onClick={() => void showEvidence(item)} aria-label={`Открыть материал в ${formatTime(item.start)}`}><Clock3 size={14} />{formatTime(item.start)}</button>
                     <div className="timeline-content">
                       <div className="timeline-source-label">{item.kind === 'screen' ? 'Видно на экране' : item.kind === 'orphan_edit' ? 'Исправление без исходного фрагмента' : 'Сказано на встрече'}</div>
-                      {item.kind === 'transcript' && item.id ? <textarea aria-label={`Исправить фрагмент ${index + 1}`} value={value} onChange={(event) => changeSegment(item, event.target.value)} onBlur={() => { if (segmentKey) void persistSegment(segmentKey).catch(() => undefined) }} rows={Math.max(2, Math.min(5, Math.ceil(value.length / 100)))} /> : <p>{item.text || 'Текст не распознан'}</p>}
+                      {item.kind === 'transcript' && item.id ? <textarea aria-label={`Исправить фрагмент ${index + 1}`} value={value} onChange={(event) => changeSegment(item, event.target.value)} onBlur={() => { if (segmentKey) void persistSegment(segmentKey).catch(() => undefined) }} rows={Math.max(2, Math.min(5, Math.ceil(value.length / 100)))} /> : item.kind === 'screen' ? item.text ? <p>{item.text}</p> : null : <p>{item.text || 'Текст не распознан'}</p>}
                       {item.original_text && item.original_text !== item.text && <details><summary>Исходный вариант</summary><p>{item.original_text}</p></details>}
                       {item.kind === 'screen' && item.frame && <button className="text-action" onClick={() => void showEvidence(item)}>Посмотреть сохранённый кадр</button>}
                     </div>
@@ -976,88 +1048,92 @@ export function MeetingWorkspace() {
     </section>}
 
     {tab === 'settings' && <section className="meeting-page-card settings-page">
-      <div className="meeting-page-heading"><div><p className="eyebrow">Хранение и подключения</p><h1>Настройки встреч</h1><p>Изменения пути применяются к следующим действиям архива.</p></div></div>
+      <div className="meeting-page-heading"><div><h1>Настройки</h1></div></div>
       {settingsError && <div className="meeting-inline-error" role="alert"><AlertCircle size={16} />{settingsError}</div>}
       {settingsBusy && !settings ? <div className="meeting-empty">Загружаем настройки…</div> : settings && <>
-        <section className="settings-group"><h2>Папки</h2><FolderField label="Папка архива" value={settings.archive_root} onChoose={() => void chooseDirectory('archive_root')} />{settings.backup_root !== undefined && <FolderField label="Резервная папка" value={settings.backup_root ?? ''} onChoose={() => void chooseDirectory('backup_root')} clearable onClear={() => updateSettings('backup_root', null)} />}
-          {settings.disk && <p className="disk-space">Свободно: {typeof settings.disk.free_bytes === 'number' ? formatBytes(settings.disk.free_bytes) : 'нет данных'}</p>}
-        </section>
-        <section className="settings-group"><h2>Обработка</h2><label className="settings-field">Профиль распознавания<select value={settings.profile} onChange={(event) => updateSettings('profile', event.target.value as MeetingSettings['profile'])}><option value="balanced">Обычный · Parakeet</option><option value="quality">Точнее · Qwen</option><option value="economy">Экономнее · Whisper</option></select><small>Профиль применяется только после нажатия «Обработать».</small></label><fieldset className="settings-choice"><legend>Режим устройства</legend><label><input type="radio" checked={settings.execution_mode === 'auto'} onChange={() => updateSettings('execution_mode', 'auto')} />Авто <small>Приложение выбирает проверенный способ для каждого этапа.</small></label><label><input type="radio" checked={settings.execution_mode === 'manual'} onChange={() => updateSettings('execution_mode', 'manual')} />Вручную <small>Выбранное устройство не заменяется незаметно.</small></label></fieldset>{settings.execution_mode === 'manual' && <label className="settings-field">Устройство<select value={settings.device} onChange={(event) => updateSettings('device', event.target.value as 'cpu' | 'gpu')}><option value="cpu">Процессор</option><option value="gpu">Видеокарта</option></select>{settings.device === 'gpu' && screenGpu?.prepared && !screenGpu.verified && <small>Ручной запуск экранного OCR будет экспериментальным до проверки качества и скорости.</small>}</label>}<label className="settings-field">Срок хранения полного видео<input type="number" min={1} max={365} value={settings.original_retention_days} onChange={(event) => updateSettings('original_retention_days', Math.max(1, Number(event.target.value) || 30))} /><small>Текст, звук и сохранённые кадры остаются в архиве.</small></label><p className="settings-note">{settings.auto_cleanup ? 'Автоматическая очистка включена: оригиналы старше выбранного срока удаляются только при готовом архиве и проверенной резервной копии.' : 'Автоматическая очистка выключена.'}</p></section>
-        <section className="settings-group hardware-settings"><h2>Устройства и подготовка GPU</h2>
+        <section className="settings-group"><h2>Обработка</h2><label className="settings-field">Профиль распознавания<select value={settings.profile} onChange={(event) => updateSettings('profile', event.target.value as MeetingSettings['profile'])}><option value="quality">Qwen3-ASR</option><option value="balanced">Whisper large-v3</option><option value="economy">Whisper small</option></select><small>Профиль применяется только после нажатия «Обработать».</small></label><fieldset className="settings-choice"><legend>Режим устройства распознавания</legend><label><input type="radio" checked={settings.execution_mode === 'auto'} onChange={() => updateSettings('execution_mode', 'auto')} />Авто <small>Приложение выбирает проверенный способ распознавания речи.</small></label><label><input type="radio" checked={settings.execution_mode === 'manual'} onChange={() => updateSettings('execution_mode', 'manual')} />Вручную <small>Выбранное устройство применяется к распознаванию речи.</small></label></fieldset>{settings.execution_mode === 'manual' && <label className="settings-field">Устройство<select value={settings.device} onChange={(event) => updateSettings('device', event.target.value as 'cpu' | 'gpu')}><option value="cpu">Процессор</option><option value="gpu">Видеокарта</option></select></label>}</section>
+        <section className="settings-group hardware-settings"><h2>Модели и устройства</h2>
           {!hardware ? <p className="settings-note">Проверяем доступные устройства…</p> : <>
             <p className="hardware-detected"><strong>Видеокарта:</strong> {hardware.hardware.gpu?.name || 'Совместимая видеокарта не обнаружена'}</p>
-            {hardware.hardware.gpu?.driver && <p className="settings-note">Версия драйвера: {hardware.hardware.gpu.driver}</p>}
-            <ul className="hardware-stage-list">
-              <li><strong>Экран · Авто:</strong> {screenGpu?.verified ? 'GPU DirectML, проверено' : 'CPU'}<small>{screenGpu?.verified ? 'Есть актуальная проверка качества и скорости.' : screenGpu?.reason ?? 'Автоматический режим использует проверенный CPU.'}</small></li>
+            <details className="settings-disclosure"><summary>Сведения о драйвере и этапах</summary><div className="settings-disclosure-content">{hardware.hardware.gpu?.driver && <p className="settings-note">Версия драйвера: {hardware.hardware.gpu.driver}</p>}<ul className="hardware-stage-list">
+              <li><strong>Извлечение кадров:</strong> CPU<small>Обработка кадров не зависит от устройства распознавания речи.</small></li>
               <li><strong>Сжатие звука · Авто:</strong> {hardware.stages.audio?.auto_device === 'cpu' ? 'CPU' : hardware.stages.audio?.auto_device ?? 'не определено'}<small>{hardware.stages.audio?.reason ?? 'Используется проверенный путь.'}</small></li>
               <li><strong>Говорящие · Авто:</strong> {hardware.stages.diarization?.auto_device === 'cpu' ? 'CPU' : hardware.stages.diarization?.auto_device ?? 'CPU'}<small>{hardware.stages.diarization?.reason ?? 'CPU · нет сопоставимого замера качества и скорости'}</small></li>
               <li><strong>Поиск · Авто:</strong> {hardware.stages.index?.auto_device === 'cpu' ? 'CPU' : hardware.stages.index?.auto_device ?? 'не определено'}<small>{hardware.stages.index?.query_reason ?? hardware.stages.index?.bulk_reason ?? 'GPU для поиска не выбран.'}</small></li>
-            </ul>
-            <p className="hardware-runtime-status">GPU среда: {gpuVerified ? 'подготовлена и проверена' : gpuPrepared ? 'подготовлена, но ещё не проверена; ручной запуск будет экспериментальным' : 'не подготовлена'}</p>
-            {hardwarePreparation?.status === 'running' && <div className="hardware-preparation-progress" role="status"><LoaderCircle size={16} className="spin" /><div><strong>Подготавливаем среду</strong><p>{latestHardwareProgress?.stage ?? hardwarePreparation.stage ?? 'Подготовка'}{latestHardwareProgress?.detail ? ` · ${latestHardwareProgress.detail}` : ''}</p></div></div>}
-            {screenGpu?.can_prepare && <div className="hardware-prepare-action"><p>Оценка загрузки: {formatBytes(hardware.gpu_runtime.estimated_download_bytes ?? hardwarePreparation?.estimated_download_bytes ?? 0)}. Подготовка запускается только после вашего действия.</p><button className="secondary-button" type="button" onClick={() => void prepareGpu()} disabled={hardwarePrepareBusy || hardwarePreparation?.status === 'running'}>{hardwarePrepareBusy ? 'Запускаем…' : gpuPrepared ? 'Проверить GPU' : 'Подготовить среду GPU'}</button></div>}
-            {!screenGpu?.can_prepare && !gpuPrepared && <p className="settings-note">Подготовка DirectML сейчас недоступна для обнаруженного оборудования.</p>}
+            </ul></div></details>
           </>}
         </section>
         <section className="settings-group semantic-assets-settings"><h2>Семантический поиск</h2>
           {!assets ? <p className="settings-note">Проверяем локальную модель…</p> : assets.available ? <>
-            <p className="asset-ready-status"><Check size={16} />Локальный семантический поиск готов{assets.version ? ` · ${assets.version}` : ''}</p>
-            {assets.files?.length ? <ul className="asset-file-list">{assets.files.map((file) => <li key={file.name}>{file.name} · {file.available ? 'проверен' : 'не найден'}</li>)}</ul> : null}
+            <p className="asset-ready-status"><Check size={16} />Модель поиска установлена</p>
+            {assets.files?.length ? <details className="settings-disclosure"><summary>Проверка файлов модели</summary><div className="settings-disclosure-content"><ul className="asset-file-list">{assets.files.map((file) => <li key={file.name}>{file.name} · {file.available ? 'проверен' : 'не найден'}</li>)}</ul></div></details> : null}
           </> : <>
             <p className="settings-note">Модель не загружается при запуске. После подготовки запросы смогут находить похожие по смыслу фрагменты.</p>
             <p className="asset-download-estimate">Оценка загрузки: {formatBytes(assets.download_bytes ?? assetPreparation?.estimated_download_bytes ?? 0)}.</p>
             {assetPreparation?.status === 'running' && <div className="hardware-preparation-progress" role="status"><LoaderCircle size={16} className="spin" /><div><strong>Подготавливаем семантический поиск</strong><p>{latestAssetProgress?.file ?? assetPreparation.stage ?? 'Загрузка модели'}{typeof latestAssetProgress?.completed_bytes === 'number' && typeof latestAssetProgress.total_bytes === 'number' ? ` · ${formatBytes(latestAssetProgress.completed_bytes)} из ${formatBytes(latestAssetProgress.total_bytes)}` : typeof latestAssetProgress?.percent === 'number' ? ` · ${latestAssetProgress.percent}%` : ''}</p></div></div>}
             <button className="secondary-button" type="button" onClick={() => void prepareSemanticSearch()} disabled={assetsPrepareBusy || assetPreparation?.status === 'running'}>{assetsPrepareBusy ? 'Запускаем…' : 'Подготовить семантический поиск'}</button>
           </>}
+          <div className="archive-reindex-action"><button className="secondary-button" type="button" onClick={() => void reindexArchive()} disabled={archiveReindexBusy || assets?.available !== true}>{archiveReindexBusy ? <><LoaderCircle size={15} className="spin" />Обновляем…</> : 'Обновить индекс архива'}</button>{!assets?.available && <small>Сначала установите локальную модель поиска.</small>}{archiveReindexStatus && <p role="status">{archiveReindexStatus}</p>}</div>
         </section>
-        <section className="settings-group backup-settings"><h2>Резервные копии и очистка</h2>
-          <label className="settings-choice backup-cleanup-choice"><input type="checkbox" checked={settings.auto_cleanup} onChange={(event) => updateSettings('auto_cleanup', event.target.checked)} /><span><strong>Разрешить очистку старых исходников</strong><small>После включения приложение периодически проверяет срок хранения и условия удаления. Нужны проверенная копия и успешный тест восстановления.</small></span></label>
-          <p className="settings-note">Срок хранения исходников: {settings.original_retention_days} дн. Папка резервных копий задаётся выше и сохраняется перед запуском операций.</p>
+        <AutoLearnSetting disabled={settingsBusy} />
+        <section className="settings-group backup-settings"><h2>Хранение и резервные копии</h2>
+          <FolderField label="Папка архива" value={settings.archive_root} onChoose={() => void chooseDirectory('archive_root')} />{settings.backup_root !== undefined && <FolderField label="Резервная папка" value={settings.backup_root ?? ''} onChoose={() => void chooseDirectory('backup_root')} clearable onClear={() => updateSettings('backup_root', null)} />}
+          {settings.disk && <p className="disk-space">Свободно: {typeof settings.disk.free_bytes === 'number' ? formatBytes(settings.disk.free_bytes) : 'нет данных'}</p>}
+          <label className="settings-field">Срок хранения полного видео<input type="number" min={1} max={365} value={settings.original_retention_days} onChange={(event) => updateSettings('original_retention_days', Math.max(1, Number(event.target.value) || 30))} /><small>Текст, звук и сохранённые кадры остаются в архиве.</small></label><p className="settings-note">{settings.auto_cleanup ? 'Автоматическая очистка включена: оригиналы старше выбранного срока удаляются только при готовом архиве и проверенной резервной копии.' : 'Автоматическая очистка выключена.'}</p>
+          <label className="settings-choice backup-cleanup-choice"><input type="checkbox" checked={settings.auto_cleanup} onChange={(event) => updateSettings('auto_cleanup', event.target.checked)} /><span><strong>Разрешить очистку старых исходников</strong><small>Приложение проверяет срок хранения, проверенную копию и успешный тест восстановления.</small></span></label>
           {!backupStatus ? <p className="settings-note">Проверяем резервные копии…</p> : <>
             {backupStatus.storage.error && <p className="settings-note">{backupStatus.storage.error.message}</p>}
-            {backupStatus.storage.configured ? <p className="backup-storage-state">Папка подключена: {backupStatus.storage.backup_root}</p> : <p className="backup-storage-state">Папка резервных копий не настроена. Выберите её выше и сохраните настройки.</p>}
+            {backupStatus.storage.configured ? <p className="backup-storage-state">Папка подключена: {backupStatus.storage.backup_root}</p> : <p className="backup-storage-state">{settings.backup_root && !backupRootSaved ? 'Сохраните выбранную папку резервных копий перед запуском операций.' : 'Папка резервных копий не подключена.'}</p>}
             {backupJob?.status === 'running' && <div className="hardware-preparation-progress" role="status"><LoaderCircle size={16} className="spin" /><div><strong>{backupOperationLabel(backupJob.operation)}</strong><p>{backupJob.stage ?? 'Выполняется'}{backupJob.progress?.at(-1)?.path ? ` · ${backupJob.progress.at(-1)?.path}` : ''}{typeof backupJob.progress?.at(-1)?.completed === 'number' && typeof backupJob.progress?.at(-1)?.total === 'number' ? ` · ${backupJob.progress.at(-1)?.completed} из ${backupJob.progress.at(-1)?.total}` : ''}</p></div></div>}
-            {settings.backup_root && !backupRootSaved && <p className="settings-note">Сохраните выбранную папку резервной копии перед запуском операций.</p>}
             <div className="backup-actions"><button className="primary-button" type="button" onClick={() => void runBackupOperation('backup')} disabled={!backupStatus.storage.configured || !backupRootSaved || backupBusy || backupJob?.status === 'running'}>Создать резервную копию</button><button className="secondary-button" type="button" onClick={() => void runBackupOperation('cleanup_preview')} disabled={backupBusy || backupJob?.status === 'running'}>Проверить условия очистки</button></div>
-            {backupStatus.storage.snapshots.length === 0 ? <p className="settings-note">Снимков пока нет.</p> : <div className="backup-snapshot-list">{backupStatus.storage.snapshots.map((snapshot) => <article className="backup-snapshot" key={snapshot.snapshot_id}>
+            {backupStatus.storage.snapshots.length === 0 ? <p className="settings-note">Снимков пока нет.</p> : <details className="settings-disclosure"><summary>Резервные копии · {backupStatus.storage.snapshots.length}</summary><div className="settings-disclosure-content backup-snapshot-list">{backupStatus.storage.snapshots.map((snapshot) => <article className="backup-snapshot" key={snapshot.snapshot_id}>
               <div className="backup-snapshot-summary"><strong>{snapshot.created_at ? new Intl.DateTimeFormat('ru-RU', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(snapshot.created_at)) : snapshot.snapshot_id}</strong><small>{snapshot.file_count} файлов · {formatBytes(snapshot.total_bytes)}</small><small>{snapshot.verified_receipt ? 'Копия проверена' : 'Копия ещё не проверена'} · {snapshot.restore_test_passed ? 'Тест восстановления пройден' : 'Тест восстановления не пройден'}</small></div>
               <div className="backup-snapshot-actions"><button className="text-action" type="button" onClick={() => void runBackupOperation('verify', snapshot.snapshot_id)} disabled={backupBusy || backupJob?.status === 'running'}>Проверить</button><button className="text-action" type="button" onClick={() => void runBackupOperation('restore_test', snapshot.snapshot_id)} disabled={backupBusy || backupJob?.status === 'running'}>Тест восстановления</button></div>
               <div className="backup-restore-controls"><label className="settings-field">Папка для восстановления<input value={backupTarget} readOnly placeholder="Выберите новую или пустую папку" /></label><button className="secondary-button" type="button" onClick={() => void chooseBackupRestoreTarget()} disabled={backupBusy || backupJob?.status === 'running'}>Выбрать папку</button><button className="text-action" type="button" onClick={() => setBackupConfirmation({ operation: 'restore', snapshotId: snapshot.snapshot_id })} disabled={!backupTarget || backupBusy || backupJob?.status === 'running'}>Восстановить в папку</button></div>
-            </article>)}</div>}
+            </article>)}</div></details>}
             {cleanupPreview && <div className="cleanup-preview"><strong>Проверка очистки: {cleanupPreview.eligible_count} можно удалить, {cleanupPreview.blocked_count} заблокировано.</strong>{cleanupPreview.items.slice(0, 5).map((item) => <article key={item.meeting_id}><span>{item.filename}{typeof item.age_days === 'number' ? ` · ${item.age_days} дн.` : ''}</span><small>{item.eligible ? 'Есть проверенная копия и исходник готов к очистке.' : item.blocked_reasons.join(' ')}</small></article>)}{cleanupPreview.items.length > 5 && <small>Показаны первые пять файлов из {cleanupPreview.items.length}.</small>}{!settings.auto_cleanup || !backupStatus.storage.auto_cleanup_enabled ? <small>Сохраните настройку, разрешающую очистку, чтобы выполнить удаление.</small> : null}<button className="danger-button" type="button" onClick={() => setBackupConfirmation({ operation: 'cleanup' })} disabled={!settings.auto_cleanup || !backupStatus.storage.auto_cleanup_enabled || cleanupPreview.eligible_count === 0 || backupBusy || backupJob?.status === 'running'}>Удалить проверенные старые исходники</button></div>}
           </>}
         </section>
         <section className="settings-group"><h2>Codex</h2><ConnectorPanel status={connector} busy={connectorBusy} onAction={(action) => void runConnector(action)} /></section>
-        <div className="settings-save-row"><button className="primary-button" onClick={() => void saveSettings()} disabled={settingsBusy}>{settingsBusy ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />}Сохранить настройки</button></div>
+        <div className="settings-save-row"><span className="settings-dirty-status" role="status">{settingsBusy ? 'Сохраняем…' : settingsDirty ? 'Есть несохранённые изменения' : 'Все настройки сохранены'}</span><button className="primary-button" onClick={() => void saveSettings()} disabled={settingsBusy || !settingsDirty}>{settingsBusy ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />}Сохранить настройки</button></div>
       </>}
     </section>}
 
-    {toast && <div className="meeting-toast" role="status"><span>{toast.message}</span>{toast.onUndo && <button onClick={toast.onUndo}><Undo2 size={14} />Отменить</button>}<button aria-label="Закрыть сообщение" onClick={() => setToast(null)}><X size={14} /></button></div>}
-    {errorDialog && <div className="meeting-dialog-backdrop"><section className="meeting-error-dialog" role="alertdialog" aria-modal="true" aria-labelledby="meeting-error-title" aria-describedby="meeting-error-reason"><AlertCircle size={22} /><h2 id="meeting-error-title">{errorDialog.title}</h2><p id="meeting-error-reason">{errorDialog.reason}</p><p>{errorDialog.recommendation}</p><button className="primary-button" autoFocus onClick={() => setErrorDialog(null)}>ОК</button></section></div>}
-    {backupConfirmation && <div className="meeting-dialog-backdrop"><section className="meeting-error-dialog" role="alertdialog" aria-modal="true" aria-labelledby="backup-confirm-title"><AlertCircle size={22} /><h2 id="backup-confirm-title">{backupConfirmation.operation === 'cleanup' ? 'Удалить исходники?' : 'Восстановить резервную копию?'}</h2><p>{backupConfirmation.operation === 'cleanup' ? 'Будут удалены только исходные файлы, которые прошли свежую проверку контрольных сумм, срока хранения и теста восстановления. Текст, звук и сохранённые кадры останутся.' : 'Копия будет восстановлена в выбранную новую или пустую папку. Существующие файлы в целевой папке не перезаписываются.'}</p><div className="backup-confirm-actions"><button className="secondary-button" type="button" onClick={() => setBackupConfirmation(null)}>Отмена</button><button className={backupConfirmation.operation === 'cleanup' ? 'danger-button' : 'primary-button'} type="button" autoFocus onClick={confirmBackupAction}>Продолжить</button></div></section></div>}
+    <ToastNotice show={Boolean(toast)} className="meeting-toast"><span>{toast?.message}</span>{toast?.onUndo && <button onClick={toast.onUndo}><Undo2 size={14} />Отменить</button>}<button aria-label="Закрыть сообщение" onClick={() => setToast(null)}><X size={14} /></button></ToastNotice>
+    <dialog ref={errorDialogRef} className="meeting-error-dialog" role="alertdialog" aria-labelledby="meeting-error-title" aria-describedby="meeting-error-reason" onCancel={(event) => { event.preventDefault(); setErrorDialog(null) }} onClose={() => setErrorDialog(null)}>
+      {errorDialog && <><AlertCircle size={22} /><h2 id="meeting-error-title">{errorDialog.title}</h2><p id="meeting-error-reason">{errorDialog.reason}</p><p>{errorDialog.recommendation}</p><button className="primary-button" autoFocus onClick={() => setErrorDialog(null)}>ОК</button></>}
+    </dialog>
+    <dialog ref={backupConfirmationRef} className="meeting-error-dialog" aria-labelledby="backup-confirm-title" onCancel={(event) => { event.preventDefault(); setBackupConfirmation(null) }} onClose={() => setBackupConfirmation(null)}>
+      {backupConfirmation && <><AlertCircle size={22} /><h2 id="backup-confirm-title">{backupConfirmation.operation === 'cleanup' ? 'Удалить исходники?' : 'Восстановить резервную копию?'}</h2><p>{backupConfirmation.operation === 'cleanup' ? 'Будут удалены только исходные файлы, которые прошли свежую проверку контрольных сумм, срока хранения и теста восстановления. Текст, звук и сохранённые кадры останутся.' : 'Копия будет восстановлена в выбранную новую или пустую папку. Существующие файлы в целевой папке не перезаписываются.'}</p><div className="backup-confirm-actions"><button className="secondary-button" type="button" onClick={() => setBackupConfirmation(null)}>Отмена</button><button className={backupConfirmation.operation === 'cleanup' ? 'danger-button' : 'primary-button'} type="button" autoFocus onClick={confirmBackupAction}>Продолжить</button></div></>}
+    </dialog>
   </main>
 }
 
 function RecorderPanel(props: {
-  recorder: RecorderStatus | null; error: string; busy: boolean; prepared: boolean; title: string; selection: RecorderSelection; previewFailed: boolean;
+  recorder: RecorderStatus | null; error: string; busy: boolean; prepareBusy: boolean; prepared: boolean; title: string; selection: RecorderSelection; previewFailed: boolean; previewReady: boolean; previewNonce: number;
   onTitle: (value: string) => void; onSelection: (value: RecorderSelection) => void; onPrepare: () => void; onConfigure: () => void;
-  onStart: () => void; onStop: () => void; onPreviewError: () => void;
+  onStart: () => void; onStop: () => void; onPreviewError: () => void; onPreviewLoad: () => void;
 }) {
   const recording = props.recorder?.state === 'recording'
+  const starting = ['starting', 'start_pending'].includes(props.recorder?.state ?? '')
+  const stopping = ['stopping', 'saving', 'finalizing'].includes(props.recorder?.state ?? '')
   const available = Boolean(props.recorder?.available && props.recorder.connected)
+  const sourcesReady = Boolean(props.selection.monitor_id && props.selection.browser_id && props.selection.microphone_id)
+  const previewAvailable = props.previewReady && available && sourcesReady && Boolean(props.recorder?.preview_url)
+  const previewMessage = props.previewFailed ? 'Предварительный просмотр временно недоступен. Повторяем попытку…' : !available ? 'Подготовьте источник записи, чтобы увидеть экран.' : !sourcesReady ? 'Выберите экран и сохраните источники, чтобы включить просмотр.' : !props.previewReady ? 'Сохраните выбранные источники, чтобы включить просмотр.' : 'Загружаем предварительный просмотр…'
   const selectValue = (key: keyof RecorderSelection, value: string) => props.onSelection({ ...props.selection, [key]: value || null })
-  return <section className={`recorder-panel ${recording ? 'is-recording' : ''}`} aria-label="Запись встречи">
-    <div className="recorder-heading"><div className="recorder-icon"><Radio size={18} /></div><div><h2>{recording ? 'Идёт запись' : 'Запись встречи'}</h2><p>{recording ? `${props.recorder?.title || 'Встреча'} · ${formatTime(props.recorder?.duration_seconds)}` : 'Перед началом проверьте изображение и источники звука.'}</p></div>{recording ? <button className="danger-button" onClick={props.onStop} disabled={props.busy}><Square size={15} />Закончить запись</button> : <button className="secondary-button" onClick={props.onPrepare} disabled={props.busy}><Settings2 size={15} />Подготовить</button>}</div>
-    {!recording && <div className="recorder-controls">
+  return <section className={`recorder-panel ${recording || stopping ? 'is-recording' : ''}`} aria-label="Запись встречи">
+    <div className="recorder-heading"><div className="recorder-icon"><Radio size={18} /></div><div><h2>{stopping ? 'Останавливаем и сохраняем…' : starting ? 'Запускаем запись…' : recording ? 'Идёт запись' : 'Запись встречи'}</h2><p role={props.prepareBusy ? 'status' : undefined}>{props.prepareBusy ? 'Первый запуск может скачивать и распаковывать пакет OBS. Настройки записи станут доступны после завершения.' : recording || stopping ? `${props.recorder?.title || 'Встреча'} · ${formatTime(props.recorder?.duration_seconds)}` : starting ? 'Подключаем источники записи.' : 'Перед началом проверьте изображение и источники звука.'}</p></div>{recording || stopping ? <button className="danger-button" onClick={props.onStop} disabled={props.busy || stopping}><Square size={15} />{stopping ? 'Останавливаем…' : 'Закончить запись'}</button> : starting ? <button className="secondary-button" disabled><LoaderCircle size={15} className="spin" />Запускаем…</button> : <button className="secondary-button" onClick={props.onPrepare} disabled={props.busy}>{props.prepareBusy ? <LoaderCircle size={15} className="spin" /> : <Settings2 size={15} />}{props.prepareBusy ? 'Подготавливаем OBS…' : 'Подготовить'}</button>}</div>
+    <div className="recorder-preview" aria-live="polite">{previewAvailable ? <img src={`${meetingsApi.previewUrl(props.recorder!.preview_url!)}?refresh=${props.previewNonce}`} alt="Предварительный просмотр выбранного экрана" onError={props.onPreviewError} onLoad={props.onPreviewLoad} /> : <div><ImageIcon size={22} /><span>{previewMessage}</span></div>}</div>
+    {!recording && !stopping && <div className="recorder-controls">
       {props.error && <p className="recorder-unavailable" role="status"><AlertCircle size={15} />{props.error}</p>}
       {props.recorder && <>
         <label className="recorder-select"><span><Monitor size={14} />Экран</span><select value={props.selection.monitor_id ?? ''} onChange={(event) => selectValue('monitor_id', event.target.value)} disabled={!available}><option value="">Выберите экран</option>{props.recorder.monitors.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
         <label className="recorder-select"><span><Volume2 size={14} />Звук созвона</span><select value={props.selection.browser_id ?? ''} onChange={(event) => selectValue('browser_id', event.target.value)} disabled={!available}><option value="">Выберите источник звука</option>{props.recorder.browsers.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
         <label className="recorder-select"><span><Mic size={14} />Микрофон</span><select value={props.selection.microphone_id ?? ''} onChange={(event) => selectValue('microphone_id', event.target.value)} disabled={!available}><option value="">Выберите микрофон</option>{props.recorder.microphones.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-        <div className="recorder-preview">{props.recorder.preview_url && !props.previewFailed ? <img src={meetingsApi.previewUrl(props.recorder.preview_url)} alt="Предварительный просмотр выбранного экрана" onError={props.onPreviewError} /> : <div><ImageIcon size={22} /><span>{props.previewFailed ? 'Предварительный просмотр недоступен.' : 'Предварительный просмотр появится после подготовки.'}</span></div>}</div>
         <div className="audio-levels"><AudioLevel label="Звук созвона" value={props.recorder.levels.browser} stale={props.recorder.levels.stale} /><AudioLevel label="Микрофон" value={props.recorder.levels.microphone} stale={props.recorder.levels.stale} /></div>
         <label className="recorder-title">Название встречи<input value={props.title} onChange={(event) => props.onTitle(event.target.value)} placeholder="Например, Планирование на сегодня" /></label>
-        <div className="recorder-actions"><button className="secondary-button" disabled={!available || props.busy || !props.prepared} onClick={props.onConfigure}>Сохранить источники</button><button className="primary-button" disabled={!available || props.busy || !props.prepared} onClick={props.onStart}><Radio size={15} />Начать запись</button></div>
+        <div className="recorder-actions"><button className="secondary-button" disabled={!available || props.busy || !props.prepared || starting} onClick={props.onConfigure}>Сохранить источники</button><button className="primary-button" disabled={!available || props.busy || !props.prepared || starting} onClick={props.onStart}><Radio size={15} />Начать запись</button></div>
       </>}
     </div>}
   </section>
@@ -1078,7 +1154,7 @@ function ConnectorPanel({ status, busy, onAction }: { status: ConnectorStatus | 
   const uriStatus = status?.evidence_protocol
   const canAddUriHandler = Boolean(status?.registered && uriStatus?.supported && !uriStatus.owned && !uriStatus.conflict)
   const connectLabel = canAddUriHandler ? 'Настроить ссылки для встреч' : 'Подключить'
-  return <div className="connector-panel"><div className={`connector-status ${status?.client_verified ? 'verified' : ''}`}><span className="connector-dot" /><p>{label}</p></div><p className="settings-note">Подключение даёт Codex доступ к встречам только для чтения.</p>{uriStatus?.owned && <p className="settings-note">Ссылки video-transcribe:// можно открывать повторно после закрытия Codex.</p>}{uriStatus?.conflict && <p className="settings-note">Схема ссылок уже занята другим приложением; существующая регистрация сохранена.</p>}<div className="connector-actions"><button className="primary-button" onClick={() => onAction('connect')} disabled={busy || (Boolean(status?.registered) && !canAddUriHandler)}>{busy ? 'Подключаем…' : connectLabel}</button><button className="secondary-button" onClick={() => onAction('check')} disabled={busy}>Проверить подключение</button><button className="secondary-button" onClick={() => onAction('disconnect')} disabled={busy || !status?.registered}>Отключить</button></div></div>
+  return <div className="connector-panel"><div className={`connector-status ${status?.client_verified ? 'verified' : ''}`}><span className="connector-dot" /><p>{label}</p></div><p className="settings-note">Codex может читать архив и отправлять локальные аудио- и видеофайлы в очередь приложения на преобразование.</p>{uriStatus?.owned && <p className="settings-note">Ссылки video-transcribe:// можно открывать повторно после закрытия Codex.</p>}{uriStatus?.conflict && <p className="settings-note">Схема ссылок уже занята другим приложением; существующая регистрация сохранена.</p>}<div className="connector-actions"><button className="primary-button" onClick={() => onAction('connect')} disabled={busy || (Boolean(status?.registered) && !canAddUriHandler)}>{busy ? 'Подключаем…' : connectLabel}</button><button className="secondary-button" onClick={() => onAction('check')} disabled={busy}>Проверить подключение</button><button className="secondary-button" onClick={() => onAction('disconnect')} disabled={busy || !status?.registered}>Отключить</button></div></div>
 }
 
 function formatBytes(value: number): string {

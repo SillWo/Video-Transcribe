@@ -13,22 +13,75 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
+import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 _NAMESPACE = uuid.UUID("f2e7a39c-97be-4c5b-a8c3-6a11fe7d0637")
+_SPEECH_ID_RE = re.compile(r"^speech:[0-9a-f]{24}$")
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _check_import_cancelled(cancel: Callable[[], Any] | None) -> None:
+    if cancel is not None and cancel():
+        raise InterruptedError("Meeting import was cancelled.")
+
+
+def _uniquify_speech_ids(segments: list[dict], overrides: dict | None = None
+                         ) -> tuple[list[dict], dict]:
+    """Return stable unique IDs for collisions among emitted speech rows.
+
+    The original hash remains on the first row. Later rows receive the first
+    available numbered suffix, while all unrelated IDs and correction keys are
+    reserved so existing archive data is never overwritten.
+    """
+    rows = [dict(segment) if isinstance(segment, dict) else segment for segment in segments]
+    corrections = dict(overrides) if isinstance(overrides, dict) else {}
+    reserved = {str(segment.get("id")) for segment in rows if isinstance(segment, dict)
+                and segment.get("id") is not None}
+    reserved.update(str(key) for key in corrections)
+    seen: set[str] = set()
+    next_suffix: dict[str, int] = {}
+
+    for segment in rows:
+        if not isinstance(segment, dict):
+            continue
+        base_id = segment.get("id")
+        if not isinstance(base_id, str) or not _SPEECH_ID_RE.fullmatch(base_id):
+            continue
+        if base_id not in seen:
+            seen.add(base_id)
+            continue
+
+        suffix = next_suffix.get(base_id, 2)
+        candidate = f"{base_id}:{suffix}"
+        while candidate in reserved:
+            suffix += 1
+            candidate = f"{base_id}:{suffix}"
+        next_suffix[base_id] = suffix + 1
+        segment["id"] = candidate
+        reserved.add(candidate)
+
+        correction = corrections.get(base_id)
+        if correction is not None:
+            if not isinstance(correction, dict) or (
+                    correction.get("original_start") == segment.get("start")
+                    and correction.get("original_end") == segment.get("end")):
+                corrections[candidate] = dict(correction) if isinstance(correction, dict) else correction
+
+    return rows, corrections
 
 
 def _json_read(path: Path, default: Any) -> Any:
@@ -89,7 +142,7 @@ class MeetingArchive:
     """A local archive whose meeting folders are the authoritative storage."""
 
     def __init__(self, root: str | Path, read_only: bool = False):
-        self.root = Path(root).expanduser()
+        self.root = Path(root).expanduser().resolve()
         self.read_only = read_only
         if not read_only:
             self.root.mkdir(parents=True, exist_ok=True)
@@ -138,63 +191,191 @@ class MeetingArchive:
             raise KeyError(meeting_id)
         return data
 
-    def import_file(self, path: str | Path, title: str | None = None, started_at: str | None = None) -> dict:
+    def _stage_original_copy(self, source: Path, target: Path, expected_sha: str,
+                             cancel: Callable[[], Any] | None = None) -> Path:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=".import-", suffix=".tmp", dir=target.parent)
+        temporary = Path(temp_name)
+        digest = hashlib.sha256()
+        try:
+            incoming = source.open("rb")
+            with incoming, os.fdopen(fd, "wb") as outgoing:
+                while True:
+                    _check_import_cancelled(cancel)
+                    chunk = incoming.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    outgoing.write(chunk)
+                outgoing.flush()
+                os.fsync(outgoing.fileno())
+            if digest.hexdigest() != expected_sha:
+                raise ValueError("Source changed while it was being imported")
+            shutil.copystat(source, temporary)
+            _check_import_cancelled(cancel)
+            return temporary
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def _meeting_for_sha(self, sha: str) -> dict | None:
+        meetings = self.root / "meetings"
+        if not meetings.is_dir():
+            return None
+        for entry in meetings.glob("*/meeting.json"):
+            meta = _json_read(entry, {})
+            if meta.get("sha256") == sha:
+                return meta
+        return None
+
+    def _restore_missing_original(self, meta: dict, source: Path, sha: str,
+                                  cancel: Callable[[], Any] | None = None) -> dict:
+        meeting_id = self._valid_id(meta.get("meeting_id"))
+        original_rel = meta.get("original_rel")
+        target = (self.root / str(original_rel)).resolve() if original_rel else None
+        if target is not None and target.is_relative_to(self.root.resolve()) and target.is_file():
+            return meta
+        filename = Path(str(meta.get("source_filename") or source.name)).name or source.name
+        target = self.root / "originals" / meeting_id / filename
+        temporary = self._stage_original_copy(source, target, sha, cancel)
+        try:
+            with _archive_lock(self.root):
+                current = self.get_meeting(meeting_id)
+                if current.get("sha256") != sha:
+                    raise ValueError("Content identity changed while restoring the meeting original")
+                current_rel = current.get("original_rel")
+                current_target = (self.root / str(current_rel)).resolve() if current_rel else None
+                if current_target is not None and current_target.is_relative_to(self.root) and current_target.is_file():
+                    return current
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(temporary, target)
+                updated = {**current, "original_rel": target.relative_to(self.root).as_posix(),
+                           "source_filename": filename, "source_available": True,
+                           "source_modified_at": datetime.fromtimestamp(
+                               source.stat().st_mtime, timezone.utc).isoformat(timespec="seconds")}
+                _json_write(self._meeting_meta_path(meeting_id), updated)
+                return updated
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def import_file(self, path: str | Path, title: str | None = None, started_at: str | None = None,
+                    cancel: Callable[[], Any] | None = None, provisional: bool = False) -> dict:
         self._require_write()
         source = Path(path).expanduser().resolve(strict=True)
         if not source.is_file():
             raise ValueError("Source must be a file")
         digest = hashlib.sha256()
         with source.open("rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            while True:
+                _check_import_cancelled(cancel)
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
                 digest.update(chunk)
         sha = digest.hexdigest()
+        meeting_id = str(uuid.uuid5(_NAMESPACE, sha))
         with _archive_lock(self.root):
-            for entry in (self.root / "meetings").glob("*/meeting.json"):
-                meta = _json_read(entry, {})
-                if meta.get("sha256") == sha:
-                    return meta
-            meeting_id = str(uuid.uuid5(_NAMESPACE, sha))
-            folder = self.meeting_dir(meeting_id)
-            folder.mkdir(parents=True, exist_ok=True)
-            original_name = source.name or "original"
-            target = self.root / "originals" / meeting_id / original_name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.exists():
-                shutil.copy2(source, target)
-            meta = {
-                "meeting_id": meeting_id,
-                "title": title or source.stem,
-                "started_at": started_at,
-                "created_at": _now(),
-                "source_modified_at": datetime.fromtimestamp(source.stat().st_mtime, timezone.utc).isoformat(timespec="seconds"),
-                "source_filename": original_name,
-                "source_available": True,
-                "original_rel": target.relative_to(self.root).as_posix(),
-                "sha256": sha,
-                "status": "imported",
-                "job_id": None,
-            }
-            _json_write(folder / "meeting.json", meta)
-            _json_write(folder / "transcript.json", {"raw_segments": [], "raw_text": None, "overrides": {}})
-            _json_write(folder / "speakers.json", {"confirmed": {}})
-            _json_write(folder / "screen-events.json", {"events": [], "status": "pending", "limitations": []})
-            _json_write(folder / "glossary.json", {"entries": []})
-            return meta
+            existing = self._meeting_for_sha(sha)
+        if existing:
+            return self._restore_missing_original(existing, source, sha, cancel)
 
-    def list_meetings(self, query: str = "", limit: int = 50, offset: int = 0) -> list[dict]:
+        original_name = source.name or "original"
+        target = self.root / "originals" / meeting_id / original_name
+        temporary = self._stage_original_copy(source, target, sha, cancel)
+        created_original = False
+        created_folder = False
+        folder = self.meeting_dir(meeting_id)
+        try:
+            _check_import_cancelled(cancel)
+            duplicate = None
+            with _archive_lock(self.root):
+                duplicate = self._meeting_for_sha(sha)
+                if duplicate is None:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if target.is_file() and self._sha256_file(target) == sha:
+                        temporary.unlink(missing_ok=True)
+                    else:
+                        os.replace(temporary, target)
+                        created_original = True
+                    _check_import_cancelled(cancel)
+                    folder.mkdir(parents=True, exist_ok=False)
+                    created_folder = True
+                    meta = {
+                        "meeting_id": meeting_id,
+                        "title": title or source.stem,
+                        "started_at": started_at,
+                        "created_at": _now(),
+                        "source_modified_at": datetime.fromtimestamp(source.stat().st_mtime, timezone.utc).isoformat(timespec="seconds"),
+                        "source_filename": original_name,
+                        "source_available": True,
+                        "original_rel": target.relative_to(self.root).as_posix(),
+                        "sha256": sha,
+                        "status": "imported",
+                        "job_id": None,
+                    }
+                    if provisional:
+                        meta["provisional"] = True
+                    _json_write(folder / "transcript.json", {"raw_segments": [], "raw_text": None, "overrides": {}})
+                    _json_write(folder / "speakers.json", {"confirmed": {}})
+                    _json_write(folder / "screen-events.json", {"events": [], "status": "pending", "limitations": []})
+                    _json_write(folder / "glossary.json", {"entries": []})
+                    # meeting.json is the publication marker used by discovery and
+                    # content-addressed deduplication. Publish it only after every
+                    # required artifact has been initialized.
+                    _json_write(folder / "meeting.json", meta)
+                    temporary.unlink(missing_ok=True)
+                    return meta
+            if duplicate:
+                return self._restore_missing_original(duplicate, source, sha, cancel)
+        except Exception:
+            with _archive_lock(self.root):
+                if created_folder:
+                    shutil.rmtree(folder, ignore_errors=True)
+                if created_original and self._meeting_for_sha(sha) is None:
+                    target.unlink(missing_ok=True)
+                    try:
+                        target.parent.rmdir()
+                    except OSError:
+                        pass
+            raise
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def list_meetings(self, query: str = "", limit: int = 50, offset: int = 0,
+                      include_provisional: bool = False) -> list[dict]:
         query_fold = (query or "").casefold()
         rows = []
         meetings = self.root / "meetings"
         if meetings.is_dir():
             for entry in meetings.glob("*/meeting.json"):
                 item = _json_read(entry, None)
-                if isinstance(item, dict) and (not query_fold or query_fold in json.dumps(item, ensure_ascii=False).casefold()):
+                if (isinstance(item, dict) and (include_provisional or not item.get("provisional"))
+                        and (not query_fold or query_fold in json.dumps(item, ensure_ascii=False).casefold())):
                     rows.append(item)
         rows.sort(key=lambda m: (m.get("started_at") or m.get("created_at") or "", m.get("meeting_id", "")), reverse=True)
         return rows[max(0, offset):max(0, offset) + max(0, limit)]
 
     def _read_transcript(self, meeting_id: str) -> dict:
-        return _json_read(self.meeting_dir(meeting_id) / "transcript.json", {"raw_segments": [], "raw_text": None, "overrides": {}})
+        data = _json_read(self.meeting_dir(meeting_id) / "transcript.json", {"raw_segments": [], "raw_text": None, "overrides": {}})
+        segments = data.get("raw_segments", [])
+        if isinstance(segments, list):
+            data["raw_segments"], data["overrides"] = _uniquify_speech_ids(
+                segments, data.get("overrides"))
+        return data
+
+    def effective_text(self, meeting_id: str) -> str:
+        """Return current editor text without falling back to a linked job's old copy."""
+        self.get_meeting(meeting_id)
+        data = self._read_transcript(meeting_id)
+        segments = self._effective_segments(data)
+        if segments:
+            return "\n".join(str(segment.get("text") or "") for segment in segments)
+        raw_text = data.get("raw_text")
+        return raw_text if isinstance(raw_text, str) else ""
 
     def read_screen_events(self, meeting_id: str) -> dict:
         """Read retained screen events and their status without loading timeline data."""
@@ -290,11 +471,26 @@ class MeetingArchive:
             _json_write(path, data)
             return data["confirmed"][str(speaker_id)]
 
-    def write_screen_events(self, meeting_id: str, events: list[dict], status: str = "ready", limitations: list | None = None) -> dict:
+    def write_screen_events(self, meeting_id: str, events: list[dict], status: str = "ready",
+                            limitations: list | None = None, *, mode: str | None = None,
+                            publish_check: Callable[[], bool] | None = None) -> dict:
         self._require_write()
         with _archive_lock(self.root):
             self.get_meeting(meeting_id)
-            data = {"events": [dict(e) for e in events], "status": status, "limitations": list(limitations or [])}
+            if mode not in {None, "frames_only"}:
+                raise ValueError("Unsupported screen event mode")
+            rows = [dict(e) for e in events]
+            if mode == "frames_only":
+                event_fields = {"id", "frame", "start", "end", "width", "height",
+                                "sample_interval_seconds", "time_uncertainty_seconds", "reason"}
+                rows = [{key: value for key, value in event.items() if key in event_fields}
+                        for event in rows]
+                data = {"schema_version": 2, "mode": mode, "events": rows,
+                        "status": status, "limitations": list(limitations or [])}
+            else:
+                data = {"events": rows, "status": status, "limitations": list(limitations or [])}
+            if publish_check and publish_check():
+                raise InterruptedError("Screen stage was cancelled before screen event publication.")
             _json_write(self.meeting_dir(meeting_id) / "screen-events.json", data)
             return data
 
@@ -317,7 +513,8 @@ class MeetingArchive:
                 original = override.get("original_text") if isinstance(override, dict) else None
                 items.append({"id": str(orphan_id), "kind": "orphan_edit", "evidence_id": str(orphan_id), "start": override.get("original_start") if isinstance(override, dict) else None, "end": override.get("original_end") if isinstance(override, dict) else None, "text": orphan_text, "original_text": original, "reason": "segment_missing_or_changed_after_rerun"})
         for event in screen.get("events", []):
-            items.append({**event, "kind": "screen", "evidence_id": str(event.get("id", "")), "original_text": event.get("text", "")})
+            items.append({**event, "kind": "screen", "evidence_id": str(event.get("id", "")),
+                          "original_text": event.get("text", "") or ""})
         def time_key(it):
             try: return float(it.get("start", 0))
             except (ValueError, TypeError): return 0.0
@@ -509,7 +706,15 @@ class MeetingArchive:
             folder = self.meeting_dir(meeting_id)
             screen = _json_read(folder / "screen-events.json", {"events": [], "status": "pending", "limitations": []})
             timeline_rows = sorted(screen.get("events", []), key=lambda e: (float(e.get("start", 0) or 0), str(e.get("id", ""))))
-            (folder / "screen-timeline.md").write_text("\n".join(f"[{e.get('start', 0)}] {e.get('text', '')}" for e in timeline_rows) + "\n", encoding="utf-8")
+            def screen_line(event: dict) -> str:
+                stamp = event.get("start", 0)
+                if screen.get("schema_version") == 2 and screen.get("mode") == "frames_only":
+                    frame = str(event.get("frame") or "")
+                    if frame and not Path(frame).is_absolute() and ".." not in Path(frame).parts:
+                        return f"[{stamp}] [{event.get('id', 'Frame')} captured]({frame})"
+                    return f"[{stamp}] {event.get('id', 'Frame captured')}"
+                return f"[{stamp}] {event.get('text', '')}"
+            (folder / "screen-timeline.md").write_text("\n".join(screen_line(e) for e in timeline_rows) + "\n", encoding="utf-8")
             transcript_present = bool(effective) or transcript.get("raw_text") is not None
             speech_ready = meta.get("speech_status") in {"ready", "completed"} or bool(effective)
             availability = {"source": bool(self.original_path(meeting_id)), "transcript": transcript_present, "screen": screen.get("status") == "ready", "audio": any((folder / "audio").glob("*.opus")) if (folder / "audio").is_dir() else False}

@@ -1,5 +1,5 @@
 export type DiarizationPrefs = { diarizationEnabled: boolean; diarizationDevice: string }
-export type StoredPrefs = Partial<{ profile: 'quality' | 'balanced' | 'economy'; device: 'cpu' | 'gpu'; cpuThreads: number; restorePunctuation: boolean }> & DiarizationPrefs
+export type StoredPrefs = Partial<{ profile: 'quality' | 'balanced' | 'economy'; device: 'cpu' | 'gpu'; executionMode: 'auto' | 'manual'; cpuThreads: number; restorePunctuation: boolean }> & DiarizationPrefs
 
 export const defaultDiarizationPrefs: DiarizationPrefs = {
   diarizationEnabled: false,
@@ -34,6 +34,7 @@ export function sanitizeStoredPrefs(value: unknown): StoredPrefs {
   const result: StoredPrefs = {
     profile: stored.profile === 'quality' || stored.profile === 'balanced' || stored.profile === 'economy' ? stored.profile : 'balanced',
     restorePunctuation: typeof stored.restorePunctuation === 'boolean' ? stored.restorePunctuation : true,
+    executionMode: stored.executionMode === 'auto' || stored.executionMode === 'manual' ? stored.executionMode : stored.device === 'cpu' || stored.device === 'gpu' ? 'manual' : 'auto',
     ...sanitizeDiarizationPrefs(stored),
   }
   if (stored.device === 'cpu' || stored.device === 'gpu') result.device = stored.device
@@ -48,8 +49,11 @@ export function diarizationRequestFields(prefs: DiarizationPrefs) {
   }
 }
 
-export function stageOrderFor(enabled: boolean) {
+export function stageOrderFor(enabled: boolean, meetingLinked = false) {
+  if (meetingLinked) return enabled
+    ? ['source_check', 'preparation', 'source', 'audio', 'recognition', 'diarization', 'postprocess', 'screen', 'archive_audio', 'index', 'result'] as const
+    : ['source_check', 'preparation', 'source', 'audio', 'recognition', 'postprocess', 'screen', 'archive_audio', 'index', 'result'] as const
   return enabled
-    ? ['preparation', 'source', 'audio', 'recognition', 'diarization', 'postprocess', 'result'] as const
-    : ['preparation', 'source', 'audio', 'recognition', 'postprocess', 'result'] as const
+    ? ['source_check', 'preparation', 'source', 'audio', 'recognition', 'diarization', 'postprocess', 'result'] as const
+    : ['source_check', 'preparation', 'source', 'audio', 'recognition', 'postprocess', 'result'] as const
 }

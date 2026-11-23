@@ -1,12 +1,12 @@
 .meeting-workspace {
-  --meet-bg: #f6f8fa;
-  --meet-surface: #fff;
-  --meet-panel: #fbfcfd;
-  --meet-border: #dfe5eb;
-  --meet-text: #202a36;
-  --meet-muted: #637181;
-  --meet-blue: #3672c6;
-  --meet-blue-soft: #eef4fc;
+  --meet-bg: var(--app-bg, #13111c);
+  --meet-surface: var(--surface, #1c1a28);
+  --meet-panel: var(--surface-soft, #17151f);
+  --meet-border: var(--line, rgb(255 255 255 / 9%));
+  --meet-text: var(--text-primary, #f7f7f8);
+  --meet-muted: var(--text-secondary, #a1a0ab);
+  --meet-blue: var(--accent, #a78bfa);
+  --meet-blue-soft: rgb(167 139 250 / 10%);
   min-width: 0;
   min-height: 0;
   flex: 1 1 auto;
@@ -91,7 +91,7 @@
 .recorder-unavailable { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; margin: 0; color: #765b22; font-size: 13px; }
 .recorder-select, .recorder-title { min-width: 0; display: flex; flex-direction: column; gap: 6px; color: var(--meet-muted); font-size: 12px; }
 .recorder-select > span { display: inline-flex; align-items: center; gap: 6px; }
-.recorder-select select, .recorder-title input, .settings-field input, .settings-field select, .folder-field input, .glossary-add-form input, .glossary-add-form select, .speaker-card input { width: 100%; min-width: 0; min-height: 38px; padding: 0 10px; border: 1px solid var(--meet-border); border-radius: 7px; color: var(--meet-text); background: var(--meet-surface); font-size: 13px; }
+.recorder-select select, .recorder-title input, .settings-field input, .settings-field select, .folder-field input, .glossary-add-form input, .glossary-add-form select, .speaker-card input { width: 100%; min-width: 0; min-height: 38px; padding: 0 10px; border: 1px solid var(--meet-border); border-radius: 7px; color: var(--meet-text); background: var(--meet-surface); font-size: 14px; }
 .recorder-select select:disabled { color: #8792a0; background: #f3f5f7; }
 .recorder-preview { min-height: 115px; grid-column: 1 / 3; overflow: hidden; display: grid; place-items: center; border: 1px solid var(--meet-border); border-radius: 8px; color: var(--meet-muted); background: #f1f3f5; }
 .recorder-preview img { width: 100%; max-height: 220px; object-fit: contain; }
@@ -191,7 +191,7 @@
 .folder-field { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: end; gap: 8px; margin: 9px 0; }
 .folder-field label { display: flex; flex-direction: column; gap: 6px; color: var(--meet-muted); font-size: 12px; }
 .folder-field input { background: var(--meet-panel); }
-.folder-field .secondary-button { min-height: 38px; font-size: 12px; }
+.folder-field .secondary-button { min-height: 38px; font-size: 14px; }
 .disk-space { margin: 5px 0; color: var(--meet-muted); font-size: 12px; }
 .settings-choice { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
 .settings-choice legend { margin-bottom: 8px; color: var(--meet-muted); font-size: 12px; }
@@ -223,20 +223,8 @@
 .spin { animation: meeting-spin .9s linear infinite; }
 @keyframes meeting-spin { to { transform: rotate(360deg); } }
 
-@media (prefers-color-scheme: dark) {
-  .meeting-workspace { --meet-bg: #171b20; --meet-surface: #20262d; --meet-panel: #1b2128; --meet-border: #3a434d; --meet-text: #e8edf2; --meet-muted: #a8b2bd; --meet-blue: #8db8f0; --meet-blue-soft: #26384e; }
-  .meeting-recording-banner { color: #ffd2cd; background: #3a2425; border-color: #684342; }
-  .recorder-preview, .meeting-frame-placeholder { color: #aab4bf; background: #252d35; }
-  .timeline-content textarea, .meeting-speakers input { color: var(--meet-text); }
-  .meeting-status.ready { color: #b9e2c3; background: #24392d; border-color: #47654f; }
-  .meeting-status.active { color: #c1d9f6; background: #29394b; border-color: #4b6078; }
-  .meeting-status.failed { color: #f4c3bd; background: #452b2b; border-color: #714544; }
-  .meeting-toast { color: #dce8f5; background: var(--meet-surface); border-color: #50647a; }
-  .meeting-error-dialog { color: var(--meet-text); background: var(--meet-surface); }
-}
-
 @media (prefers-contrast: more) {
-  .meeting-workspace { --meet-border: #64717d; --meet-muted: #46515d; }
+  .meeting-workspace { --meet-border: rgb(255 255 255 / 22%); --meet-muted: #c4c3cc; }
   .meeting-status { border-width: 2px; }
   .meeting-subnav a.selected { border-bottom-width: 3px; }
   .meeting-list-item.active { outline: 2px solid var(--meet-blue); }

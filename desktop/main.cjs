@@ -167,7 +167,7 @@ async function stopRecordingFromTray() {
     recorderStatus = result.recorder;
     updateTray();
     await dialog.showMessageBox(mainWindow || undefined, { type: 'info', title: 'Запись сохранена',
-      message: 'Встреча добавлена в архив. Транскрибация автоматически не запускалась.' });
+      message: 'Запись сохранена и поставлена в очередь на обработку.' });
   } catch (error) {
     recorderStatus = { ...(recorderStatus || {}), state: 'recording', error: String(error?.message || error) };
     updateTray();

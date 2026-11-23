@@ -38,6 +38,41 @@ def _fake_ort_module_tree(factory):
 
 
 class MeetingScreenTests(unittest.TestCase):
+    def test_production_frame_extraction_saves_visual_states_without_ocr(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = np.zeros((80, 120, 3), dtype=np.uint8)
+            changed = base.copy()
+            changed[10:50, 10:60] = 255
+            samples = [(0.0, base), (1.0, base.copy()), (2.0, changed),
+                       (3.0, changed.copy()), (4.0, changed.copy())]
+            with (patch.object(screen, "probe_media", return_value={"duration": 5, "video": [{"index": 0}]}),
+                  patch.object(screen, "_iter_video_frames", return_value=iter(samples)),
+                  patch.object(screen, "_load_ocr", side_effect=AssertionError("OCR must not load"))):
+                result = screen.extract_frames("video.mp4", temp, checkpoint_seconds=2)
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual([e["reason"] for e in result["events"]], ["initial", "region_change", "checkpoint"])
+            for event in result["events"]:
+                self.assertEqual(set(event), {"id", "start", "end", "frame", "reason", "width", "height",
+                                              "sample_interval_seconds", "time_uncertainty_seconds"})
+                self.assertTrue((Path(temp) / event["frame"]).is_file())
+            self.assertEqual(result["stats"]["sampled_frames"], 5)
+
+    def test_frame_extraction_reports_no_frames_and_incomplete_coverage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(screen, "probe_media", return_value={"duration": 5, "video": [{"index": 0}]}), \
+                    patch.object(screen, "_iter_video_frames", return_value=iter([])):
+                no_frames = screen.extract_frames("video.mp4", temp)
+            self.assertEqual(no_frames["status"], "unavailable")
+            frame = np.zeros((32, 48, 3), dtype=np.uint8)
+            with patch.object(screen, "probe_media", return_value={"duration": 5, "video": [{"index": 0}]}), \
+                    patch.object(screen, "_iter_video_frames", return_value=iter([
+                        (0.0, frame), (None, {"coverage_seconds": 1.0, "decode_error": True,
+                                               "decode_complete": False, "error": "damaged"})])):
+                partial = screen.extract_frames("video.mp4", temp)
+            self.assertEqual(partial["status"], "partial")
+            self.assertEqual(partial["events"][0]["start"], 0.0)
+            self.assertEqual(partial["events"][0]["end"], 1.0)
+
     def test_manual_stock_plan_environment_reaches_fp32_loader_without_variant_validation(self):
         class FakeEngine:
             return_word_box = False
@@ -65,7 +100,12 @@ class MeetingScreenTests(unittest.TestCase):
                     patch.object(hardware, "_identity", return_value={
                         "name": "Radeon", "vendor_id": 0x1002, "device_index": 0}), \
                     patch.object(hardware, "_receipt_matches", return_value=False):
-                plan = hardware.plan_stage("screen", "manual", "gpu")
+                plan = {"device": "directml", "env": {
+                    "VT_MEETING_OCR_REC_PRECISION": "fp32",
+                    "VT_MEETING_OCR_BATCHING": "stock",
+                    "VT_MEETING_OCR_REC_MODEL_PATH": "",
+                    "VT_MEETING_OCR_REC_MODEL_SHA256": "",
+                }}
 
         typings_stub = types.ModuleType("rapidocr.ch_ppocr_rec.typings")
         typings_stub.TextRecInput = lambda *, img, return_word_box: SimpleNamespace(

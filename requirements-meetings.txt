@@ -1,8 +1,6 @@
-# Local screen OCR and image processing; FFmpeg/ffprobe are system executables.
+# Local meeting archive, frame extraction, and image processing; FFmpeg/ffprobe are system executables.
 mcp>=1.9,<2
 Pillow>=10,<13
 opencv-python-headless>=4.10,<5
-rapidocr>=3.10,<4
-onnxruntime>=1.20,<2
 tokenizers>=0.20,<1
 obsws-python>=1.7,<2

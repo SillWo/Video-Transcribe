@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { defaultDiarizationPrefs, diarizationRequestFields, sanitizeDiarizationPrefs, sanitizeStoredPrefs, stageOrderFor } from '../src/lib/diarization.ts'
 
-const safeStoredDefaults = { profile: 'balanced', restorePunctuation: true, ...defaultDiarizationPrefs }
+const safeStoredDefaults = { profile: 'balanced', restorePunctuation: true, executionMode: 'auto', ...defaultDiarizationPrefs }
 
 test('empty and malformed stored preferences keep the complete safe defaults', () => {
   assert.deepEqual(sanitizeStoredPrefs({}), safeStoredDefaults)
@@ -34,6 +34,6 @@ test('request snapshot carries the selected diarization settings', () => {
 
 test('diarization checkpoint appears only when the task requested it', () => {
   assert.equal(stageOrderFor(false).includes('diarization' as never), false)
-  assert.equal(stageOrderFor(true).indexOf('diarization'), 4)
-  assert.equal(stageOrderFor(true)[5], 'postprocess')
+  assert.equal(stageOrderFor(true).indexOf('diarization'), 5)
+  assert.equal(stageOrderFor(true)[6], 'postprocess')
 })

@@ -459,7 +459,8 @@ def _is_output_limit_error(exc: BaseException, transcribe_cpp: Any) -> bool:
 
 
 def _native_transcribe(model_path: Path, audio_path: Path, device: str, index: int, threads: int,
-                       language: str | None, verify_gpu: bool) -> dict[str, Any]:
+                       language: str | None, verify_gpu: bool,
+                       dictionary_snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
     configure_runtime("native", verify_gpu=verify_gpu)
     import transcribe_cpp
 
@@ -475,6 +476,17 @@ def _native_transcribe(model_path: Path, audio_path: Path, device: str, index: i
     records: list[dict[str, Any]] = []
     observations: list[dict[str, Any]] = []
     timings = Counter()
+    snapshot = dictionary_snapshot if isinstance(dictionary_snapshot, dict) else {"version": 0, "terms": []}
+    source_terms = [str(term).strip() for term in snapshot.get("terms", [])
+                    if isinstance(term, str) and term.strip()]
+    vocabulary = []
+    used_chars = 0
+    for term in source_terms:
+        if len(vocabulary) >= 128 or len(term) > 256 or used_chars + len(term) > 8192:
+            continue
+        vocabulary.append(term)
+        used_chars += len(term)
+    omitted_terms = [term for term in source_terms if term not in vocabulary]
     try:
         with transcribe_cpp.Model(str(model_path), device=selected) as model:
             load_seconds = time.perf_counter() - load_start
@@ -496,7 +508,7 @@ def _native_transcribe(model_path: Path, audio_path: Path, device: str, index: i
                     def infer(current: AudioChunk) -> list[dict[str, Any]]:
                         inference_start = time.perf_counter()
                         try:
-                            result = session.run(current.pcm_f32, language=language)
+                            result = session.run(current.pcm_f32, language=language, vocabulary=vocabulary)
                         except Exception as exc:
                             timings["inference"] += time.perf_counter() - inference_start
                             if not _is_output_limit_error(exc, transcribe_cpp):
@@ -543,6 +555,10 @@ def _native_transcribe(model_path: Path, audio_path: Path, device: str, index: i
             "model_device": native_device,
             "native_timings": session_timings or native_timings,
             "precision": "F16 GGUF",
+            "dictionary": {"version": int(snapshot.get("version", 0) or 0),
+                           "usedTerms": vocabulary, "omittedTerms": omitted_terms,
+                           "usedCount": len(vocabulary), "omittedCount": len(omitted_terms),
+                           "truncated": bool(omitted_terms), "integration": "transcribe.cpp vocabulary"},
         }
         if placement:
             placement_result = placement.finish()
@@ -1162,6 +1178,23 @@ def _align_segments(audio_path: Path, segments_path: Path, language_code: str,
         raise WorkerError(f"Forced alignment failed: {type(exc).__name__}: {exc}") from exc
 
 
+def _read_dictionary_snapshot(path: str | None) -> dict[str, Any]:
+    if not path:
+        return {"version": 0, "terms": []}
+    try:
+        data = json.loads(Path(path).expanduser().resolve().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"version": 0, "terms": []}
+    if not isinstance(data, dict) or not isinstance(data.get("terms"), list):
+        return {"version": 0, "terms": []}
+    try:
+        version = max(0, int(data.get("version", 0)))
+    except (TypeError, ValueError):
+        version = 0
+    return {"version": version,
+            "terms": [term for term in data["terms"] if isinstance(term, str) and term.strip()]}
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.mode == "devices":
         return list_devices(args.model)
@@ -1176,7 +1209,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if args.device not in {"cpu", "vulkan", "cuda"}:
                 raise WorkerError(f"Qwen ASR cannot use {args.device!r}; select cpu or vulkan")
             return _native_transcribe(model_file, audio_path, args.device, args.device_index,
-                                      args.threads, args.language, args.verify_gpu)
+                                      args.threads, args.language, args.verify_gpu,
+                                      _read_dictionary_snapshot(getattr(args, "dictionary_file", None)))
         if args.model == PARAKEET_NAME:
             model_dir = model_paths(args.model)["model_dir"]
             if args.device not in {"cpu", "cuda", "directml"}:
@@ -1208,6 +1242,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--language")
     parser.add_argument("--segments-json")
+    parser.add_argument("--dictionary-file")
     parser.add_argument("--verify-gpu", action="store_true")
     args = parser.parse_args(argv)
     output = Path(args.output).expanduser().resolve()

@@ -3,8 +3,8 @@
 Public contract: GET ``/api/meetings/recorder`` returns a RecorderStatus;
 POST ``/recorder/prepare`` starts the private OBS process only;
 POST ``/recorder/configure`` accepts monitor_id/browser_id/microphone_id;
-POST ``/recorder/start`` accepts title; POST ``/recorder/stop`` imports and
-returns ``{meeting, recorder}``; GET ``/recorder/preview`` returns JPEG bytes.
+POST ``/recorder/start`` accepts title; POST ``/recorder/stop`` queues the
+captured media for conversion and returns ``{job, recorder}``; GET ``/recorder/preview`` returns JPEG bytes.
 """
 from __future__ import annotations
 

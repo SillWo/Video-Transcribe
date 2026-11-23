@@ -28,6 +28,7 @@ export type MeetingRecord = {
   source_filename?: string | null
   source_available?: boolean
   status?: MeetingStatus
+  speechAvailability?: string | null
   readiness?: Record<string, string>
   availability?: Record<string, boolean>
   jobs?: MeetingJobSummary[]
@@ -67,6 +68,9 @@ export type MeetingSettings = {
   original_retention_days: number
   cpu_threads?: number
   disk?: { free_bytes?: number; total_bytes?: number; used_bytes?: number; [key: string]: unknown }
+}
+export function preserveMeetingSettingsDraft(current: MeetingSettings | null, incoming: MeetingSettings): MeetingSettings {
+  return current ?? incoming
 }
 export type GlossaryEntry = { id: string; meeting_id?: string; term: string; definition?: string; aliases?: string[]; provenance?: Record<string, unknown> }
 export type ConnectorStatus = {
@@ -199,7 +203,7 @@ export const meetingsApi = {
     return fetchJson<TimelinePage>(`${idPath(meetingId)}/timeline?${params}`, { signal })
   },
   pickFiles: () => post<FileSelection>('/api/simple/pick-files'),
-  importFiles: (paths: string[]) => post<{ items: MeetingRecord[]; rejected: { path: string; reason: string }[] }>('/api/meetings/import', { paths }),
+  importFiles: (paths: string[]) => post<{ jobs: { id: string; source?: string; title?: string; status?: string; archiveRoot?: string | null }[]; rejected: { path: string; reason: string }[] }>('/api/meetings/import', { paths }),
   process: (meetingIds: string[], settings: Pick<MeetingSettings, 'execution_mode' | 'device' | 'cpu_threads' | 'profile'>, stages: ('speech' | 'screen' | 'audio' | 'index')[] = ['speech', 'screen', 'audio', 'index']) => post<{ jobs: unknown[] }>('/api/meetings/process', {
     meeting_ids: meetingIds,
     profile: settings.profile,
@@ -209,7 +213,7 @@ export const meetingsApi = {
     stages,
     execution_mode: settings.execution_mode,
   }),
-  saveSegment: (meetingId: string, segmentId: string, text: string) => put<{ segment: TimelineItem; remembered_term_undo_id?: string | null }>(`${idPath(meetingId)}/segments/${encodeURIComponent(segmentId)}`, { text, remember: true }),
+  saveSegment: (meetingId: string, segmentId: string, text: string) => put<{ segment: TimelineItem; remembered_term_undo_id?: string | null; remembered_terms?: { id?: string; term?: string; undo_id?: string }[] }>(`${idPath(meetingId)}/segments/${encodeURIComponent(segmentId)}`, { text, remember: true }),
   saveSpeaker: (meetingId: string, speakerId: string, name: string) => put<{ speaker_id?: string; name: string }>(`${idPath(meetingId)}/speakers/${encodeURIComponent(speakerId)}`, { name }),
   evidence: (meetingId: string, time: number) => fetchJson<{ url: string }>(`${idPath(meetingId)}/evidence?t=${encodeURIComponent(String(time))}`),
   frameUrl: (meetingId: string, evidenceId: string) => `${API_BASE}${idPath(meetingId)}/frames/${encodeURIComponent(evidenceId)}`,
@@ -233,6 +237,7 @@ export const meetingsApi = {
   assets: () => fetchJson<{ semantic_search: MeetingAssetStatus }>('/api/meetings/assets'),
   prepareAssets: () => post<{ job_id: string | null; status: string; estimated_download_bytes: number; semantic_search: MeetingAssetStatus }>('/api/meetings/assets/prepare', { component: 'semantic_search' }),
   assetPreparation: () => fetchJson<{ preparation: AssetPreparation | null; semantic_search: MeetingAssetStatus }>('/api/meetings/assets/prepare'),
+  reindex: () => post<{ jobs?: unknown[]; rebuild?: unknown; queued_transcriptions?: number }>('/api/meetings/reindex', {}),
   backupStatus: (jobId?: string) => fetchJson<BackupStatus>(`/api/meetings/backup/status${jobId ? `?job_id=${encodeURIComponent(jobId)}` : ''}`),
   createBackup: () => post<{ job_id?: string; operation?: string; status: string; error?: { code?: string; message?: string } }>('/api/meetings/backup/backup'),
   verifyBackup: (snapshotId: string) => post<{ job_id?: string; operation?: string; status: string; error?: { code?: string; message?: string } }>('/api/meetings/backup/verify', { snapshot_id: snapshotId }),
@@ -243,7 +248,7 @@ export const meetingsApi = {
   prepareRecorder: () => post<RecorderStatus>('/api/meetings/recorder/prepare'),
   configureRecorder: (selection: RecorderSelection) => post<RecorderStatus>('/api/meetings/recorder/configure', selection),
   startRecording: (title: string) => post<RecorderStatus>('/api/meetings/recorder/start', { title }),
-  stopRecording: () => post<{ meeting: MeetingRecord; recorder: RecorderStatus }>('/api/meetings/recorder/stop'),
+  stopRecording: () => post<{ job: { id: string; status?: string }; recorder: RecorderStatus }>('/api/meetings/recorder/stop'),
   previewUrl: (url: string) => `${API_BASE}${url}`,
 }
 

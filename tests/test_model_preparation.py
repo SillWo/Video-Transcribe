@@ -10,14 +10,14 @@ from services import cuda_runtime, prepare_models
 
 
 class ModelPreparationTests(unittest.TestCase):
-    def test_setup_only_prepares_aligner_weights_and_cpu_runtime_for_each_asr_profile(self):
+    def test_setup_only_prepares_only_active_qwen_asr_profile(self):
         with patch.object(prepare_models, "get_simple_gpu_details", return_value={"backend": None}), \
                 patch.object(prepare_models, "enumerate_vulkan_gpus", return_value=[]), \
                 patch.object(prepare_models, "_windows_gpu_inventory", return_value=[]), \
                 patch.object(prepare_models, "get_model_status", return_value={"status": "downloaded"}), \
                 patch.object(prepare_models, "_punctuation_cached", return_value=True), \
                 patch.object(prepare_models, "asr_gpu_candidate", side_effect=lambda model: {
-                    "backend": "directml" if model == "parakeet-tdt-0.6b-v3" else "cuda",
+                    "backend": "cuda",
                     "canPrepare": True,
                 }), \
                 patch("services.asr_resources.ensure_asr_resources") as ensure:
@@ -25,10 +25,7 @@ class ModelPreparationTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         selected = [(call.args[0], call.args[1]) for call in ensure.call_args_list]
-        self.assertEqual(selected, [
-            ("parakeet-tdt-0.6b-v3", "cpu"), ("parakeet-tdt-0.6b-v3", "directml"),
-            ("qwen3-asr-1.7b", "cpu"), ("qwen3-asr-1.7b", "cuda"),
-        ])
+        self.assertEqual(selected, [("qwen3-asr-1.7b", "cpu"), ("qwen3-asr-1.7b", "cuda")])
         self.assertTrue(all(call.kwargs["diarization"] is True for call in ensure.call_args_list))
 
     def test_setup_only_check_validates_optional_alignment_without_downloading(self):
@@ -44,7 +41,7 @@ class ModelPreparationTests(unittest.TestCase):
                                            progress=lambda _message: None)
 
         self.assertEqual(result, 0)
-        self.assertEqual(status.call_count, 2)
+        self.assertEqual(status.call_count, 1)
         self.assertTrue(all(call.kwargs["diarization"] is True for call in status.call_args_list))
         ensure.assert_not_called()
 
@@ -62,9 +59,9 @@ class ModelPreparationTests(unittest.TestCase):
         self.assertEqual(result, 0)
         status.assert_not_called()
         ensure.assert_not_called()
-        self.assertEqual([call.args[0] for call in model_status.call_args_list], ["small"])
+        self.assertEqual([call.args[0] for call in model_status.call_args_list], ["small", "large-v3"])
 
-    def test_regular_prepare_downloads_only_small_and_leaves_new_profiles_lazy(self):
+    def test_regular_prepare_includes_balanced_large_v3_and_leaves_qwen_lazy(self):
         downloaded = []
         with patch.object(prepare_models, "get_simple_gpu_details", return_value={"backend": None}), \
                 patch.object(prepare_models, "get_model_status", return_value={"status": "not_downloaded"}) as model_status, \
@@ -75,8 +72,8 @@ class ModelPreparationTests(unittest.TestCase):
             result = prepare_models.prepare(skip_postprocess=True, progress=lambda _message: None)
 
         self.assertEqual(result, 0)
-        self.assertEqual(downloaded, ["small"])
-        self.assertEqual([call.args[0] for call in model_status.call_args_list], ["small"])
+        self.assertEqual(downloaded, ["small", "large-v3"])
+        self.assertEqual([call.args[0] for call in model_status.call_args_list], ["small", "large-v3"])
         status.assert_not_called()
         ensure.assert_not_called()
 
@@ -88,7 +85,7 @@ class ModelPreparationTests(unittest.TestCase):
             output = []
             result = prepare_models.prepare(check_only=True, skip_postprocess=True, progress=output.append)
         self.assertEqual(result, 1)
-        self.assertTrue(any("faster-whisper small" in line and "offline mode" in line for line in output))
+        self.assertTrue(any("faster-whisper large-v3" in line and "offline mode" in line for line in output))
         download.assert_not_called()
         cpp_download.assert_not_called()
 
@@ -113,7 +110,7 @@ class ModelPreparationTests(unittest.TestCase):
             output = []
             result = prepare_models.prepare(check_only=True, skip_postprocess=True, progress=output.append)
         self.assertEqual(result, 1)
-        self.assertTrue(any("whisper.cpp small" in line for line in output))
+        self.assertTrue(any("whisper.cpp large-v3" in line for line in output))
         cpp_download.assert_not_called()
 
     def test_empty_model_named_folder_does_not_count_as_punctuation_cache(self):

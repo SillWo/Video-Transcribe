@@ -31,10 +31,41 @@ class ResourcePreparationTests(unittest.TestCase):
         self.assertEqual(events[1]["totalBytes"], 2048)
         self.assertEqual(events[-1]["message"], "Подготовка завершена")
 
+    def test_public_preparation_rejects_retired_parakeet_before_resource_adapter(self):
+        with patch("services.asr_resources.ensure_asr_resources") as ensure_asr, \
+                patch.object(resources, "download_registered_model") as download, \
+                patch.object(resources, "snapshot_download") as snapshot:
+            with self.assertRaises(resources.ResourcePreparationError) as raised:
+                resources.ensure_selected_resources({
+                    "model": "parakeet-tdt-0.6b-v3", "device": "cpu",
+                    "restorePunctuation": True, "diarization": True,
+                })
+        self.assertEqual(raised.exception.code, "retired_model")
+        self.assertIn("Parakeet", str(raised.exception))
+        ensure_asr.assert_not_called()
+        download.assert_not_called()
+        snapshot.assert_not_called()
+
+    def test_cli_rejects_retired_parakeet_before_any_download_or_adapter_call(self):
+        output = io.StringIO()
+        with (patch("services.asr_resources.ensure_asr_resources") as ensure_asr,
+              patch.object(resources, "download_registered_model") as download,
+              patch.object(resources, "snapshot_download") as snapshot,
+              redirect_stdout(output)):
+            result = resources.main(["--model", "parakeet-tdt-0.6b-v3", "--device", "cpu"])
+        self.assertEqual(result, 1)
+        event = json.loads(output.getvalue().strip()[len(resources.PREPARATION_EVENT_PREFIX):])
+        self.assertEqual(event["type"], "error")
+        self.assertEqual(event["code"], "retired_model")
+        ensure_asr.assert_not_called()
+        download.assert_not_called()
+        snapshot.assert_not_called()
+
     def test_vulkan_model_receives_byte_callback_and_is_revalidated(self):
         events = []
         with (patch("services.prepare_models._vulkan_cached", side_effect=[False, True]),
-              patch("services.whisper_cpp.resolve_model_path") as resolve):
+              patch("services.whisper_cpp.resolve_model_path") as resolve,
+              patch("services.whisper_cpp.resolve_tokenizer_path") as tokenizer):
             def resolve_side_effect(model_id, *, byte_progress=None):
                 self.assertEqual(model_id, "small")
                 byte_progress(10, 100)
@@ -42,6 +73,7 @@ class ResourcePreparationTests(unittest.TestCase):
             resources.ensure_selected_resources({"model": "small", "device": "vulkan",
                                                   "restorePunctuation": False}, events.append)
         self.assertEqual(events[1]["completedBytes"], 10)
+        tokenizer.assert_called_once_with("small", progress=unittest.mock.ANY)
 
     def test_vulkan_model_validation_failure_is_retryable_preparation_error(self):
         with (patch("services.prepare_models._vulkan_cached", return_value=False),

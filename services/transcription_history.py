@@ -18,13 +18,16 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-STAGES = ("preparation", "source", "audio", "recognition", "diarization", "postprocess", "result")
+STAGES = ("source_check", "preparation", "source", "audio", "recognition", "diarization",
+          "postprocess", "screen", "archive_audio", "index", "result")
+BASE_STAGES = ("source_check", "preparation", "source", "audio", "recognition",
+               "diarization", "postprocess", "result")
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 
 
 def initial_checkpoints() -> list[dict[str, Any]]:
     return [{"stage": stage, "status": "pending", "startedAt": None, "completedAt": None}
-            for stage in STAGES]
+            for stage in BASE_STAGES]
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -129,6 +132,7 @@ class TranscriptionHistory:
                 record["id"], record["createdAt"], record["updatedAt"], record["status"],
                 record["stage"], record["revision"], json.dumps(record, ensure_ascii=False)))
         self.job_dir(record["id"]).mkdir(parents=True, exist_ok=True)
+        self._publish_archive(record)
         return record
 
     def create_queued(self, metadata_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -150,7 +154,31 @@ class TranscriptionHistory:
                     record["id"], record["createdAt"], record["updatedAt"], record["status"],
                     record["stage"], record["revision"], json.dumps(record, ensure_ascii=False)))
                 db.execute("INSERT INTO queue_entries(job_id) VALUES (?)", (record["id"],))
+        for record in records:
+            self._publish_archive(record)
         return records
+
+    def _publish_archive(
+        self, record=None, job_id=None, text=None, *, index_transcription=False
+    ):
+        """Publish only explicitly archive-bound ordinary jobs; keep imports lazy."""
+        try:
+            record = record or self.get(job_id)
+            if (not record or record.get("meetingId")
+                    or record.get("mediaClassification") == "pending"
+                    or not record.get("archiveRoot")):
+                return
+            from services.archive_catalog import update_from_history
+            update_from_history(
+                self,
+                record.get("id"),
+                record=record,
+                text=text,
+                index_transcription=index_transcription,
+            )
+        except (OSError, ValueError, ImportError):
+            # The local history database remains authoritative if removable archive storage is unavailable.
+            return
 
     def queue_ids(self) -> list[str]:
         with self._lock, self._connect() as db:
@@ -239,6 +267,8 @@ class TranscriptionHistory:
                 return None
             record = json.loads(row[0])
             previous_status = record.get("status")
+            previous_revision = record.get("revision")
+            previous_title = record.get("title")
             prior_timing = normalize_terminal_timing(record) if previous_status in TERMINAL_STATUSES else None
             prior_elapsed_fields = {key: record.get(key) for key in
                                     ("startedAt", "queueWaitSeconds", "processingDurationSeconds")}
@@ -282,12 +312,57 @@ class TranscriptionHistory:
                         json.dumps(record, ensure_ascii=False), job_id))
             if record.get("status") in TERMINAL_STATUSES:
                 db.execute("DELETE FROM queue_entries WHERE job_id=?", (job_id,))
-            return record
+        should_index = record.get("status") == "completed" and (
+            previous_status != "completed"
+            or previous_revision != record.get("revision")
+            or previous_title != record.get("title")
+        )
+        self._publish_archive(record, index_transcription=should_index)
+        return record
+
+    def claim_archive_root(self, job_id: str, archive_root: str) -> dict[str, Any] | None:
+        """Bind an unassigned ordinary job without changing its history fields."""
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT metadata FROM jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                return None
+            record = json.loads(row["metadata"])
+            if record.get("meetingId") or record.get("archiveRoot"):
+                return record
+            record["archiveRoot"] = archive_root
+            db.execute(
+                "UPDATE jobs SET metadata=? WHERE id=?",
+                (json.dumps(record, ensure_ascii=False), job_id),
+            )
+        return record
 
     def list(self) -> list[dict[str, Any]]:
         with self._lock, self._connect() as db:
             rows = db.execute("SELECT metadata FROM jobs ORDER BY created_at DESC, id DESC").fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def list_ordinary_summaries(self) -> list[dict[str, Any]]:
+        """Read compact catalog fields without decoding diagnostic-heavy job metadata."""
+        with self._lock, self._connect() as db:
+            rows = db.execute("""SELECT id,
+                json_extract(metadata, '$.createdAt') AS createdAt,
+                json_extract(metadata, '$.updatedAt') AS updatedAt,
+                json_extract(metadata, '$.startedAt') AS startedAt,
+                json_extract(metadata, '$.status') AS status,
+                json_extract(metadata, '$.revision') AS revision,
+                json_extract(metadata, '$.archiveRoot') AS archiveRoot,
+                json_extract(metadata, '$.mediaClassification') AS mediaClassification,
+                json_extract(metadata, '$.meetingId') AS meetingId,
+                json_extract(metadata, '$.source') AS source,
+                json_extract(metadata, '$.title') AS title
+                FROM jobs WHERE json_extract(metadata, '$.meetingId') IS NULL
+                   OR json_extract(metadata, '$.meetingId') = ''
+                ORDER BY created_at DESC, id DESC""").fetchall()
+        return [dict(row) for row in rows]
 
     def list_meeting_jobs(self, meeting_id: str | None = None) -> list[dict[str, Any]]:
         """Return compact summaries for meeting jobs without decoding full metadata."""
@@ -400,6 +475,7 @@ class TranscriptionHistory:
         finally:
             for temp, _ in temps:
                 temp.unlink(missing_ok=True)
+        self._publish_archive(job_id=job_id, text=text, index_transcription=True)
 
     def read_text(self, job_id: str) -> str | None:
         with self._lock:
@@ -417,11 +493,15 @@ class TranscriptionHistory:
                 raise PermissionError(f"Конфликт версии. Текущая версия: {record.get('revision', 0)}.")
             if not self.artifact(job_id, "txt").is_file() or not self.artifact(job_id, "md").is_file():
                 raise LookupError(job_id)
+            old_text = self.read_text(job_id) or ""
             revision = base_revision + 1
             self.write_text(job_id, text, revision)
             updated = self.update(job_id, revision=revision)
             assert updated is not None
-            return updated
+        from services.personal_dictionary import remember_corrections
+        updated["rememberedTerms"] = remember_corrections(
+            old_text, text, {"job_id": job_id, "archive_root": updated.get("archiveRoot")})
+        return updated
 
     def recover_interrupted(self) -> None:
         with self._lock, self._connect() as db:
@@ -469,4 +549,12 @@ class TranscriptionHistory:
             with self._connect() as db:
                 db.execute("DELETE FROM queue_entries WHERE job_id=?", (job_id,))
                 db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+            if record.get("archiveRoot"):
+                try:
+                    from services.archive_catalog import _checked_folder, archive_lock, mark_deleted
+                    with archive_lock(record["archiveRoot"]):
+                        mark_deleted(record["archiveRoot"], job_id)
+                        shutil.rmtree(_checked_folder(record["archiveRoot"], job_id), ignore_errors=True)
+                except (ImportError, OSError, ValueError):
+                    pass
             return True

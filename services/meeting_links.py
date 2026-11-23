@@ -22,6 +22,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+VIEWER_UI_VERSION = 2
+
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -291,10 +293,61 @@ class Viewer:
                             media = f'<audio controls preload="metadata" src="{html.escape(audio_url, quote=True)}"></audio>' + seek_script
                         if evidence["frame"]:
                             frame_route = "frame/" + urllib.parse.quote(meeting_id, safe="")
-                            media += f'<img alt="Saved screen evidence" src="{prefix}{frame_route}?t={evidence["at"]}" />'
+                            media += f'<img alt="Сохранённый кадр экрана" src="{prefix}{frame_route}?t={evidence["at"]}" />'
                         if not media:
-                            media = "<p>The original recording and a retained frame are unavailable.</p>"
-                        body = f'<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{title}</title><style>body{{font:16px system-ui;max-width:1000px;margin:2rem auto;padding:0 1rem}}video,audio,img{{display:block;max-width:100%;margin:1rem 0}}</style><h1>{title}</h1><p>Evidence at {evidence["at"]:.2f} seconds</p>{media}'
+                            media = "<p>Исходная запись и сохранённый кадр недоступны.</p>"
+                        style = """
+                            :root {
+                                color-scheme: dark;
+                                font-family: "Segoe UI", sans-serif;
+                                color: #f7f7f8;
+                                background: #13111c;
+                            }
+                            * { box-sizing: border-box; }
+                            body {
+                                min-height: 100vh;
+                                margin: 0;
+                                padding: 20px;
+                                background: #13111c;
+                                color: #f7f7f8;
+                                font-size: 16px;
+                            }
+                            main {
+                                max-width: 1000px;
+                                margin: 0 auto;
+                                padding: 20px;
+                                border: 1px solid #302d3d;
+                                border-radius: 16px;
+                                background: #1c1a28;
+                            }
+                            h1 { margin: 0 0 8px; font-size: 24px; line-height: 1.25; }
+                            p { margin: 0 0 14px; color: #a1a0ab; }
+                            video, audio, img {
+                                display: block;
+                                max-width: 100%;
+                                margin: 14px 0 0;
+                                border-radius: 10px;
+                                background: #0b0b0f;
+                            }
+                            video, audio { width: 100%; }
+                            img { height: auto; }
+                            :focus-visible { outline: 2px solid #a78bfa; outline-offset: 3px; }
+                            @media (max-width: 600px) {
+                                body { padding: 12px; }
+                                main { padding: 12px; border-radius: 12px; }
+                                h1 { font-size: 16px; }
+                                p { margin-bottom: 10px; }
+                                video, audio, img { margin-top: 10px; }
+                            }
+                        """
+                        body = (
+                            f'<!doctype html><html lang="ru"><head><meta charset="utf-8">'
+                            f'<meta name="viewport" content="width=device-width, initial-scale=1">'
+                            f'<title>{title}</title><style>{style}</style></head><body>'
+                            f'<main><h1>{title}</h1>'
+                            f'<p>Материал на отметке {evidence["at"]:.2f} секунды</p>'
+                            f'{media}</main></body></html>'
+                        )
                         data = body.encode("utf-8")
                         self.send_response(200)
                         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -412,6 +465,8 @@ def _start_detached_viewer(root: str | Path, settings: str | Path | None = None,
     prior = viewers.get(state_key) if isinstance(viewers, dict) else None
     if not isinstance(prior, dict) and Path(state.get("root", "")).resolve() == resolved:
         prior = state
+    if isinstance(prior, dict) and prior.get("viewer_ui_version") != VIEWER_UI_VERSION:
+        prior = None
     if isinstance(prior, dict):
         try:
             handle = ViewerHandle(resolved, str(prior["token"]), int(prior["port"]), descriptor)
@@ -470,11 +525,18 @@ def _start_detached_viewer(root: str | Path, settings: str | Path | None = None,
             with urllib.request.urlopen(handle.base_url + "health", timeout=.4) as response:
                 if response.status == 200:
                     viewers = state.get("viewers", {}) if isinstance(state.get("viewers", {}), dict) else {}
-                    viewers[state_key] = {"root": str(resolved), "port": port, "token": token,
-                                          "pid": process.pid, "launch_mode": launch_mode}
+                    viewers[state_key] = {
+                        "root": str(resolved),
+                        "port": port,
+                        "token": token,
+                        "pid": process.pid,
+                        "launch_mode": launch_mode,
+                        "viewer_ui_version": VIEWER_UI_VERSION,
+                    }
                     temp = descriptor.with_suffix(".tmp")
                     temp.write_text(json.dumps({"root": str(resolved), "port": port, "token": token,
                                                 "pid": process.pid, "launch_mode": launch_mode,
+                                                "viewer_ui_version": VIEWER_UI_VERSION,
                                                 "viewers": viewers}, ensure_ascii=False), encoding="utf-8")
                     temp.replace(descriptor)
                     return handle
